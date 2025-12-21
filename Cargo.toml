@@ -14,3 +14,10 @@ zarrs = { version = "0.22.10", features = ["ndarray"] }
 [[example]]
 name = "query_zarr"
 path = "examples/query_zarr.rs"
+
+[[bin]]
+name = "zarr-cli"
+path = "src/bin/zarr_cli.rs"
+
+[dependencies.rustyline]
+version = "15"
