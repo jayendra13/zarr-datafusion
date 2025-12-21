@@ -15,14 +15,14 @@ Zarr stores multidimensional data in chunked arrays. For example, a weather data
 This library flattens the 3D structure into rows where each row represents one grid cell:
 
 ```
-┌─────────────────────────────────────────────────────────┐
+┌───────────────────────────────────────────────────────────────────────┐
 │  Zarr Store (3D)           →    SQL Table (2D)                        │
-├─────────────────────────────────────────────────────────              ┤
+├───────────────────────────────────────────────────────────────────────┤
 │  temperature[t, lat, lon]  →    | timestamp | lat | lon | temperature |
 │  humidity[t, lat, lon]     →    | 0         | 0   | 0   | 43          |
 │                            →    | 0         | 0   | 1   | 51          |
 │                            →    | ...       | ... | ... | ...         |
-└─────────────────────────────────────────────────────────┘
+└───────────────────────────────────────────────────────────────────────┘
 ```
 
 ## Features
@@ -103,10 +103,76 @@ Then run the example:
 cargo run --example query_zarr
 ```
 
+## Interactive CLI
+
+An interactive SQL shell is included for exploring Zarr data:
+
+> **Note:** The CLI currently only supports the fixed weather schema defined in `zarr_weather_schema()`. Automatic schema inference is a work in progress.
+
+```bash
+cargo run --bin zarr-cli
+```
+
+```
+Zarr-DataFusion CLI
+Registered table: weather (from data/weather.zarr)
+Type SQL queries or 'quit' to exit.
+
+zarr> SELECT * FROM weather LIMIT 5;
+zarr> help
+zarr> quit
+```
+
+### Example Queries
+
+**Sample data:**
+```sql
+SELECT * FROM weather LIMIT 10;
+```
+
+**Filter by temperature:**
+```sql
+SELECT timestamp, lat, lon, temperature
+FROM weather
+WHERE temperature > 20
+LIMIT 10;
+```
+
+**Average temperature per timestamp:**
+```sql
+SELECT timestamp, AVG(temperature) as avg_temp
+FROM weather
+GROUP BY timestamp
+ORDER BY timestamp;
+```
+
+**Find locations where temperature is always below 10:**
+```sql
+SELECT lat, lon, MAX(temperature) as max_temp
+FROM weather
+GROUP BY lat, lon
+HAVING MAX(temperature) < 10
+ORDER BY max_temp;
+```
+
+**Temperature statistics by location:**
+```sql
+SELECT lat, lon,
+       MIN(temperature) as min_temp,
+       MAX(temperature) as max_temp,
+       AVG(temperature) as avg_temp
+FROM weather
+GROUP BY lat, lon
+ORDER BY avg_temp DESC
+LIMIT 10;
+```
+
 ## Architecture
 
 ```
 src/
+├── bin/
+│   └── zarr_cli.rs       # Interactive SQL shell (REPL)
 ├── reader/
 │   └── zarr_reader.rs    # Low-level Zarr reading and Arrow conversion
 ├── datasource/
@@ -124,8 +190,10 @@ src/
 
 ## Roadmap
 
-- [ ] Read ERA5 climate dataset from local disk
-- [ ] Read ERA5 dataset from cloud storage (S3/GCS buckets)
+- [x] Add REPL for quick quries.
+- [ ] Read ERA5 climate dataset from local disk.
+- [ ] Read ERA5 dataset from cloud storage (S3/GCS buckets).
 - [ ] Integrate [icechunk](https://github.com/earth-mover/icechunk) for transactional Zarr reads
 - [ ] Tackle the [One Trillion Row Challenge](https://github.com/coiled/1trc) with Zarr + DataFusion
 - [ ] Integrate with [xarray-sql](https://github.com/xarray-contrib/xarray-sql) for xarray interoperability
+- [ ] Support Schema Inference.
