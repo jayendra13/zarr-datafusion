@@ -1,0 +1,16 @@
+[package]
+name = "zarr-datafusion"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+arrow = "57.1.0"
+async-trait = "0.1"
+datafusion = "51.0.0"
+futures = "0.3.31"
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+zarrs = { version = "0.22.10", features = ["ndarray"] }
+
+[[example]]
+name = "query_zarr"
+path = "examples/query_zarr.rs"
