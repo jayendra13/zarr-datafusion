@@ -3639,6 +3639,7 @@ dependencies = [
  "datafusion",
  "futures",
  "rustyline",
+ "serde_json",
  "tokio",
  "zarrs",
 ]

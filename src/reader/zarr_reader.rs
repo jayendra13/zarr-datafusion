@@ -1,7 +1,11 @@
+//! Zarr array reader that flattens nD data into Arrow RecordBatches
+//!
+//! See [`super::schema_inference`] for assumptions about Zarr store structure
+//! (1D coordinates, nD data variables as Cartesian product of coordinates).
 
 use arrow::{
-    array::{ArrayRef, Int64Array, RecordBatch},
-    datatypes::{DataType, Field, Schema, SchemaRef},
+    array::{ArrayRef, DictionaryArray, Int16Array, Int64Array, RecordBatch},
+    datatypes::{Int16Type, Schema, SchemaRef},
 };
 use datafusion::{
     common::DataFusionError, error::Result, execution::SendableRecordBatchStream,
@@ -11,22 +15,7 @@ use futures::stream;
 use std::sync::Arc;
 use zarrs::{array::Array, array_subset::ArraySubset, filesystem::FilesystemStore};
 
-// Column indices
-const COL_TIMESTAMP: usize = 0;
-const COL_LAT: usize = 1;
-const COL_LON: usize = 2;
-const COL_TEMPERATURE: usize = 3;
-const COL_HUMIDITY: usize = 4;
-
-pub fn zarr_weather_schema() -> Schema {
-    Schema::new(vec![
-        Field::new("timestamp", DataType::Int64, false),
-        Field::new("lat", DataType::Int64, false),
-        Field::new("lon", DataType::Int64, false),
-        Field::new("temperature", DataType::Int64, false),
-        Field::new("humidity", DataType::Int64, false),
-    ])
-}
+use super::schema_inference::discover_arrays;
 
 fn zarr_err(e: impl std::error::Error + Send + Sync + 'static) -> DataFusionError {
     DataFusionError::External(Box::new(e))
@@ -39,133 +28,63 @@ pub fn read_zarr(
 ) -> Result<SendableRecordBatchStream> {
     let store = Arc::new(FilesystemStore::new(store_path).map_err(zarr_err)?);
 
-    // Determine which columns we need
-    let projected_indices = projection
-        .clone()
-        .unwrap_or_else(|| (0..schema.fields().len()).collect());
+    // Discover store structure
+    let store_meta = discover_arrays(store_path)
+        .map_err(|e| DataFusionError::External(e))?;
 
-    let need_timestamp = projected_indices.contains(&COL_TIMESTAMP);
-    let need_lat = projected_indices.contains(&COL_LAT);
-    let need_lon = projected_indices.contains(&COL_LON);
-    let need_temp = projected_indices.contains(&COL_TEMPERATURE);
-    let need_humid = projected_indices.contains(&COL_HUMIDITY);
+    let coord_names: Vec<_> = store_meta.coords.iter().map(|c| c.name.clone()).collect();
 
-    // Open arrays to get shapes (metadata only, no data read yet)
-    let time_array = Array::open(store.clone(), "/time").map_err(zarr_err)?;
-    let lat_array = Array::open(store.clone(), "/lat").map_err(zarr_err)?;
-    let lon_array = Array::open(store.clone(), "/lon").map_err(zarr_err)?;
+    // Load coordinate arrays and get their sizes
+    let mut coord_sizes: Vec<usize> = Vec::new();
+    let mut coord_values: Vec<Vec<i64>> = Vec::new();
 
-    let ntime = time_array.shape()[0] as usize;
-    let nlat = lat_array.shape()[0] as usize;
-    let nlon = lon_array.shape()[0] as usize;
-    let total_rows = ntime * nlat * nlon;
+    for coord in &store_meta.coords {
+        let arr = Array::open(store.clone(), &format!("/{}", coord.name)).map_err(zarr_err)?;
+        let size = arr.shape()[0] as usize;
+        coord_sizes.push(size);
 
-    // Only read coordinate values if needed
-    let time_vals: Option<Vec<i64>> = if need_timestamp {
-        let (vals, _) = time_array
-            .retrieve_array_subset_ndarray::<i64>(&ArraySubset::new_with_shape(vec![
-                ntime as u64,
-            ]))
+        let (vals, _) = arr
+            .retrieve_array_subset_ndarray::<i64>(&ArraySubset::new_with_shape(arr.shape().to_vec()))
             .map_err(zarr_err)?
             .into_raw_vec_and_offset();
-        Some(vals)
-    } else {
-        None
-    };
+        coord_values.push(vals);
+    }
 
-    let lat_vals: Option<Vec<i64>> = if need_lat {
-        let (vals, _) = lat_array
-            .retrieve_array_subset_ndarray::<i64>(&ArraySubset::new_with_shape(vec![nlat as u64]))
-            .map_err(zarr_err)?
-            .into_raw_vec_and_offset();
-        Some(vals)
-    } else {
-        None
-    };
+    // Total rows = product of all coordinate sizes
+    let total_rows: usize = coord_sizes.iter().product();
 
-    let lon_vals: Option<Vec<i64>> = if need_lon {
-        let (vals, _) = lon_array
-            .retrieve_array_subset_ndarray::<i64>(&ArraySubset::new_with_shape(vec![nlon as u64]))
-            .map_err(zarr_err)?
-            .into_raw_vec_and_offset();
-        Some(vals)
-    } else {
-        None
-    };
+    let projected_indices = projection.unwrap_or_else(|| (0..schema.fields().len()).collect());
 
-    // Only read data arrays if needed
-    let temp_vals: Option<Vec<i64>> = if need_temp {
-        let temp_array = Array::open(store.clone(), "/temperature").map_err(zarr_err)?;
-        let shape = temp_array.shape().to_vec();
-        let (vals, _) = temp_array
-            .retrieve_array_subset_ndarray::<i64>(&ArraySubset::new_with_shape(shape))
-            .map_err(zarr_err)?
-            .into_raw_vec_and_offset();
-        Some(vals)
-    } else {
-        None
-    };
+    let mut result_arrays: Vec<ArrayRef> = Vec::new();
 
-    let humid_vals: Option<Vec<i64>> = if need_humid {
-        let humid_array = Array::open(store.clone(), "/humidity").map_err(zarr_err)?;
-        let shape = humid_array.shape().to_vec();
-        let (vals, _) = humid_array
-            .retrieve_array_subset_ndarray::<i64>(&ArraySubset::new_with_shape(shape))
-            .map_err(zarr_err)?
-            .into_raw_vec_and_offset();
-        Some(vals)
-    } else {
-        None
-    };
+    for idx in &projected_indices {
+        let field = schema.field(*idx);
+        let field_name = field.name();
 
-    // Build only the arrays we need, in schema order
-    let mut all_arrays: Vec<Option<ArrayRef>> = vec![None; 5];
-
-    if let Some(ref time_vals) = time_vals {
-        let mut vals = Vec::with_capacity(total_rows);
-        for t in 0..ntime {
-            for _ in 0..nlat {
-                for _ in 0..nlon {
-                    vals.push(time_vals[t]);
-                }
-            }
+        // Check if this is a coordinate
+        if let Some(coord_idx) = coord_names.iter().position(|n| n == field_name) {
+            // Create DictionaryArray for coordinate (memory efficient)
+            let dict_array = create_coord_dictionary(
+                &coord_values[coord_idx],
+                coord_idx,
+                &coord_sizes,
+                total_rows,
+            );
+            result_arrays.push(Arc::new(dict_array));
+        } else {
+            // Data variable - read and flatten
+            let arr =
+                Array::open(store.clone(), &format!("/{}", field_name)).map_err(zarr_err)?;
+            let (vals, _) = arr
+                .retrieve_array_subset_ndarray::<i64>(&ArraySubset::new_with_shape(
+                    arr.shape().to_vec(),
+                ))
+                .map_err(zarr_err)?
+                .into_raw_vec_and_offset();
+            result_arrays.push(Arc::new(Int64Array::from(vals)));
         }
-        all_arrays[COL_TIMESTAMP] = Some(Arc::new(Int64Array::from(vals)));
     }
 
-    if let Some(ref lat_vals) = lat_vals {
-        let mut vals = Vec::with_capacity(total_rows);
-        for _ in 0..ntime {
-            for i in 0..nlat {
-                for _ in 0..nlon {
-                    vals.push(lat_vals[i]);
-                }
-            }
-        }
-        all_arrays[COL_LAT] = Some(Arc::new(Int64Array::from(vals)));
-    }
-
-    if let Some(ref lon_vals) = lon_vals {
-        let mut vals = Vec::with_capacity(total_rows);
-        for _ in 0..ntime {
-            for _ in 0..nlat {
-                for j in 0..nlon {
-                    vals.push(lon_vals[j]);
-                }
-            }
-        }
-        all_arrays[COL_LON] = Some(Arc::new(Int64Array::from(vals)));
-    }
-
-    if let Some(temp_vals) = temp_vals {
-        all_arrays[COL_TEMPERATURE] = Some(Arc::new(Int64Array::from(temp_vals)));
-    }
-
-    if let Some(humid_vals) = humid_vals {
-        all_arrays[COL_HUMIDITY] = Some(Arc::new(Int64Array::from(humid_vals)));
-    }
-
-    // Build projected schema and collect only projected arrays
     let projected_schema = Arc::new(Schema::new(
         projected_indices
             .iter()
@@ -173,16 +92,54 @@ pub fn read_zarr(
             .collect::<Vec<_>>(),
     ));
 
-    let arrays: Vec<ArrayRef> = projected_indices
-        .iter()
-        .map(|&i| all_arrays[i].clone().expect("projected column not built"))
-        .collect();
-
-    let batch = RecordBatch::try_new(projected_schema.clone(), arrays)?;
+    let batch = RecordBatch::try_new(projected_schema.clone(), result_arrays)?;
     let stream = stream::iter(vec![Ok(batch)]);
 
     Ok(Box::pin(RecordBatchStreamAdapter::new(
         projected_schema,
         stream,
     )))
+}
+
+/// Create a DictionaryArray for a coordinate column
+///
+/// Instead of expanding [0,1,2] to [0,0,0,1,1,1,2,2,2,...] (700 i64 values = 5600 bytes),
+/// we store:
+///   - values: [0,1,2] (the unique coordinate values)
+///   - keys: [0,0,0,1,1,1,2,2,2,...] (indices into values, as i16)
+///
+/// Memory: 700 i16 keys (1400 bytes) + 3 i64 values (24 bytes) = 1424 bytes (~75% savings)
+///
+/// References:
+/// - Arrow DictionaryArray: https://docs.rs/arrow/latest/arrow/array/struct.DictionaryArray.html
+/// - DataFusion Dictionary support: https://datafusion.apache.org/user-guide/sql/data_types.html
+fn create_coord_dictionary(
+    vals: &[i64],
+    coord_idx: usize,
+    coord_sizes: &[usize],
+    total_rows: usize,
+) -> DictionaryArray<Int16Type> {
+    // Build keys array (indices into the values)
+    let mut keys: Vec<i16> = Vec::with_capacity(total_rows);
+
+    // Elements after this coordinate (inner loop size)
+    let inner_size: usize = coord_sizes[coord_idx + 1..].iter().product();
+    let inner_size = if inner_size == 0 { 1 } else { inner_size };
+
+    // Elements before this coordinate (outer loop count)
+    let outer_count: usize = coord_sizes[..coord_idx].iter().product();
+    let outer_count = if outer_count == 0 { 1 } else { outer_count };
+
+    for _ in 0..outer_count {
+        for (i, _) in vals.iter().enumerate() {
+            for _ in 0..inner_size {
+                keys.push(i as i16);
+            }
+        }
+    }
+
+    let keys_array = Int16Array::from(keys);
+    let values_array = Int64Array::from(vals.to_vec());
+
+    DictionaryArray::new(keys_array, Arc::new(values_array))
 }

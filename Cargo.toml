@@ -21,3 +21,6 @@ path = "src/bin/zarr_cli.rs"
 
 [dependencies.rustyline]
 version = "15"
+
+[dependencies.serde_json]
+version = "1"
