@@ -25,10 +25,33 @@ This library flattens the 3D structure into rows where each row represents one g
 └───────────────────────────────────────────────────────────────────────┘
 ```
 
+### Assumptions
+
+> **Note:** This library currently assumes a specific Zarr store structure:
+
+1. **Coordinates are 1D arrays** — Any array with a single dimension is treated as a coordinate (e.g., `time(7)`, `lat(10)`, `lon(10)`)
+
+2. **Data variables are nD arrays** — Arrays with multiple dimensions are treated as data variables. Their dimensionality must equal the number of coordinate arrays.
+
+3. **Cartesian product structure** — Data variables are assumed to represent the Cartesian product of all coordinates. For coordinates `[lat(10), lon(10), time(7)]`, data variables must have shape `[10, 10, 7]`.
+
+4. **Dimension ordering** — Coordinates are sorted alphabetically, and data variable dimensions are assumed to follow this same order.
+
+```
+weather.zarr/
+├── lat/          shape: [10]          → coordinate
+├── lon/          shape: [10]          → coordinate
+├── time/         shape: [7]           → coordinate
+├── temperature/  shape: [10, 10, 7]   → data variable (lat × lon × time)
+└── humidity/     shape: [10, 10, 7]   → data variable (lat × lon × time)
+```
+
 ## Features
 
 - **Zarr v3 support** via the [zarrs](https://crates.io/crates/zarrs) crate
+- **Schema inference**: Automatically infers Arrow schema from Zarr metadata
 - **Projection pushdown**: Only reads arrays that are needed for the query
+- **Memory efficient coordinates**: Uses Arrow DictionaryArray for coordinate columns (~75% memory savings)
 - **SQL interface**: Full DataFusion SQL support (filtering, aggregation, joins, etc.)
 
 ## Usage
@@ -37,13 +60,14 @@ This library flattens the 3D structure into rows where each row represents one g
 use std::sync::Arc;
 use datafusion::prelude::SessionContext;
 use zarr_datafusion::datasource::zarr::ZarrTable;
-use zarr_datafusion::reader::zarr_reader::zarr_weather_schema;
+use zarr_datafusion::reader::schema_inference::infer_schema;
 
 #[tokio::main]
 async fn main() -> datafusion::error::Result<()> {
     let ctx = SessionContext::new();
 
-    let schema = Arc::new(zarr_weather_schema());
+    // Schema is automatically inferred from Zarr metadata
+    let schema = Arc::new(infer_schema("data/weather.zarr").expect("Failed to infer schema"));
     let table = Arc::new(ZarrTable::new(schema, "data/weather.zarr"));
 
     ctx.register_table("weather", table)?;
@@ -107,7 +131,7 @@ cargo run --example query_zarr
 
 An interactive SQL shell is included for exploring Zarr data:
 
-> **Note:** The CLI currently only supports the fixed weather schema defined in `zarr_weather_schema()`. Automatic schema inference is a work in progress.
+The CLI automatically infers the schema from Zarr v3 metadata. Coordinate arrays (1D) become columns, and data arrays (nD) are flattened.
 
 ```bash
 cargo run --bin zarr-cli
@@ -116,6 +140,7 @@ cargo run --bin zarr-cli
 ```
 Zarr-DataFusion CLI
 Registered table: weather (from data/weather.zarr)
+Columns: lat, lon, time, humidity, temperature
 Type SQL queries or 'quit' to exit.
 
 zarr> SELECT * FROM weather LIMIT 5;
@@ -191,9 +216,16 @@ src/
 ## Roadmap
 
 - [x] Add REPL for quick quries.
+- [x] Support Schema Inference.
+- [x] Projection Push down
+- [ ] Filter push down
+- [x] Memory efficient co-ord expansion (DictionaryArray)
+- [ ] Zarr Codecs
+- [ ] Zero Copy data
 - [ ] Read ERA5 climate dataset from local disk.
 - [ ] Read ERA5 dataset from cloud storage (S3/GCS buckets).
+- [ ] DMA while reading from Cloud
 - [ ] Integrate [icechunk](https://github.com/earth-mover/icechunk) for transactional Zarr reads
 - [ ] Tackle the [One Trillion Row Challenge](https://github.com/coiled/1trc) with Zarr + DataFusion
 - [ ] Integrate with [xarray-sql](https://github.com/xarray-contrib/xarray-sql) for xarray interoperability
-- [ ] Support Schema Inference.
+
