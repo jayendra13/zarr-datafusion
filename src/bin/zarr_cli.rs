@@ -1,3 +1,4 @@
+use std::path::Path;
 use std::sync::Arc;
 
 use datafusion::prelude::SessionContext;
@@ -17,19 +18,33 @@ use zarr_datafusion::reader::schema_inference::infer_schema;
 // - Tokio multi-threaded runtime: https://tokio.rs/tokio/tutorial/spawning#concurrency
 // - Rust Send/Sync traits: https://doc.rust-lang.org/nomicon/send-and-sync.html
 // - DataFusion async execution: https://docs.rs/datafusion/latest/datafusion/execution/context/struct.SessionContext.html
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let ctx = SessionContext::new();
 
-    let store_path = "data/weather.zarr";
-    let schema = Arc::new(infer_schema(store_path)?);
-    let table = Arc::new(ZarrTable::new(schema.clone(), store_path));
-    ctx.register_table("weather", table)?;
+struct TableInfo {
+    name: &'static str,
+    path: &'static str,
+}
 
-    println!("Zarr-DataFusion CLI");
-    println!("Registered table: weather (from {})", store_path);
+const TABLES: &[TableInfo] = &[
+    TableInfo { name: "synthetic", path: "data/synthetic.zarr" },
+    TableInfo { name: "era5", path: "data/era5.zarr" },
+];
+
+fn register_table(
+    ctx: &SessionContext,
+    info: &TableInfo,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    if !Path::new(info.path).exists() {
+        return Ok(()); // Skip if data doesn't exist
+    }
+
+    let schema = Arc::new(infer_schema(info.path)?);
+    let table = Arc::new(ZarrTable::new(schema.clone(), info.path));
+    ctx.register_table(info.name, table)?;
+
     println!(
-        "Columns: {}",
+        "  {} ({}) - columns: {}",
+        info.name,
+        info.path,
         schema
             .fields()
             .iter()
@@ -37,7 +52,30 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             .collect::<Vec<_>>()
             .join(", ")
     );
-    println!("Type SQL queries or 'quit' to exit.\n");
+
+    Ok(())
+}
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let ctx = SessionContext::new();
+
+    println!("Zarr-DataFusion CLI");
+    println!("Registered tables:");
+
+    let mut registered = Vec::new();
+    for info in TABLES {
+        if Path::new(info.path).exists() {
+            register_table(&ctx, info)?;
+            registered.push(info.name);
+        }
+    }
+
+    if registered.is_empty() {
+        println!("  (none) - run ./scripts/generate_data.sh first");
+    }
+
+    println!("\nType SQL queries or 'help' for commands.\n");
 
     let mut rl = DefaultEditor::new()?;
 
@@ -62,7 +100,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
                 if line.starts_with("\\d") || line.eq_ignore_ascii_case("show tables") {
                     println!("Tables:");
-                    println!("  weather");
+                    for name in &registered {
+                        println!("  {}", name);
+                    }
                     continue;
                 }
 
@@ -104,9 +144,14 @@ Zarr-DataFusion CLI Commands:
   help          Show this help
   quit/exit     Exit the CLI
 
-Example queries:
-  SELECT * FROM weather LIMIT 10;
-  SELECT AVG(temperature) FROM weather GROUP BY lat, lon;
+Example queries (synthetic data):
+  SELECT * FROM synthetic LIMIT 10;
+  SELECT AVG(temperature) FROM synthetic GROUP BY lat, lon;
+
+Example queries (ERA5 data):
+  SELECT * FROM era5 LIMIT 10;
+  SELECT hybrid, AVG(temperature) as avg_temp FROM era5 GROUP BY hybrid;
+  SELECT latitude, longitude, temperature FROM era5 WHERE temperature > 300 LIMIT 10;
 "#
     );
 }

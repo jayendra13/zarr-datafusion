@@ -38,7 +38,7 @@ This library flattens the 3D structure into rows where each row represents one g
 4. **Dimension ordering** — Coordinates are sorted alphabetically, and data variable dimensions are assumed to follow this same order.
 
 ```
-weather.zarr/
+synthetic.zarr/
 ├── lat/          shape: [10]          → coordinate
 ├── lon/          shape: [10]          → coordinate
 ├── time/         shape: [7]           → coordinate
@@ -67,14 +67,14 @@ async fn main() -> datafusion::error::Result<()> {
     let ctx = SessionContext::new();
 
     // Schema is automatically inferred from Zarr metadata
-    let schema = Arc::new(infer_schema("data/weather.zarr").expect("Failed to infer schema"));
-    let table = Arc::new(ZarrTable::new(schema, "data/weather.zarr"));
+    let schema = Arc::new(infer_schema("data/synthetic.zarr").expect("Failed to infer schema"));
+    let table = Arc::new(ZarrTable::new(schema, "data/synthetic.zarr"));
 
-    ctx.register_table("weather", table)?;
+    ctx.register_table("synthetic", table)?;
 
     // Query with SQL
-    let df = ctx.sql("SELECT timestamp, lat, lon, temperature
-                      FROM weather
+    let df = ctx.sql("SELECT time, lat, lon, temperature
+                      FROM synthetic
                       WHERE temperature > 5
                       LIMIT 10").await?;
     df.show().await?;
@@ -87,24 +87,24 @@ async fn main() -> datafusion::error::Result<()> {
 
 ```
 Sample data (first 10 rows):
-+-----------+-----+-----+-------------+----------+
-| timestamp | lat | lon | temperature | humidity |
-+-----------+-----+-----+-------------+----------+
-| 0         | 0   | 0   | 43          | 55       |
-| 0         | 0   | 1   | 51          | 62       |
-| 0         | 0   | 2   | 39          | 70       |
-| ...       | ... | ... | ...         | ...      |
-+-----------+-----+-----+-------------+----------+
++-----+-----+------+----------+-------------+
+| lat | lon | time | humidity | temperature |
++-----+-----+------+----------+-------------+
+| 0   | 0   | 0    | 21       | 52          |
+| 0   | 0   | 1    | 34       | 1           |
+| 0   | 0   | 2    | 61       | 42          |
+| ... | ... | ...  | ...      | ...         |
++-----+-----+------+----------+-------------+
 
 Average temperature per day:
-+-----------+----------+
-| timestamp | avg_temp |
-+-----------+----------+
-| 0         | 5.35     |
-| 1         | 3.08     |
-| 2         | 0.88     |
-| ...       | ...      |
-+-----------+----------+
++------+----------+
+| time | avg_temp |
++------+----------+
+| 0    | 7.07     |
+| 1    | 3.69     |
+| 2    | 1.38     |
+| ...  | ...      |
++------+----------+
 ```
 
 ## Building
@@ -118,13 +118,14 @@ cargo build
 First, generate sample Zarr data:
 
 ```bash
-uv run --with zarr --with numpy data_gen.py
+./scripts/generate_data.sh
 ```
 
-Then run the example:
+Then run the examples:
 
 ```bash
-cargo run --example query_zarr
+cargo run --example query_synthetic  # Query synthetic data
+cargo run --example query_era5       # Query ERA5 climate data
 ```
 
 ## Interactive CLI
@@ -139,11 +140,15 @@ cargo run --bin zarr-cli
 
 ```
 Zarr-DataFusion CLI
-Registered table: weather (from data/weather.zarr)
-Columns: lat, lon, time, humidity, temperature
-Type SQL queries or 'quit' to exit.
+Registered tables:
+  synthetic (data/synthetic.zarr) - columns: lat, lon, time, humidity, temperature
+  era5 (data/era5.zarr) - columns: hybrid, latitude, longitude, time, geopotential, temperature
 
-zarr> SELECT * FROM weather LIMIT 5;
+Type SQL queries or 'help' for commands.
+
+zarr> show tables
+zarr> SELECT * FROM synthetic LIMIT 5;
+zarr> SELECT * FROM era5 LIMIT 5;
 zarr> help
 zarr> quit
 ```
@@ -152,29 +157,29 @@ zarr> quit
 
 **Sample data:**
 ```sql
-SELECT * FROM weather LIMIT 10;
+SELECT * FROM synthetic LIMIT 10;
 ```
 
 **Filter by temperature:**
 ```sql
-SELECT timestamp, lat, lon, temperature
-FROM weather
+SELECT time, lat, lon, temperature
+FROM synthetic
 WHERE temperature > 20
 LIMIT 10;
 ```
 
-**Average temperature per timestamp:**
+**Average temperature per time step:**
 ```sql
-SELECT timestamp, AVG(temperature) as avg_temp
-FROM weather
-GROUP BY timestamp
-ORDER BY timestamp;
+SELECT time, AVG(temperature) as avg_temp
+FROM synthetic
+GROUP BY time
+ORDER BY time;
 ```
 
 **Find locations where temperature is always below 10:**
 ```sql
 SELECT lat, lon, MAX(temperature) as max_temp
-FROM weather
+FROM synthetic
 GROUP BY lat, lon
 HAVING MAX(temperature) < 10
 ORDER BY max_temp;
@@ -186,7 +191,7 @@ SELECT lat, lon,
        MIN(temperature) as min_temp,
        MAX(temperature) as max_temp,
        AVG(temperature) as avg_temp
-FROM weather
+FROM synthetic
 GROUP BY lat, lon
 ORDER BY avg_temp DESC
 LIMIT 10;
@@ -222,7 +227,7 @@ src/
 - [x] Memory efficient co-ord expansion (DictionaryArray)
 - [ ] Zarr Codecs
 - [ ] Zero Copy data
-- [ ] Read ERA5 climate dataset from local disk.
+- [x] Read ERA5 climate dataset from local disk.
 - [ ] Read ERA5 dataset from cloud storage (S3/GCS buckets).
 - [ ] DMA while reading from Cloud
 - [ ] Integrate [icechunk](https://github.com/earth-mover/icechunk) for transactional Zarr reads
