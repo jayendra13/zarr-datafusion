@@ -78,7 +78,9 @@ pub struct ZarrStoreMeta {
 }
 
 /// Discover all arrays in a Zarr v3 store
-pub fn discover_arrays(store_path: &str) -> Result<ZarrStoreMeta, Box<dyn std::error::Error + Send + Sync>> {
+pub fn discover_arrays(
+    store_path: &str,
+) -> Result<ZarrStoreMeta, Box<dyn std::error::Error + Send + Sync>> {
     let root = Path::new(store_path);
     let mut arrays: Vec<ZarrArrayMeta> = Vec::new();
 
@@ -111,15 +113,27 @@ pub fn discover_arrays(store_path: &str) -> Result<ZarrStoreMeta, Box<dyn std::e
                         .unwrap_or("float64")
                         .to_string();
 
-                    arrays.push(ZarrArrayMeta { name, data_type, shape });
+                    arrays.push(ZarrArrayMeta {
+                        name,
+                        data_type,
+                        shape,
+                    });
                 }
             }
         }
     }
 
     // Separate and sort
-    let mut coords: Vec<_> = arrays.iter().filter(|a| a.is_coordinate()).cloned().collect();
-    let mut data_vars: Vec<_> = arrays.iter().filter(|a| !a.is_coordinate()).cloned().collect();
+    let mut coords: Vec<_> = arrays
+        .iter()
+        .filter(|a| a.is_coordinate())
+        .cloned()
+        .collect();
+    let mut data_vars: Vec<_> = arrays
+        .iter()
+        .filter(|a| !a.is_coordinate())
+        .cloned()
+        .collect();
 
     coords.sort_by(|a, b| a.name.cmp(&b.name));
     data_vars.sort_by(|a, b| a.name.cmp(&b.name));

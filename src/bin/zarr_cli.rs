@@ -1,11 +1,11 @@
-use std::path::Path;
+use std::collections::HashMap;
 use std::sync::Arc;
 
-use datafusion::prelude::SessionContext;
+use datafusion::execution::session_state::SessionStateBuilder;
+use datafusion::prelude::{SessionConfig, SessionContext};
 use rustyline::error::ReadlineError;
 use rustyline::DefaultEditor;
-use zarr_datafusion::datasource::zarr::ZarrTable;
-use zarr_datafusion::reader::schema_inference::infer_schema;
+use zarr_datafusion::datasource::factory::ZarrTableFactory;
 
 // Why `Send + Sync` in the error type?
 //
@@ -19,62 +19,20 @@ use zarr_datafusion::reader::schema_inference::infer_schema;
 // - Rust Send/Sync traits: https://doc.rust-lang.org/nomicon/send-and-sync.html
 // - DataFusion async execution: https://docs.rs/datafusion/latest/datafusion/execution/context/struct.SessionContext.html
 
-struct TableInfo {
-    name: &'static str,
-    path: &'static str,
-}
-
-const TABLES: &[TableInfo] = &[
-    TableInfo { name: "synthetic", path: "data/synthetic.zarr" },
-    TableInfo { name: "era5", path: "data/era5.zarr" },
-];
-
-fn register_table(
-    ctx: &SessionContext,
-    info: &TableInfo,
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    if !Path::new(info.path).exists() {
-        return Ok(()); // Skip if data doesn't exist
-    }
-
-    let schema = Arc::new(infer_schema(info.path)?);
-    let table = Arc::new(ZarrTable::new(schema.clone(), info.path));
-    ctx.register_table(info.name, table)?;
-
-    println!(
-        "  {} ({}) - columns: {}",
-        info.name,
-        info.path,
-        schema
-            .fields()
-            .iter()
-            .map(|f| f.name().as_str())
-            .collect::<Vec<_>>()
-            .join(", ")
-    );
-
-    Ok(())
-}
-
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let ctx = SessionContext::new();
+    let config = SessionConfig::new().with_information_schema(true);
+    let state = SessionStateBuilder::new()
+        .with_default_features()
+        .with_config(config)
+        .with_table_factories(HashMap::from([(
+            "ZARR".to_string(),
+            Arc::new(ZarrTableFactory) as _,
+        )]))
+        .build();
+    let ctx = SessionContext::new_with_state(state);
 
     println!("Zarr-DataFusion CLI");
-    println!("Registered tables:");
-
-    let mut registered = Vec::new();
-    for info in TABLES {
-        if Path::new(info.path).exists() {
-            register_table(&ctx, info)?;
-            registered.push(info.name);
-        }
-    }
-
-    if registered.is_empty() {
-        println!("  (none) - run ./scripts/generate_data.sh first");
-    }
-
     println!("\nType SQL queries or 'help' for commands.\n");
 
     let mut rl = DefaultEditor::new()?;
@@ -99,9 +57,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 }
 
                 if line.starts_with("\\d") || line.eq_ignore_ascii_case("show tables") {
-                    println!("Tables:");
-                    for name in &registered {
-                        println!("  {}", name);
+                    match ctx.sql("SHOW TABLES").await {
+                        Ok(df) => {
+                            if let Err(e) = df.show().await {
+                                eprintln!("Error: {e}");
+                            }
+                        }
+                        Err(e) => eprintln!("Error: {e}"),
                     }
                     continue;
                 }
@@ -109,7 +71,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 // Execute SQL
                 match ctx.sql(line).await {
                     Ok(df) => {
-                        if let Err(e) = df.show().await {
+                        // DDL statements return empty results - don't show the empty table
+                        let line_upper = line.to_uppercase();
+                        let is_ddl = line_upper.starts_with("CREATE ")
+                            || line_upper.starts_with("DROP ")
+                            || line_upper.starts_with("ALTER ");
+
+                        if is_ddl {
+                            // Execute DDL silently - only show errors
+                            if let Err(e) = df.collect().await {
+                                eprintln!("Error: {e}");
+                            }
+                        } else if let Err(e) = df.show().await {
                             eprintln!("Error displaying results: {e}");
                         }
                     }
@@ -137,21 +110,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 fn print_help() {
     println!(
         r#"
-Zarr-DataFusion CLI Commands:
-  <SQL>         Execute a SQL query
-  show tables   List registered tables
-  \d            List registered tables
-  help          Show this help
-  quit/exit     Exit the CLI
+  Zarr-DataFusion CLI Commands:
+    <SQL>           Execute a SQL query
+    show tables     List registered tables
+    \d              List registered tables
+    help            Show this help
+    quit/exit       Exit the CLI
 
-Example queries (synthetic data):
-  SELECT * FROM synthetic LIMIT 10;
-  SELECT AVG(temperature) FROM synthetic GROUP BY lat, lon;
+  Loading data:
+    CREATE EXTERNAL TABLE <name> STORED AS ZARR LOCATION '<path>';
+    DROP TABLE <name>;
 
-Example queries (ERA5 data):
-  SELECT * FROM era5 LIMIT 10;
-  SELECT hybrid, AVG(temperature) as avg_temp FROM era5 GROUP BY hybrid;
-  SELECT latitude, longitude, temperature FROM era5 WHERE temperature > 300 LIMIT 10;
-"#
+  Example:
+    CREATE EXTERNAL TABLE weather STORED AS ZARR LOCATION 'data/synthetic.zarr';
+    SELECT * FROM weather LIMIT 10;
+    SELECT AVG(temperature) FROM weather GROUP BY lat, lon;
+    DROP TABLE weather;
+  "#
     );
 }

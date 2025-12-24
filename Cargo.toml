@@ -12,8 +12,12 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 zarrs = { version = "0.22.10", features = ["ndarray"] }
 
 [[example]]
-name = "query_zarr"
-path = "examples/query_zarr.rs"
+name = "query_era5"
+path = "examples/query_era5.rs"
+
+[[example]]
+name = "query_synthetic"
+path = "examples/query_synthetic.rs"
 
 [[bin]]
 name = "zarr-cli"

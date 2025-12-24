@@ -4,7 +4,9 @@
 //! (1D coordinates, nD data variables as Cartesian product of coordinates).
 
 use arrow::{
-    array::{ArrayRef, DictionaryArray, Float32Array, Float64Array, Int16Array, Int64Array, RecordBatch},
+    array::{
+        ArrayRef, DictionaryArray, Float32Array, Float64Array, Int16Array, Int64Array, RecordBatch,
+    },
     datatypes::{DataType, Int16Type, Schema, SchemaRef},
 };
 use datafusion::{
@@ -36,11 +38,14 @@ pub fn read_zarr(
     let store = Arc::new(FilesystemStore::new(store_path).map_err(zarr_err)?);
 
     // Discover store structure
-    let store_meta =
-        discover_arrays(store_path).map_err(|e| DataFusionError::External(e))?;
+    let store_meta = discover_arrays(store_path).map_err(DataFusionError::External)?;
 
     let coord_names: Vec<_> = store_meta.coords.iter().map(|c| c.name.clone()).collect();
-    let coord_types: Vec<_> = store_meta.coords.iter().map(|c| c.data_type.clone()).collect();
+    let coord_types: Vec<_> = store_meta
+        .coords
+        .iter()
+        .map(|c| c.data_type.clone())
+        .collect();
 
     // Load coordinate arrays and get their sizes
     let mut coord_sizes: Vec<usize> = Vec::new();
@@ -101,8 +106,7 @@ pub fn read_zarr(
             result_arrays.push(dict_array);
         } else {
             // Data variable - read and flatten based on schema type
-            let arr =
-                Array::open(store.clone(), &format!("/{}", field_name)).map_err(zarr_err)?;
+            let arr = Array::open(store.clone(), &format!("/{}", field_name)).map_err(zarr_err)?;
             let subset = ArraySubset::new_with_shape(arr.shape().to_vec());
 
             let array: ArrayRef = match field.data_type() {
@@ -161,15 +165,24 @@ fn create_coord_dictionary_typed(
     match values {
         CoordValues::Int64(vals) => {
             let values_array = Int64Array::from(vals.clone());
-            Arc::new(DictionaryArray::<Int16Type>::new(keys_array, Arc::new(values_array)))
+            Arc::new(DictionaryArray::<Int16Type>::new(
+                keys_array,
+                Arc::new(values_array),
+            ))
         }
         CoordValues::Float32(vals) => {
             let values_array = Float32Array::from(vals.clone());
-            Arc::new(DictionaryArray::<Int16Type>::new(keys_array, Arc::new(values_array)))
+            Arc::new(DictionaryArray::<Int16Type>::new(
+                keys_array,
+                Arc::new(values_array),
+            ))
         }
         CoordValues::Float64(vals) => {
             let values_array = Float64Array::from(vals.clone());
-            Arc::new(DictionaryArray::<Int16Type>::new(keys_array, Arc::new(values_array)))
+            Arc::new(DictionaryArray::<Int16Type>::new(
+                keys_array,
+                Arc::new(values_array),
+            ))
         }
     }
 }

@@ -132,23 +132,32 @@ cargo run --example query_era5       # Query ERA5 climate data
 
 An interactive SQL shell is included for exploring Zarr data:
 
-The CLI automatically infers the schema from Zarr v3 metadata. Coordinate arrays (1D) become columns, and data arrays (nD) are flattened.
-
 ```bash
 cargo run --bin zarr-cli
 ```
 
+### Loading Zarr Data
+
+Use standard SQL `CREATE EXTERNAL TABLE` syntax to load Zarr stores:
+
+```sql
+zarr> CREATE EXTERNAL TABLE weather STORED AS ZARR LOCATION 'data/synthetic.zarr';
+zarr> SHOW TABLES;
+zarr> SELECT * FROM weather LIMIT 5;
+zarr> DROP TABLE weather;
+```
+
+The schema is automatically inferred from Zarr v3 metadata. Coordinate arrays (1D) become columns, and data arrays (nD) are flattened.
+
 ```
 Zarr-DataFusion CLI
-Registered tables:
-  synthetic (data/synthetic.zarr) - columns: lat, lon, time, humidity, temperature
-  era5 (data/era5.zarr) - columns: hybrid, latitude, longitude, time, geopotential, temperature
 
 Type SQL queries or 'help' for commands.
 
-zarr> show tables
+zarr> CREATE EXTERNAL TABLE synthetic STORED AS ZARR LOCATION 'data/synthetic.zarr';
+zarr> CREATE EXTERNAL TABLE era5 STORED AS ZARR LOCATION 'data/era5.zarr';
+zarr> SHOW TABLES;
 zarr> SELECT * FROM synthetic LIMIT 5;
-zarr> SELECT * FROM era5 LIMIT 5;
 zarr> help
 zarr> quit
 ```
@@ -204,9 +213,11 @@ src/
 ├── bin/
 │   └── zarr_cli.rs       # Interactive SQL shell (REPL)
 ├── reader/
-│   └── zarr_reader.rs    # Low-level Zarr reading and Arrow conversion
+│   ├── schema_inference.rs  # Infer Arrow schema from Zarr metadata
+│   └── zarr_reader.rs       # Low-level Zarr reading and Arrow conversion
 ├── datasource/
-│   └── zarr.rs           # DataFusion TableProvider implementation
+│   ├── zarr.rs           # DataFusion TableProvider implementation
+│   └── factory.rs        # TableProviderFactory for CREATE EXTERNAL TABLE
 └── physical_plan/
     └── zarr_exec.rs      # DataFusion ExecutionPlan for scanning
 ```
