@@ -257,18 +257,61 @@ src/
 
 ## Roadmap
 
+### Completed
 - [x] Add REPL for quick queries
 - [x] Support Schema Inference
-- [x] Projection Push down
 - [x] Memory efficient co-ord expansion (DictionaryArray)
 - [x] Read ERA5 climate dataset from local disk
 - [x] Zarr v2 support (without codecs)
-- [ ] Filter push down
 - [x] Zarr Codecs (Blosc, etc.)
-- [ ] Zero Copy data
-- [ ] Read ERA5 dataset from cloud storage (S3/GCS buckets)
-- [ ] DMA while reading from Cloud
+
+### Pushdown Optimizations
+- [x] Projection pushdown (only read requested columns)
+- [x] Limit pushdown (slice results to limit)
+- [ ] Filter pushdown
+  - [ ] Coordinate equality (`WHERE lat = 5`)
+  - [ ] Coordinate range (`WHERE time BETWEEN 2 AND 4`)
+  - [ ] Partition pruning (skip chunks based on coordinate ranges)
+  - [ ] Data variable filter (`WHERE temperature > 20`)
+- [ ] Aggregate pushdown (push `SUM/AVG/COUNT` to chunk level)
+- [ ] Top-K optimization (`ORDER BY x LIMIT k` without full sort)
+
+### REPL Experience
+- [ ] Tab completion (tables, columns, SQL keywords)
+- [ ] Syntax highlighting
+- [ ] Multi-line query editing
+- [ ] Query history persistence (~/.zarr_cli_history)
+- [ ] Output formats (table, csv, json, parquet)
+- [ ] Timing statistics (`Query took 1.23s, 1000 rows`)
+- [ ] Progress bar for long-running queries
+- [ ] `.schema <table>` command for quick schema view
+- [ ] Pager support for large results (less/more)
+
+### Performance
+- [ ] Chunk-level parallelism (read chunks concurrently)
+- [ ] Streaming RecordBatch output (multiple batches instead of one)
+- [ ] Zero-copy reads with memory-mapped I/O
+- [ ] Statistics-based chunk pruning
+
+### Data Types
+- [ ] Additional numeric types (uint8/16/32, int8/16/32, float16)
+- [ ] String/datetime coordinates
+- [ ] Handle fill_value as Arrow nulls
+- [ ] Expose Zarr attributes in Arrow schema metadata
+
+### Cloud & Storage
+- [ ] Read from cloud storage (S3/GCS/Azure) via `object_store` crate
+- [ ] HTTP/HTTPS Zarr backend
+- [ ] Async chunk prefetching
+- [ ] LRU cache for frequently accessed chunks
+
+### Interoperability
 - [ ] Integrate [icechunk](https://github.com/earth-mover/icechunk) for transactional Zarr reads
+- [ ] [Kerchunk](https://github.com/fsspec/kerchunk)/VirtualiZarr support (virtual references to NetCDF/HDF5)
+- [ ] Integrate with [xarray-sql](https://github.com/xarray-contrib/xarray-sql)
+- [ ] Python bindings via PyO3
+- [ ] Arrow Flight server
+
+### Challenges
 - [ ] Tackle the [One Trillion Row Challenge](https://github.com/coiled/1trc) with Zarr + DataFusion
-- [ ] Integrate with [xarray-sql](https://github.com/xarray-contrib/xarray-sql) for xarray interoperability
 
