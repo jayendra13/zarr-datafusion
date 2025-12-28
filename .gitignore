@@ -1,2 +1,2 @@
 /target
-data/**
+data/era5_*.zarr

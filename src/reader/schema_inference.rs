@@ -327,3 +327,221 @@ pub fn infer_schema(store_path: &str) -> Result<Schema, Box<dyn std::error::Erro
 
     Ok(Schema::new(fields))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ==================== parse_v2_dtype tests ====================
+
+    #[test]
+    fn test_parse_v2_dtype_all_types() {
+        let cases = [
+            // Integers
+            ("<i8", "int64"),
+            ("<i4", "int32"),
+            ("<i2", "int16"),
+            ("<i1", "int8"),
+            // Unsigned integers
+            ("<u8", "uint64"),
+            ("<u4", "uint32"),
+            ("<u2", "uint16"),
+            ("<u1", "uint8"),
+            // Floats
+            ("<f8", "float64"),
+            ("<f4", "float32"),
+            ("<f2", "float16"),
+            // Bool
+            ("|b1", "bool"),
+        ];
+        for (input, expected) in cases {
+            assert_eq!(parse_v2_dtype(input), expected, "Failed for {}", input);
+        }
+    }
+
+    #[test]
+    fn test_parse_v2_dtype_big_endian() {
+        assert_eq!(parse_v2_dtype(">i8"), "int64");
+        assert_eq!(parse_v2_dtype(">f4"), "float32");
+    }
+
+    #[test]
+    fn test_parse_v2_dtype_edge_cases() {
+        // Malformed/short strings default to float64
+        assert_eq!(parse_v2_dtype("x"), "float64");
+        assert_eq!(parse_v2_dtype(""), "float64");
+        // Unknown type char defaults to float64
+        assert_eq!(parse_v2_dtype("<x8"), "float64");
+    }
+
+    // ==================== detect_zarr_version tests ====================
+
+    #[test]
+    fn test_detect_zarr_version_v2() {
+        assert_eq!(detect_zarr_version("data/synthetic_v2.zarr").unwrap(), ZarrVersion::V2);
+        assert_eq!(detect_zarr_version("data/synthetic_v2_blosc.zarr").unwrap(), ZarrVersion::V2);
+    }
+
+    #[test]
+    fn test_detect_zarr_version_v3() {
+        assert_eq!(detect_zarr_version("data/synthetic_v3.zarr").unwrap(), ZarrVersion::V3);
+        assert_eq!(detect_zarr_version("data/synthetic_v3_blosc.zarr").unwrap(), ZarrVersion::V3);
+    }
+
+    #[test]
+    fn test_detect_zarr_version_error() {
+        assert!(detect_zarr_version("data/nonexistent.zarr").is_err());
+    }
+
+    // ==================== zarr_dtype_to_arrow tests ====================
+
+    #[test]
+    fn test_zarr_dtype_to_arrow_all_types() {
+        let cases = [
+            ("int8", DataType::Int8),
+            ("int16", DataType::Int16),
+            ("int32", DataType::Int32),
+            ("int64", DataType::Int64),
+            ("uint8", DataType::UInt8),
+            ("uint16", DataType::UInt16),
+            ("uint32", DataType::UInt32),
+            ("uint64", DataType::UInt64),
+            ("float16", DataType::Float16),
+            ("float32", DataType::Float32),
+            ("float64", DataType::Float64),
+            ("bool", DataType::Boolean),
+            ("unknown", DataType::Utf8), // fallback
+        ];
+        for (input, expected) in cases {
+            assert_eq!(zarr_dtype_to_arrow(input), expected, "Failed for {}", input);
+        }
+    }
+
+    // ==================== ZarrArrayMeta tests ====================
+
+    #[test]
+    fn test_array_meta_is_coordinate() {
+        // 1D arrays are coordinates
+        let coord = ZarrArrayMeta {
+            name: "lat".to_string(),
+            data_type: "float64".to_string(),
+            shape: vec![10],
+        };
+        assert!(coord.is_coordinate());
+
+        // 2D and 3D arrays are NOT coordinates
+        let data_2d = ZarrArrayMeta {
+            name: "temp".to_string(),
+            data_type: "float64".to_string(),
+            shape: vec![10, 10],
+        };
+        assert!(!data_2d.is_coordinate());
+
+        let data_3d = ZarrArrayMeta {
+            name: "temp".to_string(),
+            data_type: "float64".to_string(),
+            shape: vec![7, 10, 10],
+        };
+        assert!(!data_3d.is_coordinate());
+    }
+
+    // ==================== discover_arrays tests ====================
+
+    #[test]
+    fn test_discover_arrays_v2() {
+        let meta = discover_arrays("data/synthetic_v2.zarr").unwrap();
+
+        // 3 coordinates (sorted): lat, lon, time
+        assert_eq!(meta.coords.len(), 3);
+        let coord_names: Vec<_> = meta.coords.iter().map(|c| c.name.as_str()).collect();
+        assert_eq!(coord_names, vec!["lat", "lon", "time"]);
+
+        // 2 data variables (sorted): humidity, temperature
+        assert_eq!(meta.data_vars.len(), 2);
+        let var_names: Vec<_> = meta.data_vars.iter().map(|v| v.name.as_str()).collect();
+        assert_eq!(var_names, vec!["humidity", "temperature"]);
+
+        // Shapes
+        assert_eq!(meta.coords[0].shape, vec![10]); // lat
+        assert_eq!(meta.coords[1].shape, vec![10]); // lon
+        assert_eq!(meta.coords[2].shape, vec![7]);  // time
+        assert_eq!(meta.data_vars[0].shape, vec![7, 10, 10]); // humidity
+        assert_eq!(meta.data_vars[1].shape, vec![7, 10, 10]); // temperature
+
+        // All dtypes should be int64 (from <i8)
+        for arr in meta.coords.iter().chain(meta.data_vars.iter()) {
+            assert_eq!(arr.data_type, "int64");
+        }
+    }
+
+    #[test]
+    fn test_discover_arrays_v3() {
+        let meta = discover_arrays("data/synthetic_v3.zarr").unwrap();
+
+        // Same structure as v2
+        assert_eq!(meta.coords.len(), 3);
+        assert_eq!(meta.data_vars.len(), 2);
+
+        let coord_names: Vec<_> = meta.coords.iter().map(|c| c.name.as_str()).collect();
+        assert_eq!(coord_names, vec!["lat", "lon", "time"]);
+
+        let var_names: Vec<_> = meta.data_vars.iter().map(|v| v.name.as_str()).collect();
+        assert_eq!(var_names, vec!["humidity", "temperature"]);
+    }
+
+    // ==================== infer_schema tests ====================
+
+    #[test]
+    fn test_infer_schema_structure() {
+        let schema = infer_schema("data/synthetic_v2.zarr").unwrap();
+
+        // 5 fields: 3 coords + 2 data vars
+        assert_eq!(schema.fields().len(), 5);
+
+        let names: Vec<_> = schema.fields().iter().map(|f| f.name().as_str()).collect();
+        assert_eq!(names, vec!["lat", "lon", "time", "humidity", "temperature"]);
+    }
+
+    #[test]
+    fn test_infer_schema_coord_types() {
+        let schema = infer_schema("data/synthetic_v2.zarr").unwrap();
+
+        // First 3 fields (coordinates) should be Dictionary type, non-nullable
+        for i in 0..3 {
+            let field = schema.field(i);
+            assert!(
+                matches!(field.data_type(), DataType::Dictionary(_, _)),
+                "Coordinate {} should be Dictionary type",
+                field.name()
+            );
+            assert!(!field.is_nullable(), "Coordinate {} should not be nullable", field.name());
+        }
+    }
+
+    #[test]
+    fn test_infer_schema_data_var_types() {
+        let schema = infer_schema("data/synthetic_v2.zarr").unwrap();
+
+        // Last 2 fields (data vars) should be regular Int64, nullable
+        for i in 3..5 {
+            let field = schema.field(i);
+            assert_eq!(field.data_type(), &DataType::Int64, "Data var {} should be Int64", field.name());
+            assert!(field.is_nullable(), "Data var {} should be nullable", field.name());
+        }
+    }
+
+    #[test]
+    fn test_infer_schema_v2_v3_parity() {
+        let schema_v2 = infer_schema("data/synthetic_v2.zarr").unwrap();
+        let schema_v3 = infer_schema("data/synthetic_v3.zarr").unwrap();
+
+        // Both should produce identical schemas
+        assert_eq!(schema_v2.fields().len(), schema_v3.fields().len());
+
+        for (f2, f3) in schema_v2.fields().iter().zip(schema_v3.fields().iter()) {
+            assert_eq!(f2.name(), f3.name(), "Field names should match");
+            assert_eq!(f2.data_type(), f3.data_type(), "Data types should match for {}", f2.name());
+            assert_eq!(f2.is_nullable(), f3.is_nullable(), "Nullability should match for {}", f2.name());
+        }
+    }
+}

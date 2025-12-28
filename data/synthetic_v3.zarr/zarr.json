@@ -1,0 +1,8 @@
+{
+  "attributes": {
+    "title": "Weekly Weather Sample",
+    "conventions": "Zarr v3"
+  },
+  "zarr_format": 3,
+  "node_type": "group"
+}
