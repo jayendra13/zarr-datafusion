@@ -27,8 +27,8 @@ async fn run_query(
 async fn main() -> datafusion::error::Result<()> {
     let ctx = SessionContext::new();
 
-    // Load synthetic weather data
-    let store_path = "data/synthetic.zarr";
+    // Load synthetic weather data (Zarr v3)
+    let store_path = "data/synthetic_v3.zarr";
     let schema = Arc::new(infer_schema(store_path).expect("Failed to infer schema"));
 
     println!("Synthetic Weather Data Schema:");
