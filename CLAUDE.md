@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-zarr-datafusion is a Rust library integrating Zarr v3 array storage with Apache DataFusion for querying multidimensional scientific data using SQL. It flattens nD gridded data into a 2D tabular format.
+zarr-datafusion is a Rust library integrating Zarr (v2 and v3) array storage with Apache DataFusion for querying multidimensional scientific data using SQL. It flattens nD gridded data into a 2D tabular format.
 
 ## Build Commands
 
@@ -57,15 +57,23 @@ weather.zarr/
 ## Test Data
 
 ```bash
-uv run --with zarr --with numpy data_gen.py
+./scripts/generate_data.sh
 ```
 
-Generates `data/weather.zarr` with 5 arrays: time(7), lat(10), lon(10), temperature(7×10×10), humidity(7×10×10). Uses seed=42 for reproducible random data.
+Generates 8 dataset variations in `data/`:
+- `synthetic_v2.zarr`, `synthetic_v2_blosc.zarr` — Zarr v2 (with/without Blosc)
+- `synthetic_v3.zarr`, `synthetic_v3_blosc.zarr` — Zarr v3 (with/without Blosc)
+- `era5_v2.zarr`, `era5_v2_blosc.zarr` — ERA5 climate data, Zarr v2
+- `era5_v3.zarr`, `era5_v3_blosc.zarr` — ERA5 climate data, Zarr v3
+
+Synthetic data: time(7), lat(10), lon(10), temperature(7×10×10), humidity(7×10×10). Uses seed=42.
 
 ## Key Types
 
 - `ZarrTable` — DataFusion TableProvider for Zarr stores
 - `ZarrExec` — Physical execution plan
-- `infer_schema()` — Infers Arrow schema from Zarr v3 metadata
+- `ZarrVersion` — Enum for v2/v3 format detection
+- `infer_schema()` — Infers Arrow schema from Zarr v2/v3 metadata
+- `detect_zarr_version()` — Detects Zarr format version from metadata files
 - `read_zarr()` — Reads Zarr arrays into Arrow RecordBatch
 - `DictionaryArray<Int16Type>` — Used for coordinate columns (keys=indices, values=unique coords)
