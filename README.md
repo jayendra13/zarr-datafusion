@@ -1,10 +1,10 @@
 # zarr-datafusion
 
-A Rust library that integrates [Zarr v3](https://zarr.dev/) array storage with [Apache DataFusion](https://datafusion.apache.org/) for querying multidimensional scientific data using SQL.
+A Rust library that integrates [Zarr](https://zarr.dev/) (v2 and v3) array storage with [Apache DataFusion](https://datafusion.apache.org/) for querying multidimensional scientific data using SQL.
 
 ## Overview
 
-This library allows you to query Zarr stores (commonly used for weather, climate, and scientific datasets) using DataFusion's SQL engine. It flattens multidimensional arrays into a tabular format, enabling SQL queries over gridded data.
+This library allows you to query Zarr stores (commonly used for weather, climate, and scientific datasets) using DataFusion's SQL engine. It flattens multidimensional arrays into a tabular format, enabling SQL queries over gridded data. Both Zarr v2 and v3 formats are supported.
 
 ### How It Works
 
@@ -38,17 +38,29 @@ This library flattens the 3D structure into rows where each row represents one g
 4. **Dimension ordering** — Coordinates are sorted alphabetically, and data variable dimensions are assumed to follow this same order.
 
 ```
-synthetic.zarr/
-├── lat/          shape: [10]          → coordinate
-├── lon/          shape: [10]          → coordinate
-├── time/         shape: [7]           → coordinate
-├── temperature/  shape: [10, 10, 7]   → data variable (lat × lon × time)
-└── humidity/     shape: [10, 10, 7]   → data variable (lat × lon × time)
+# Zarr v3 structure
+synthetic_v3.zarr/
+├── zarr.json                 → group metadata
+├── lat/zarr.json             → array metadata (shape: [10])
+├── lon/zarr.json             → array metadata (shape: [10])
+├── time/zarr.json            → array metadata (shape: [7])
+├── temperature/zarr.json     → array metadata (shape: [10, 10, 7])
+└── humidity/zarr.json        → array metadata (shape: [10, 10, 7])
+
+# Zarr v2 structure
+synthetic_v2.zarr/
+├── .zgroup                   → group metadata
+├── .zattrs                   → group attributes
+├── lat/.zarray               → array metadata (shape: [10])
+├── lon/.zarray               → array metadata (shape: [10])
+├── time/.zarray              → array metadata (shape: [7])
+├── temperature/.zarray       → array metadata (shape: [10, 10, 7])
+└── humidity/.zarray          → array metadata (shape: [10, 10, 7])
 ```
 
 ## Features
 
-- **Zarr v3 support** via the [zarrs](https://crates.io/crates/zarrs) crate
+- **Zarr v2 and v3 support** via the [zarrs](https://crates.io/crates/zarrs) crate
 - **Schema inference**: Automatically infers Arrow schema from Zarr metadata
 - **Projection pushdown**: Only reads arrays that are needed for the query
 - **Memory efficient coordinates**: Uses Arrow DictionaryArray for coordinate columns (~75% memory savings)
@@ -66,9 +78,9 @@ use zarr_datafusion::reader::schema_inference::infer_schema;
 async fn main() -> datafusion::error::Result<()> {
     let ctx = SessionContext::new();
 
-    // Schema is automatically inferred from Zarr metadata
-    let schema = Arc::new(infer_schema("data/synthetic.zarr").expect("Failed to infer schema"));
-    let table = Arc::new(ZarrTable::new(schema, "data/synthetic.zarr"));
+    // Schema is automatically inferred from Zarr metadata (v2 or v3)
+    let schema = Arc::new(infer_schema("data/synthetic_v3.zarr").expect("Failed to infer schema"));
+    let table = Arc::new(ZarrTable::new(schema, "data/synthetic_v3.zarr"));
 
     ctx.register_table("synthetic", table)?;
 
@@ -115,10 +127,23 @@ cargo build
 
 ## Running the Example
 
-First, generate sample Zarr data:
+First, generate sample Zarr data (creates 8 dataset variations):
 
 ```bash
 ./scripts/generate_data.sh
+```
+
+This generates:
+```
+data/
+├── synthetic_v2.zarr       # Zarr v2, no compression
+├── synthetic_v2_blosc.zarr # Zarr v2, Blosc/LZ4 compression
+├── synthetic_v3.zarr       # Zarr v3, no compression
+├── synthetic_v3_blosc.zarr # Zarr v3, Blosc/LZ4 compression
+├── era5_v2.zarr            # ERA5 climate data, Zarr v2
+├── era5_v2_blosc.zarr      # ERA5 climate data, Zarr v2 + Blosc
+├── era5_v3.zarr            # ERA5 climate data, Zarr v3
+└── era5_v3_blosc.zarr      # ERA5 climate data, Zarr v3 + Blosc
 ```
 
 Then run the examples:
@@ -138,26 +163,27 @@ cargo run --bin zarr-cli
 
 ### Loading Zarr Data
 
-Use standard SQL `CREATE EXTERNAL TABLE` syntax to load Zarr stores:
+Use standard SQL `CREATE EXTERNAL TABLE` syntax to load Zarr stores (v2 or v3):
 
 ```sql
-zarr> CREATE EXTERNAL TABLE weather STORED AS ZARR LOCATION 'data/synthetic.zarr';
+zarr> CREATE EXTERNAL TABLE weather STORED AS ZARR LOCATION 'data/synthetic_v3.zarr';
 zarr> SHOW TABLES;
 zarr> SELECT * FROM weather LIMIT 5;
 zarr> DROP TABLE weather;
 ```
 
-The schema is automatically inferred from Zarr v3 metadata. Coordinate arrays (1D) become columns, and data arrays (nD) are flattened.
+The schema is automatically inferred from Zarr metadata (v2 or v3). Coordinate arrays (1D) become columns, and data arrays (nD) are flattened.
 
 ```
 Zarr-DataFusion CLI
 
 Type SQL queries or 'help' for commands.
 
-zarr> CREATE EXTERNAL TABLE synthetic STORED AS ZARR LOCATION 'data/synthetic.zarr';
-zarr> CREATE EXTERNAL TABLE era5 STORED AS ZARR LOCATION 'data/era5.zarr';
+zarr> CREATE EXTERNAL TABLE synthetic_v2 STORED AS ZARR LOCATION 'data/synthetic_v2.zarr';
+zarr> CREATE EXTERNAL TABLE synthetic_v3 STORED AS ZARR LOCATION 'data/synthetic_v3.zarr';
+zarr> CREATE EXTERNAL TABLE era5 STORED AS ZARR LOCATION 'data/era5_v3.zarr';
 zarr> SHOW TABLES;
-zarr> SELECT * FROM synthetic LIMIT 5;
+zarr> SELECT * FROM synthetic_v2 LIMIT 5;
 zarr> help
 zarr> quit
 ```
@@ -166,13 +192,13 @@ zarr> quit
 
 **Sample data:**
 ```sql
-SELECT * FROM synthetic LIMIT 10;
+SELECT * FROM synthetic_v3 LIMIT 10;
 ```
 
 **Filter by temperature:**
 ```sql
 SELECT time, lat, lon, temperature
-FROM synthetic
+FROM synthetic_v3
 WHERE temperature > 20
 LIMIT 10;
 ```
@@ -180,7 +206,7 @@ LIMIT 10;
 **Average temperature per time step:**
 ```sql
 SELECT time, AVG(temperature) as avg_temp
-FROM synthetic
+FROM synthetic_v3
 GROUP BY time
 ORDER BY time;
 ```
@@ -188,7 +214,7 @@ ORDER BY time;
 **Find locations where temperature is always below 10:**
 ```sql
 SELECT lat, lon, MAX(temperature) as max_temp
-FROM synthetic
+FROM synthetic_v3
 GROUP BY lat, lon
 HAVING MAX(temperature) < 10
 ORDER BY max_temp;
@@ -200,7 +226,7 @@ SELECT lat, lon,
        MIN(temperature) as min_temp,
        MAX(temperature) as max_temp,
        AVG(temperature) as avg_temp
-FROM synthetic
+FROM synthetic_v3
 GROUP BY lat, lon
 ORDER BY avg_temp DESC
 LIMIT 10;
@@ -226,20 +252,21 @@ src/
 
 - `arrow` - Apache Arrow for columnar data
 - `datafusion` - SQL query engine
-- `zarrs` - Zarr v3 file format support
+- `zarrs` - Zarr v2/v3 file format support
 - `tokio` - Async runtime
 
 ## Roadmap
 
-- [x] Add REPL for quick quries.
-- [x] Support Schema Inference.
+- [x] Add REPL for quick queries
+- [x] Support Schema Inference
 - [x] Projection Push down
-- [ ] Filter push down
 - [x] Memory efficient co-ord expansion (DictionaryArray)
-- [ ] Zarr Codecs
+- [x] Read ERA5 climate dataset from local disk
+- [x] Zarr v2 support (without codecs)
+- [ ] Filter push down
+- [ ] Zarr Codecs (Blosc, etc.)
 - [ ] Zero Copy data
-- [x] Read ERA5 climate dataset from local disk.
-- [ ] Read ERA5 dataset from cloud storage (S3/GCS buckets).
+- [ ] Read ERA5 dataset from cloud storage (S3/GCS buckets)
 - [ ] DMA while reading from Cloud
 - [ ] Integrate [icechunk](https://github.com/earth-mover/icechunk) for transactional Zarr reads
 - [ ] Tackle the [One Trillion Row Challenge](https://github.com/coiled/1trc) with Zarr + DataFusion

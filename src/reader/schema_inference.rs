@@ -1,4 +1,4 @@
-//! Schema inference for Zarr v3 stores
+//! Schema inference for Zarr v2 and v3 stores
 //!
 //! # Assumptions
 //!
@@ -31,6 +31,97 @@
 use arrow::datatypes::{DataType, Field, Schema};
 use std::fs;
 use std::path::Path;
+
+/// Zarr format version
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum ZarrVersion {
+    V2,
+    V3,
+}
+
+/// Detect Zarr version by checking metadata files
+pub fn detect_zarr_version(
+    store_path: &str,
+) -> Result<ZarrVersion, Box<dyn std::error::Error + Send + Sync>> {
+    let root = Path::new(store_path);
+
+    // Check for zarr.json (V3)
+    if root.join("zarr.json").exists() {
+        return Ok(ZarrVersion::V3);
+    }
+
+    // Check for .zgroup or .zarray (V2)
+    if root.join(".zgroup").exists() || root.join(".zarray").exists() {
+        return Ok(ZarrVersion::V2);
+    }
+
+    // Try to detect by looking at subdirectories
+    for entry in fs::read_dir(root)? {
+        let entry = entry?;
+        let path = entry.path();
+        if path.is_dir() {
+            if path.join("zarr.json").exists() {
+                return Ok(ZarrVersion::V3);
+            }
+            if path.join(".zarray").exists() {
+                return Ok(ZarrVersion::V2);
+            }
+        }
+    }
+
+    Err("Could not detect Zarr version: no metadata files found".into())
+}
+
+/// Parse Zarr v2 numpy dtype string to normalized type name
+/// Examples: "<i8" -> "int64", "<f4" -> "float32", "|b1" -> "bool"
+fn parse_v2_dtype(dtype: &str) -> String {
+    // V2 dtype format: [<>|][type_char][byte_size]
+    // < = little-endian, > = big-endian, | = not applicable
+    // Type chars: i=int, u=uint, f=float, b=bool, S=string, U=unicode
+
+    let chars: Vec<char> = dtype.chars().collect();
+    if chars.len() < 2 {
+        return "float64".to_string();
+    }
+
+    // Skip endianness prefix if present
+    let (type_char, size_str) = if chars[0] == '<' || chars[0] == '>' || chars[0] == '|' {
+        if chars.len() < 3 {
+            return "float64".to_string();
+        }
+        (chars[1], &dtype[2..])
+    } else {
+        (chars[0], &dtype[1..])
+    };
+
+    let size: u32 = size_str.parse().unwrap_or(8);
+
+    match type_char {
+        'i' => match size {
+            1 => "int8",
+            2 => "int16",
+            4 => "int32",
+            8 => "int64",
+            _ => "int64",
+        },
+        'u' => match size {
+            1 => "uint8",
+            2 => "uint16",
+            4 => "uint32",
+            8 => "uint64",
+            _ => "uint64",
+        },
+        'f' => match size {
+            2 => "float16",
+            4 => "float32",
+            8 => "float64",
+            _ => "float64",
+        },
+        'b' => "bool",
+        _ => "float64",
+    }
+    .to_string()
+}
 
 fn zarr_dtype_to_arrow(dtype: &str) -> DataType {
     match dtype {
@@ -77,8 +168,69 @@ pub struct ZarrStoreMeta {
     pub data_vars: Vec<ZarrArrayMeta>, // nD arrays
 }
 
-/// Discover all arrays in a Zarr v3 store
+/// Discover all arrays in a Zarr store (v2 or v3)
 pub fn discover_arrays(
+    store_path: &str,
+) -> Result<ZarrStoreMeta, Box<dyn std::error::Error + Send + Sync>> {
+    let version = detect_zarr_version(store_path)?;
+
+    match version {
+        ZarrVersion::V2 => discover_arrays_v2(store_path),
+        ZarrVersion::V3 => discover_arrays_v3(store_path),
+    }
+}
+
+/// Discover arrays in a Zarr v2 store
+fn discover_arrays_v2(
+    store_path: &str,
+) -> Result<ZarrStoreMeta, Box<dyn std::error::Error + Send + Sync>> {
+    let root = Path::new(store_path);
+    let mut arrays: Vec<ZarrArrayMeta> = Vec::new();
+
+    for entry in fs::read_dir(root)? {
+        let entry = entry?;
+        let path = entry.path();
+
+        if path.is_dir() {
+            let zarray = path.join(".zarray");
+            if zarray.exists() {
+                let content = fs::read_to_string(&zarray)?;
+                let meta: serde_json::Value = serde_json::from_str(&content)?;
+
+                let name = path
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or("unknown")
+                    .to_string();
+
+                let shape: Vec<u64> = meta
+                    .get("shape")
+                    .and_then(|v| v.as_array())
+                    .map(|arr| arr.iter().filter_map(|v| v.as_u64()).collect())
+                    .unwrap_or_default();
+
+                // V2 uses numpy dtype format like "<i8", "<f4"
+                let dtype_raw = meta
+                    .get("dtype")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("<f8");
+
+                let data_type = parse_v2_dtype(dtype_raw);
+
+                arrays.push(ZarrArrayMeta {
+                    name,
+                    data_type,
+                    shape,
+                });
+            }
+        }
+    }
+
+    separate_and_sort_arrays(arrays)
+}
+
+/// Discover arrays in a Zarr v3 store
+fn discover_arrays_v3(
     store_path: &str,
 ) -> Result<ZarrStoreMeta, Box<dyn std::error::Error + Send + Sync>> {
     let root = Path::new(store_path);
@@ -123,7 +275,13 @@ pub fn discover_arrays(
         }
     }
 
-    // Separate and sort
+    separate_and_sort_arrays(arrays)
+}
+
+/// Separate arrays into coordinates and data variables, then sort
+fn separate_and_sort_arrays(
+    arrays: Vec<ZarrArrayMeta>,
+) -> Result<ZarrStoreMeta, Box<dyn std::error::Error + Send + Sync>> {
     let mut coords: Vec<_> = arrays
         .iter()
         .filter(|a| a.is_coordinate())
@@ -141,7 +299,7 @@ pub fn discover_arrays(
     Ok(ZarrStoreMeta { coords, data_vars })
 }
 
-/// Infer Arrow schema from Zarr v3 store metadata
+/// Infer Arrow schema from Zarr store metadata (v2 or v3)
 /// Coordinates use DictionaryArray for memory efficiency (stores unique values once)
 pub fn infer_schema(store_path: &str) -> Result<Schema, Box<dyn std::error::Error + Send + Sync>> {
     let meta = discover_arrays(store_path)?;
