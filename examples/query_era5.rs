@@ -22,7 +22,7 @@ async fn main() -> datafusion::error::Result<()> {
     let ctx = SessionContext::new();
 
     // Load ERA5 data from Zarr v3 store
-    let store_path = "data/era5.zarr";
+    let store_path = "data/era5_v3.zarr";
     let schema = Arc::new(infer_schema(store_path).expect("Failed to infer schema"));
 
     println!("ERA5 Schema:");
