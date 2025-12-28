@@ -264,7 +264,7 @@ src/
 - [x] Read ERA5 climate dataset from local disk
 - [x] Zarr v2 support (without codecs)
 - [ ] Filter push down
-- [ ] Zarr Codecs (Blosc, etc.)
+- [x] Zarr Codecs (Blosc, etc.)
 - [ ] Zero Copy data
 - [ ] Read ERA5 dataset from cloud storage (S3/GCS buckets)
 - [ ] DMA while reading from Cloud

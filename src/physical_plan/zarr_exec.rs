@@ -12,6 +12,7 @@ pub struct ZarrExec {
     schema: SchemaRef,
     path: String,
     projection: Option<Vec<usize>>,
+    limit: Option<usize>,
     properties: PlanProperties,
 }
 
@@ -21,12 +22,20 @@ impl DisplayAs for ZarrExec {
         _t: datafusion::physical_plan::DisplayFormatType,
         f: &mut std::fmt::Formatter,
     ) -> std::fmt::Result {
-        write!(f, "ZarrExec: path={}", self.path)
+        match self.limit {
+            Some(limit) => write!(f, "ZarrExec: path={}, limit={}", self.path, limit),
+            None => write!(f, "ZarrExec: path={}", self.path),
+        }
     }
 }
 
 impl ZarrExec {
-    pub fn new(schema: SchemaRef, path: String, projection: Option<Vec<usize>>) -> Self {
+    pub fn new(
+        schema: SchemaRef,
+        path: String,
+        projection: Option<Vec<usize>>,
+        limit: Option<usize>,
+    ) -> Self {
         // Compute projected schema for plan properties
         let projected_schema = if let Some(ref indices) = projection {
             Arc::new(Schema::new(
@@ -49,6 +58,7 @@ impl ZarrExec {
             schema,
             path,
             projection,
+            limit,
             properties,
         }
     }
@@ -82,6 +92,11 @@ impl ExecutionPlan for ZarrExec {
         _partition: usize,
         _context: std::sync::Arc<datafusion::execution::TaskContext>,
     ) -> datafusion::error::Result<datafusion::execution::SendableRecordBatchStream> {
-        read_zarr(&self.path, self.schema.clone(), self.projection.clone())
+        read_zarr(
+            &self.path,
+            self.schema.clone(),
+            self.projection.clone(),
+            self.limit,
+        )
     }
 }

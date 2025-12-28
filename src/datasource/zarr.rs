@@ -40,12 +40,13 @@ impl TableProvider for ZarrTable {
         _state: &dyn Session,
         projection: Option<&Vec<usize>>,
         _filters: &[datafusion::logical_expr::Expr],
-        _limit: Option<usize>,
+        limit: Option<usize>,
     ) -> Result<Arc<dyn ExecutionPlan>> {
         Ok(Arc::new(ZarrExec::new(
             self.schema.clone(),
             self.path.clone(),
             projection.cloned(),
+            limit,
         )))
     }
 }

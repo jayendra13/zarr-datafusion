@@ -34,6 +34,7 @@ pub fn read_zarr(
     store_path: &str,
     schema: SchemaRef,
     projection: Option<Vec<usize>>,
+    limit: Option<usize>,
 ) -> Result<SendableRecordBatchStream> {
     let store = Arc::new(FilesystemStore::new(store_path).map_err(zarr_err)?);
 
@@ -142,6 +143,17 @@ pub fn read_zarr(
             .map(|&i| schema.field(i).clone())
             .collect::<Vec<_>>(),
     ));
+
+    // Apply limit if specified
+    let result_arrays = if let Some(limit) = limit {
+        let limit = limit.min(total_rows);
+        result_arrays
+            .into_iter()
+            .map(|arr| arr.slice(0, limit))
+            .collect()
+    } else {
+        result_arrays
+    };
 
     let batch = RecordBatch::try_new(projected_schema.clone(), result_arrays)?;
     let stream = stream::iter(vec![Ok(batch)]);
