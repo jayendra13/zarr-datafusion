@@ -799,7 +799,7 @@ dependencies = [
  "rand",
  "regex",
  "rstest",
- "sqlparser",
+ "sqlparser 0.59.0",
  "tempfile",
  "tokio",
  "url",
@@ -876,7 +876,7 @@ dependencies = [
  "parquet",
  "paste",
  "recursive",
- "sqlparser",
+ "sqlparser 0.59.0",
  "tokio",
  "web-time",
 ]
@@ -1072,7 +1072,7 @@ dependencies = [
  "paste",
  "recursive",
  "serde_json",
- "sqlparser",
+ "sqlparser 0.59.0",
 ]
 
 [[package]]
@@ -1397,7 +1397,7 @@ dependencies = [
  "log",
  "recursive",
  "regex",
- "sqlparser",
+ "sqlparser 0.59.0",
 ]
 
 [[package]]
@@ -2250,6 +2250,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "nu-ansi-term"
+version = "0.50.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7957b9740744892f114936ab4a57b3f487491bbeafaf8083688b16841a4240e5"
+dependencies = [
+ "windows-sys 0.61.2",
+]
+
+[[package]]
 name = "num"
 version = "0.4.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2813,10 +2822,22 @@ dependencies = [
  "memchr",
  "nix",
  "radix_trie",
+ "rustyline-derive",
  "unicode-segmentation",
  "unicode-width",
  "utf8parse",
  "windows-sys 0.59.0",
+]
+
+[[package]]
+name = "rustyline-derive"
+version = "0.11.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5d66de233f908aebf9cc30ac75ef9103185b4b715c6f2fb7a626aa5e5ede53ab"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn",
 ]
 
 [[package]]
@@ -2968,6 +2989,15 @@ checksum = "4e1432067a55bcfb1fd522d2aca6537a4fcea32bba87ea86921226d14f9bad53"
 dependencies = [
  "cc",
  "link-cplusplus",
+]
+
+[[package]]
+name = "sqlparser"
+version = "0.53.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "05a528114c392209b3264855ad491fcce534b94a38771b0a0b97a79379275ce8"
+dependencies = [
+ "log",
 ]
 
 [[package]]
@@ -3638,8 +3668,10 @@ dependencies = [
  "async-trait",
  "datafusion",
  "futures",
+ "nu-ansi-term",
  "rustyline",
  "serde_json",
+ "sqlparser 0.53.0",
  "tokio",
  "zarrs",
 ]

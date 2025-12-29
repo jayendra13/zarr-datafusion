@@ -210,10 +210,7 @@ fn discover_arrays_v2(
                     .unwrap_or_default();
 
                 // V2 uses numpy dtype format like "<i8", "<f4"
-                let dtype_raw = meta
-                    .get("dtype")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("<f8");
+                let dtype_raw = meta.get("dtype").and_then(|v| v.as_str()).unwrap_or("<f8");
 
                 let data_type = parse_v2_dtype(dtype_raw);
 
@@ -378,14 +375,26 @@ mod tests {
 
     #[test]
     fn test_detect_zarr_version_v2() {
-        assert_eq!(detect_zarr_version("data/synthetic_v2.zarr").unwrap(), ZarrVersion::V2);
-        assert_eq!(detect_zarr_version("data/synthetic_v2_blosc.zarr").unwrap(), ZarrVersion::V2);
+        assert_eq!(
+            detect_zarr_version("data/synthetic_v2.zarr").unwrap(),
+            ZarrVersion::V2
+        );
+        assert_eq!(
+            detect_zarr_version("data/synthetic_v2_blosc.zarr").unwrap(),
+            ZarrVersion::V2
+        );
     }
 
     #[test]
     fn test_detect_zarr_version_v3() {
-        assert_eq!(detect_zarr_version("data/synthetic_v3.zarr").unwrap(), ZarrVersion::V3);
-        assert_eq!(detect_zarr_version("data/synthetic_v3_blosc.zarr").unwrap(), ZarrVersion::V3);
+        assert_eq!(
+            detect_zarr_version("data/synthetic_v3.zarr").unwrap(),
+            ZarrVersion::V3
+        );
+        assert_eq!(
+            detect_zarr_version("data/synthetic_v3_blosc.zarr").unwrap(),
+            ZarrVersion::V3
+        );
     }
 
     #[test]
@@ -464,7 +473,7 @@ mod tests {
         // Shapes
         assert_eq!(meta.coords[0].shape, vec![10]); // lat
         assert_eq!(meta.coords[1].shape, vec![10]); // lon
-        assert_eq!(meta.coords[2].shape, vec![7]);  // time
+        assert_eq!(meta.coords[2].shape, vec![7]); // time
         assert_eq!(meta.data_vars[0].shape, vec![7, 10, 10]); // humidity
         assert_eq!(meta.data_vars[1].shape, vec![7, 10, 10]); // temperature
 
@@ -514,7 +523,11 @@ mod tests {
                 "Coordinate {} should be Dictionary type",
                 field.name()
             );
-            assert!(!field.is_nullable(), "Coordinate {} should not be nullable", field.name());
+            assert!(
+                !field.is_nullable(),
+                "Coordinate {} should not be nullable",
+                field.name()
+            );
         }
     }
 
@@ -525,8 +538,17 @@ mod tests {
         // Last 2 fields (data vars) should be regular Int64, nullable
         for i in 3..5 {
             let field = schema.field(i);
-            assert_eq!(field.data_type(), &DataType::Int64, "Data var {} should be Int64", field.name());
-            assert!(field.is_nullable(), "Data var {} should be nullable", field.name());
+            assert_eq!(
+                field.data_type(),
+                &DataType::Int64,
+                "Data var {} should be Int64",
+                field.name()
+            );
+            assert!(
+                field.is_nullable(),
+                "Data var {} should be nullable",
+                field.name()
+            );
         }
     }
 
@@ -540,8 +562,18 @@ mod tests {
 
         for (f2, f3) in schema_v2.fields().iter().zip(schema_v3.fields().iter()) {
             assert_eq!(f2.name(), f3.name(), "Field names should match");
-            assert_eq!(f2.data_type(), f3.data_type(), "Data types should match for {}", f2.name());
-            assert_eq!(f2.is_nullable(), f3.is_nullable(), "Nullability should match for {}", f2.name());
+            assert_eq!(
+                f2.data_type(),
+                f3.data_type(),
+                "Data types should match for {}",
+                f2.name()
+            );
+            assert_eq!(
+                f2.is_nullable(),
+                f3.is_nullable(),
+                "Nullability should match for {}",
+                f2.name()
+            );
         }
     }
 }

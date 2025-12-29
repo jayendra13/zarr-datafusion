@@ -278,7 +278,7 @@ src/
 
 ### REPL Experience
 - [ ] Tab completion (tables, columns, SQL keywords)
-- [ ] Syntax highlighting
+- [x] Syntax highlighting
 - [ ] Multi-line query editing
 - [ ] Query history persistence (~/.zarr_cli_history)
 - [ ] Output formats (table, csv, json, parquet)

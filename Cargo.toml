@@ -21,10 +21,17 @@ path = "examples/query_synthetic.rs"
 
 [[bin]]
 name = "zarr-cli"
-path = "src/bin/zarr_cli.rs"
+path = "src/bin/zarr_cli/main.rs"
 
 [dependencies.rustyline]
 version = "15"
+features = ["derive"]
 
 [dependencies.serde_json]
 version = "1"
+
+[dependencies.sqlparser]
+version = "0.53"
+
+[dependencies.nu-ansi-term]
+version = "0.50"

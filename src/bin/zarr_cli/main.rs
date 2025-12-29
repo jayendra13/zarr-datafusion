@@ -1,10 +1,13 @@
+mod highlight;
+
 use std::collections::HashMap;
 use std::sync::Arc;
 
 use datafusion::execution::session_state::SessionStateBuilder;
 use datafusion::prelude::{SessionConfig, SessionContext};
+use highlight::SqlHelper;
 use rustyline::error::ReadlineError;
-use rustyline::DefaultEditor;
+use rustyline::Editor;
 use zarr_datafusion::datasource::factory::ZarrTableFactory;
 
 // Why `Send + Sync` in the error type?
@@ -35,7 +38,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     println!("Zarr-DataFusion CLI");
     println!("\nType SQL queries or 'help' for commands.\n");
 
-    let mut rl = DefaultEditor::new()?;
+    let helper = SqlHelper::new();
+    let mut rl = Editor::new()?;
+    rl.set_helper(Some(helper));
 
     loop {
         match rl.readline("zarr> ") {
