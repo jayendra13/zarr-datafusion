@@ -283,7 +283,7 @@ src/
 - [ ] Multi-line query editing
 - [x] Query history persistence (~/.zarr_cli_history)
 - [ ] Output formats (table, csv, json, parquet)
-- [ ] Timing statistics (`Query took 1.23s, 1000 rows`)
+- [x] Timing statistics (`5 rows returned in 0.012s`)
 - [ ] Progress bar for long-running queries
 - [ ] `.schema <table>` command for quick schema view
 - [ ] Pager support for large results (less/more)

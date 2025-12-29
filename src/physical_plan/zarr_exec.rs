@@ -1,3 +1,4 @@
+use crate::reader::stats::{SharedIoStats, ZarrIoStats};
 use crate::reader::zarr_reader::read_zarr;
 use arrow::datatypes::{Schema, SchemaRef};
 use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType};
@@ -14,6 +15,7 @@ pub struct ZarrExec {
     projection: Option<Vec<usize>>,
     limit: Option<usize>,
     properties: PlanProperties,
+    io_stats: SharedIoStats,
 }
 
 impl DisplayAs for ZarrExec {
@@ -60,7 +62,13 @@ impl ZarrExec {
             projection,
             limit,
             properties,
+            io_stats: Arc::new(ZarrIoStats::new()),
         }
+    }
+
+    /// Get I/O statistics collected during execution
+    pub fn io_stats(&self) -> SharedIoStats {
+        self.io_stats.clone()
     }
 }
 impl ExecutionPlan for ZarrExec {
@@ -97,6 +105,7 @@ impl ExecutionPlan for ZarrExec {
             self.schema.clone(),
             self.projection.clone(),
             self.limit,
+            Some(self.io_stats.clone()),
         )
     }
 }

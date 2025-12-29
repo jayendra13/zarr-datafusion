@@ -15,12 +15,37 @@ use datafusion::{
 };
 use futures::stream;
 use std::sync::Arc;
+use std::time::Instant;
 use zarrs::{array::Array, array_subset::ArraySubset, filesystem::FilesystemStore};
 
 use super::schema_inference::discover_arrays;
+use super::stats::SharedIoStats;
+use super::tracked_store::TrackedStore;
 
 fn zarr_err(e: impl std::error::Error + Send + Sync + 'static) -> DataFusionError {
     DataFusionError::External(Box::new(e))
+}
+
+/// Get element size in bytes for a Zarr data type string
+fn dtype_to_bytes(dtype: &str) -> u64 {
+    match dtype {
+        "float32" | "int32" | "uint32" => 4,
+        "float64" | "int64" | "uint64" => 8,
+        "int16" | "uint16" => 2,
+        "int8" | "uint8" => 1,
+        _ => 8, // Default assumption
+    }
+}
+
+/// Get element size in bytes for an Arrow DataType
+fn arrow_dtype_to_bytes(dtype: &DataType) -> u64 {
+    match dtype {
+        DataType::Float32 | DataType::Int32 | DataType::UInt32 => 4,
+        DataType::Float64 | DataType::Int64 | DataType::UInt64 => 8,
+        DataType::Int16 | DataType::UInt16 => 2,
+        DataType::Int8 | DataType::UInt8 => 1,
+        _ => 8, // Default assumption
+    }
 }
 
 /// Coordinate values that can be either i64 or f32/f64
@@ -35,11 +60,24 @@ pub fn read_zarr(
     schema: SchemaRef,
     projection: Option<Vec<usize>>,
     limit: Option<usize>,
+    stats: Option<SharedIoStats>,
 ) -> Result<SendableRecordBatchStream> {
-    let store = Arc::new(FilesystemStore::new(store_path).map_err(zarr_err)?);
+    let fs_store = Arc::new(FilesystemStore::new(store_path).map_err(zarr_err)?);
 
-    // Discover store structure
+    // Wrap with TrackedStore if stats are provided
+    let store: Arc<TrackedStore<FilesystemStore>> = Arc::new(TrackedStore::new(
+        fs_store,
+        stats.clone().unwrap_or_default(),
+    ));
+
+    // Discover store structure (with timing)
+    let meta_start = Instant::now();
     let store_meta = discover_arrays(store_path).map_err(DataFusionError::External)?;
+    if let Some(ref s) = stats {
+        // TODO: Track actual metadata bytes read in discover_arrays() instead of estimating
+        let meta_bytes = (store_meta.coords.len() + store_meta.data_vars.len()) as u64 * 500;
+        s.record_metadata(meta_bytes, meta_start.elapsed());
+    }
 
     let coord_names: Vec<_> = store_meta.coords.iter().map(|c| c.name.clone()).collect();
     let coord_types: Vec<_> = store_meta
@@ -53,11 +91,13 @@ pub fn read_zarr(
     let mut coord_values: Vec<CoordValues> = Vec::new();
 
     for (coord, dtype) in store_meta.coords.iter().zip(coord_types.iter()) {
+        let read_start = Instant::now();
         let arr = Array::open(store.clone(), &format!("/{}", coord.name)).map_err(zarr_err)?;
         let size = arr.shape()[0] as usize;
         coord_sizes.push(size);
 
         let subset = ArraySubset::new_with_shape(arr.shape().to_vec());
+        let element_bytes = dtype_to_bytes(dtype);
         let values = match dtype.as_str() {
             "float32" => {
                 let (vals, _) = arr
@@ -81,6 +121,11 @@ pub fn read_zarr(
                 CoordValues::Int64(vals)
             }
         };
+
+        if let Some(ref s) = stats {
+            let bytes = size as u64 * element_bytes;
+            s.record_coord(bytes, read_start.elapsed());
+        }
         coord_values.push(values);
     }
 
@@ -107,8 +152,10 @@ pub fn read_zarr(
             result_arrays.push(dict_array);
         } else {
             // Data variable - read and flatten based on schema type
+            let read_start = Instant::now();
             let arr = Array::open(store.clone(), &format!("/{}", field_name)).map_err(zarr_err)?;
             let subset = ArraySubset::new_with_shape(arr.shape().to_vec());
+            let num_elements: u64 = arr.shape().iter().product();
 
             let array: ArrayRef = match field.data_type() {
                 DataType::Float32 => {
@@ -133,6 +180,11 @@ pub fn read_zarr(
                     Arc::new(Int64Array::from(vals))
                 }
             };
+
+            if let Some(ref s) = stats {
+                let bytes = num_elements * arrow_dtype_to_bytes(field.data_type());
+                s.record_data(bytes, read_start.elapsed());
+            }
             result_arrays.push(array);
         }
     }
