@@ -4,15 +4,17 @@
 
 use nu_ansi_term::{Color, Style};
 use rustyline::highlight::{CmdKind, Highlighter};
+use rustyline::hint::Hinter;
+use rustyline::history::SearchDirection;
 use rustyline::validate::{ValidationContext, ValidationResult, Validator};
-use rustyline::{Completer, Hinter};
+use rustyline::{Completer, Context};
 use sqlparser::dialect::GenericDialect;
 use sqlparser::keywords::Keyword;
 use sqlparser::tokenizer::{Token, Tokenizer};
 use std::borrow::Cow;
 
-/// SQL Helper for rustyline with syntax highlighting
-#[derive(Completer, Hinter)]
+/// SQL Helper for rustyline with syntax highlighting and history-based hints
+#[derive(Completer)]
 pub struct SqlHelper;
 
 impl SqlHelper {
@@ -22,6 +24,40 @@ impl SqlHelper {
 }
 
 impl rustyline::Helper for SqlHelper {}
+
+/// History-based hinting - suggests completions from command history
+impl Hinter for SqlHelper {
+    type Hint = String;
+
+    fn hint(&self, line: &str, pos: usize, ctx: &Context<'_>) -> Option<Self::Hint> {
+        // Only hint if cursor is at end of line
+        if pos < line.len() {
+            return None;
+        }
+
+        // Don't hint for very short inputs
+        if line.len() < 2 {
+            return None;
+        }
+
+        // Search history for entries starting with current line (case-insensitive)
+        let line_upper = line.to_uppercase();
+        let history = ctx.history();
+
+        // Iterate through history in reverse (most recent first)
+        for i in (0..history.len()).rev() {
+            if let Ok(Some(entry)) = history.get(i, SearchDirection::Forward) {
+                if entry.entry.to_uppercase().starts_with(&line_upper) {
+                    let hint = &entry.entry[pos..];
+                    if !hint.is_empty() {
+                        return Some(hint.to_string());
+                    }
+                }
+            }
+        }
+        None
+    }
+}
 
 impl Validator for SqlHelper {
     fn validate(&self, _ctx: &mut ValidationContext) -> rustyline::Result<ValidationResult> {
