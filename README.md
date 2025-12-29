@@ -79,10 +79,11 @@ async fn main() -> datafusion::error::Result<()> {
     let ctx = SessionContext::new();
 
     // Schema is automatically inferred from Zarr metadata (v2 or v3)
-    let schema = Arc::new(infer_schema("data/synthetic_v3.zarr").expect("Failed to infer schema"));
-    let table = Arc::new(ZarrTable::new(schema, "data/synthetic_v3.zarr"));
+    let schema = infer_schema("data/synthetic_v3.zarr")
+        .expect("Failed to infer schema");
+    let table = ZarrTable::new(Arc::new(schema), "data/synthetic_v3.zarr");
 
-    ctx.register_table("synthetic", table)?;
+    ctx.register_table("synthetic", Arc::new(table))?;
 
     // Query with SQL
     let df = ctx.sql("SELECT time, lat, lon, temperature
