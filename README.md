@@ -280,7 +280,7 @@ src/
 - [ ] Tab completion (tables, columns, SQL keywords)
 - [x] Syntax highlighting
 - [ ] Multi-line query editing
-- [ ] Query history persistence (~/.zarr_cli_history)
+- [x] Query history persistence (~/.zarr_cli_history)
 - [ ] Output formats (table, csv, json, parquet)
 - [ ] Timing statistics (`Query took 1.23s, 1000 rows`)
 - [ ] Progress bar for long-running queries

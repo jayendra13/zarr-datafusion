@@ -1,6 +1,7 @@
 mod highlight;
 
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use datafusion::execution::session_state::SessionStateBuilder;
@@ -9,6 +10,16 @@ use highlight::SqlHelper;
 use rustyline::error::ReadlineError;
 use rustyline::Editor;
 use zarr_datafusion::datasource::factory::ZarrTableFactory;
+
+const HISTORY_FILE: &str = ".zarr_cli_history";
+
+/// Get the path to the history file (~/.zarr_cli_history)
+fn get_history_path() -> PathBuf {
+    std::env::var("HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| PathBuf::from("."))
+        .join(HISTORY_FILE)
+}
 
 // Why `Send + Sync` in the error type?
 //
@@ -41,6 +52,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let helper = SqlHelper::new();
     let mut rl = Editor::new()?;
     rl.set_helper(Some(helper));
+
+    // Load command history (ignore error if file doesn't exist)
+    let history_path = get_history_path();
+    let _ = rl.load_history(&history_path);
 
     loop {
         match rl.readline("zarr> ") {
@@ -106,6 +121,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 break;
             }
         }
+    }
+
+    // Save command history
+    if let Err(e) = rl.save_history(&history_path) {
+        eprintln!("Warning: Could not save history: {e}");
     }
 
     println!("Goodbye!");
