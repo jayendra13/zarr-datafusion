@@ -31,6 +31,7 @@
 use arrow::datatypes::{DataType, Field, Schema};
 use std::fs;
 use std::path::Path;
+use tracing::{debug, info, instrument};
 
 /// Zarr format version
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -162,7 +163,7 @@ impl ZarrArrayMeta {
 }
 
 /// Discovered Zarr store structure
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct ZarrStoreMeta {
     pub coords: Vec<ZarrArrayMeta>,    // 1D arrays (sorted by name)
     pub data_vars: Vec<ZarrArrayMeta>, // nD arrays
@@ -323,6 +324,289 @@ pub fn infer_schema(store_path: &str) -> Result<Schema, Box<dyn std::error::Erro
     }
 
     Ok(Schema::new(fields))
+}
+
+// =============================================================================
+// Async versions for remote object stores
+// =============================================================================
+
+use zarrs::storage::AsyncReadableListableStorage;
+use zarrs_object_store::object_store::path::Path as ObjectPath;
+
+/// Async version of discover_arrays for remote object stores
+#[instrument(level = "debug", skip_all)]
+pub async fn discover_arrays_async(
+    store: &AsyncReadableListableStorage,
+    prefix: &ObjectPath,
+) -> Result<ZarrStoreMeta, Box<dyn std::error::Error + Send + Sync>> {
+    debug!("Detecting Zarr version");
+    let version = detect_zarr_version_async(store, prefix).await?;
+    info!(?version, "Zarr version detected");
+
+    let result = match version {
+        ZarrVersion::V2 => discover_arrays_v2_async(store, prefix).await,
+        ZarrVersion::V3 => discover_arrays_v3_async(store, prefix).await,
+    };
+
+    if let Ok(ref meta) = result {
+        info!(
+            coords = meta.coords.len(),
+            data_vars = meta.data_vars.len(),
+            "Arrays discovered"
+        );
+        for coord in &meta.coords {
+            debug!(name = %coord.name, shape = ?coord.shape, dtype = %coord.data_type, "Coordinate");
+        }
+        for var in &meta.data_vars {
+            debug!(name = %var.name, shape = ?var.shape, dtype = %var.data_type, "Data variable");
+        }
+    }
+
+    result
+}
+
+/// Async version of detect_zarr_version for remote object stores
+pub async fn detect_zarr_version_async(
+    store: &AsyncReadableListableStorage,
+    prefix: &ObjectPath,
+) -> Result<ZarrVersion, Box<dyn std::error::Error + Send + Sync>> {
+    use zarrs::storage::AsyncListableStorageTraits;
+    use zarrs::storage::StorePrefix;
+
+    // Check for root zarr.json (V3)
+    let zarr_json_path = format!("{}/zarr.json", prefix);
+    if store_key_exists(store, &zarr_json_path).await {
+        return Ok(ZarrVersion::V3);
+    }
+
+    // Check for root .zgroup (V2)
+    let zgroup_path = format!("{}/.zgroup", prefix);
+    if store_key_exists(store, &zgroup_path).await {
+        return Ok(ZarrVersion::V2);
+    }
+
+    // List directories and check first one for version detection
+    // StorePrefix requires trailing slash
+    let prefix_str = if prefix.as_ref().is_empty() {
+        "/".to_string()
+    } else {
+        format!("{}/", prefix.as_ref().trim_end_matches('/'))
+    };
+    let store_prefix = StorePrefix::new(&prefix_str)
+        .map_err(|e| format!("Invalid prefix '{}': {}", prefix_str, e))?;
+    let entries = store.list_dir(&store_prefix).await
+        .map_err(|e| format!("Failed to list directory: {}", e))?;
+
+    for subdir in entries.prefixes() {
+        let subdir_str = subdir.as_str().trim_end_matches('/');
+        // Check for zarr.json in subdirectory (V3)
+        let v3_path = format!("{}/zarr.json", subdir_str);
+        if store_key_exists(store, &v3_path).await {
+            return Ok(ZarrVersion::V3);
+        }
+
+        // Check for .zarray in subdirectory (V2)
+        let v2_path = format!("{}/.zarray", subdir_str);
+        if store_key_exists(store, &v2_path).await {
+            return Ok(ZarrVersion::V2);
+        }
+    }
+
+    Err("Could not detect Zarr version: no metadata files found".into())
+}
+
+/// Check if a key exists in the async store
+async fn store_key_exists(store: &AsyncReadableListableStorage, key: &str) -> bool {
+    use zarrs::storage::{AsyncReadableStorageTraits, StoreKey};
+
+    let store_key = match StoreKey::new(key) {
+        Ok(k) => k,
+        Err(_) => return false,
+    };
+
+    match store.get(&store_key).await {
+        Ok(Some(_)) => true,
+        _ => false,
+    }
+}
+
+/// Read a key from the async store as string
+async fn store_get_string(
+    store: &AsyncReadableListableStorage,
+    key: &str,
+) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+    use zarrs::storage::{AsyncReadableStorageTraits, StoreKey};
+
+    let store_key = StoreKey::new(key)
+        .map_err(|e| format!("Invalid key '{}': {}", key, e))?;
+
+    let bytes = store
+        .get(&store_key)
+        .await
+        .map_err(|e| format!("Failed to read '{}': {}", key, e))?
+        .ok_or_else(|| format!("Key not found: {}", key))?;
+
+    String::from_utf8(bytes.to_vec())
+        .map_err(|e| format!("Invalid UTF-8 in '{}': {}", key, e).into())
+}
+
+/// Async version of discover_arrays_v2 for remote stores
+async fn discover_arrays_v2_async(
+    store: &AsyncReadableListableStorage,
+    prefix: &ObjectPath,
+) -> Result<ZarrStoreMeta, Box<dyn std::error::Error + Send + Sync>> {
+    use zarrs::storage::{AsyncListableStorageTraits, StorePrefix};
+
+    let mut arrays: Vec<ZarrArrayMeta> = Vec::new();
+
+    // StorePrefix requires trailing slash
+    let prefix_str = if prefix.as_ref().is_empty() {
+        "/".to_string()
+    } else {
+        format!("{}/", prefix.as_ref().trim_end_matches('/'))
+    };
+    let store_prefix = StorePrefix::new(&prefix_str)
+        .map_err(|e| format!("Invalid prefix '{}': {}", prefix_str, e))?;
+    let entries = store.list_dir(&store_prefix).await
+        .map_err(|e| format!("Failed to list directory: {}", e))?;
+
+    for subdir in entries.prefixes() {
+        let subdir_str = subdir.as_str().trim_end_matches('/');
+        let zarray_path = format!("{}/.zarray", subdir_str);
+
+        // Try to read .zarray metadata
+        if let Ok(content) = store_get_string(store, &zarray_path).await {
+            let meta: serde_json::Value = serde_json::from_str(&content)?;
+
+            // Extract array name from path (last component)
+            let name = subdir_str
+                .trim_end_matches('/')
+                .rsplit('/')
+                .next()
+                .unwrap_or("unknown")
+                .to_string();
+
+            let shape: Vec<u64> = meta
+                .get("shape")
+                .and_then(|v| v.as_array())
+                .map(|arr| arr.iter().filter_map(|v| v.as_u64()).collect())
+                .unwrap_or_default();
+
+            let dtype_raw = meta.get("dtype").and_then(|v| v.as_str()).unwrap_or("<f8");
+            let data_type = parse_v2_dtype(dtype_raw);
+
+            arrays.push(ZarrArrayMeta {
+                name,
+                data_type,
+                shape,
+            });
+        }
+    }
+
+    separate_and_sort_arrays(arrays)
+}
+
+/// Async version of discover_arrays_v3 for remote stores
+async fn discover_arrays_v3_async(
+    store: &AsyncReadableListableStorage,
+    prefix: &ObjectPath,
+) -> Result<ZarrStoreMeta, Box<dyn std::error::Error + Send + Sync>> {
+    use zarrs::storage::{AsyncListableStorageTraits, StorePrefix};
+
+    let mut arrays: Vec<ZarrArrayMeta> = Vec::new();
+
+    // StorePrefix requires trailing slash
+    let prefix_str = if prefix.as_ref().is_empty() {
+        "/".to_string()
+    } else {
+        format!("{}/", prefix.as_ref().trim_end_matches('/'))
+    };
+    let store_prefix = StorePrefix::new(&prefix_str)
+        .map_err(|e| format!("Invalid prefix '{}': {}", prefix_str, e))?;
+    let entries = store.list_dir(&store_prefix).await
+        .map_err(|e| format!("Failed to list directory: {}", e))?;
+
+    for subdir in entries.prefixes() {
+        let subdir_str = subdir.as_str().trim_end_matches('/');
+        let zarr_json_path = format!("{}/zarr.json", subdir_str);
+
+        // Try to read zarr.json metadata
+        if let Ok(content) = store_get_string(store, &zarr_json_path).await {
+            let meta: serde_json::Value = serde_json::from_str(&content)?;
+
+            // Only process arrays (not groups)
+            if meta.get("node_type").and_then(|v| v.as_str()) == Some("array") {
+                let name = subdir_str
+                    .trim_end_matches('/')
+                    .rsplit('/')
+                    .next()
+                    .unwrap_or("unknown")
+                    .to_string();
+
+                let shape: Vec<u64> = meta
+                    .get("shape")
+                    .and_then(|v| v.as_array())
+                    .map(|arr| arr.iter().filter_map(|v| v.as_u64()).collect())
+                    .unwrap_or_default();
+
+                let data_type = meta
+                    .get("data_type")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("float64")
+                    .to_string();
+
+                arrays.push(ZarrArrayMeta {
+                    name,
+                    data_type,
+                    shape,
+                });
+            }
+        }
+    }
+
+    separate_and_sort_arrays(arrays)
+}
+
+/// Async version of infer_schema for remote object stores
+#[instrument(level = "debug", skip_all)]
+pub async fn infer_schema_async(
+    store: &AsyncReadableListableStorage,
+    prefix: &ObjectPath,
+) -> Result<Schema, Box<dyn std::error::Error + Send + Sync>> {
+    let (schema, _meta) = infer_schema_with_meta_async(store, prefix).await?;
+    Ok(schema)
+}
+
+/// Async version of infer_schema that also returns the store metadata
+/// This allows caching the metadata for later use during query execution
+#[instrument(level = "debug", skip_all)]
+pub async fn infer_schema_with_meta_async(
+    store: &AsyncReadableListableStorage,
+    prefix: &ObjectPath,
+) -> Result<(Schema, ZarrStoreMeta), Box<dyn std::error::Error + Send + Sync>> {
+    debug!("Starting async schema inference");
+    let meta = discover_arrays_async(store, prefix).await?;
+
+    let mut fields: Vec<Field> = Vec::new();
+
+    for coord in &meta.coords {
+        fields.push(Field::new(
+            &coord.name,
+            zarr_dtype_to_arrow_dictionary(&coord.data_type),
+            false,
+        ));
+    }
+
+    for var in &meta.data_vars {
+        fields.push(Field::new(
+            &var.name,
+            zarr_dtype_to_arrow(&var.data_type),
+            true,
+        ));
+    }
+
+    info!(num_fields = fields.len(), "Schema inferred");
+    Ok((Schema::new(fields), meta))
 }
 
 #[cfg(test)]

@@ -3,6 +3,8 @@
 //! See [`super::schema_inference`] for assumptions about Zarr store structure
 //! (1D coordinates, nD data variables as Cartesian product of coordinates).
 
+use tracing::{debug, info, instrument};
+
 use arrow::{
     array::{
         ArrayRef, DictionaryArray, Float32Array, Float64Array, Int16Array, Int64Array, RecordBatch,
@@ -261,6 +263,59 @@ impl CoordValues {
     }
 }
 
+/// Calculate the subset ranges needed for a limited number of rows
+///
+/// For row-major (C) order, the last dimension varies fastest.
+/// Given shape [a, b, c, d] and limit N, we need to figure out
+/// which ranges to read to get exactly N elements.
+fn calculate_limited_subset(shape: &[u64], limit: usize) -> Vec<std::ops::Range<u64>> {
+    let limit = limit as u64;
+    let mut ranges = Vec::with_capacity(shape.len());
+
+    // Work backwards from the last dimension
+    for (i, &dim_size) in shape.iter().enumerate().rev() {
+        if i == shape.len() - 1 {
+            // Last dimension: take min(limit, dim_size)
+            let take = limit.min(dim_size);
+            ranges.push(0..take);
+        } else {
+            // Earlier dimensions: calculate how many complete "slices" we need
+            let inner_size: u64 = shape[i + 1..].iter().product();
+            let slices_needed = (limit + inner_size - 1) / inner_size; // ceil
+            let take = slices_needed.min(dim_size);
+            ranges.push(0..take);
+        }
+    }
+
+    ranges.reverse();
+    ranges
+}
+
+/// Calculate how many values we need from each coordinate for a given row limit
+///
+/// For coords with sizes [a, b, c, d] and limit N rows:
+/// - coord d (last): need min(N, d) values
+/// - coord c: need ceil(N / d) values, capped at c
+/// - coord b: need ceil(N / (c*d)) values, capped at b
+/// - coord a: need ceil(N / (b*c*d)) values, capped at a
+fn calculate_coord_limits(coord_sizes: &[usize], limit: usize) -> Vec<usize> {
+    let mut limits = Vec::with_capacity(coord_sizes.len());
+    let n = coord_sizes.len();
+
+    for i in 0..n {
+        // Product of all coords after this one
+        let inner_size: usize = coord_sizes[i + 1..].iter().product();
+        let inner_size = if inner_size == 0 { 1 } else { inner_size };
+
+        // How many values do we need from this coord?
+        let needed = (limit + inner_size - 1) / inner_size; // ceil
+        let take = needed.min(coord_sizes[i]);
+        limits.push(take);
+    }
+
+    limits
+}
+
 /// Build keys array for DictionaryArray
 ///
 /// Instead of expanding [0,1,2] to [0,0,0,1,1,1,2,2,2,...] (700 i64 values = 5600 bytes),
@@ -298,4 +353,245 @@ fn build_coord_keys(
     }
 
     keys
+}
+
+// =============================================================================
+// Async version for remote object stores
+// =============================================================================
+
+use super::schema_inference::{discover_arrays_async, ZarrStoreMeta};
+use zarrs::storage::AsyncReadableListableStorage;
+use zarrs_object_store::object_store::path::Path as ObjectPath;
+
+/// Async version of read_zarr for remote object stores
+#[instrument(level = "info", skip_all)]
+pub async fn read_zarr_async(
+    store: AsyncReadableListableStorage,
+    prefix: &ObjectPath,
+    schema: SchemaRef,
+    projection: Option<Vec<usize>>,
+    limit: Option<usize>,
+    stats: Option<SharedIoStats>,
+    cached_meta: Option<ZarrStoreMeta>,
+) -> Result<SendableRecordBatchStream> {
+    info!("Starting async Zarr read");
+
+    // Use cached metadata if available, otherwise discover
+    let store_meta = if let Some(meta) = cached_meta {
+        info!("Using cached metadata");
+        meta
+    } else {
+        debug!("Discovering store metadata");
+        let meta_start = Instant::now();
+        let meta = discover_arrays_async(&store, prefix)
+            .await
+            .map_err(DataFusionError::External)?;
+        debug!(elapsed = ?meta_start.elapsed(), "Metadata discovery complete");
+
+        if let Some(ref s) = stats {
+            // TODO: Track actual metadata bytes read
+            let meta_bytes = (meta.coords.len() + meta.data_vars.len()) as u64 * 500;
+            s.record_metadata(meta_bytes, meta_start.elapsed());
+        }
+        meta
+    };
+
+    let coord_names: Vec<_> = store_meta.coords.iter().map(|c| c.name.clone()).collect();
+    let coord_types: Vec<_> = store_meta
+        .coords
+        .iter()
+        .map(|c| c.data_type.clone())
+        .collect();
+
+    // Get coordinate sizes from metadata (already discovered)
+    let coord_sizes: Vec<usize> = store_meta
+        .coords
+        .iter()
+        .map(|c| c.shape[0] as usize)
+        .collect();
+    debug!(?coord_names, ?coord_sizes, "Coordinate info");
+
+    // Total rows = product of all coordinate sizes
+    let total_rows: usize = coord_sizes.iter().product();
+    info!(total_rows, "Total rows in dataset (cartesian product)");
+
+    // Apply limit early to avoid allocating memory for rows we won't use
+    let effective_rows = limit.map(|l| l.min(total_rows)).unwrap_or(total_rows);
+    info!(effective_rows, "Effective rows after limit");
+
+    // Calculate how many values we need from each coordinate
+    let coord_value_limits = calculate_coord_limits(&coord_sizes, effective_rows);
+    debug!(?coord_value_limits, "Values needed from each coordinate");
+
+    // Load only the coordinate values we need for the limit
+    debug!("Loading coordinate values");
+    let mut coord_values: Vec<CoordValues> = Vec::new();
+
+    // TODO:: This can happen in parallel for all coordinates
+    for (i, (coord, dtype)) in store_meta.coords.iter().zip(coord_types.iter()).enumerate() {
+        debug!(coord_name = %coord.name, "Reading coordinate");
+        let read_start = Instant::now();
+        let array_path = format!("/{}/{}", prefix, coord.name);
+        debug!(path = %array_path, "Opening coordinate array");
+
+        let arr = Array::async_open(store.clone(), &array_path)
+            .await
+            .map_err(zarr_err)?;
+
+        let values_needed = coord_value_limits[i];
+        debug!(values_needed, full_size = coord_sizes[i], "Reading coordinate subset");
+
+        // Read only the subset of values we need for this limit
+        let subset = ArraySubset::new_with_ranges(&[0..values_needed as u64]);
+        let element_bytes = dtype_to_bytes(dtype);
+        let values = match dtype.as_str() {
+            "float32" => {
+                let (vals, _) = arr
+                    .async_retrieve_array_subset_ndarray::<f32>(&subset)
+                    .await
+                    .map_err(zarr_err)?
+                    .into_raw_vec_and_offset();
+                CoordValues::Float32(vals)
+            }
+            "float64" => {
+                let (vals, _) = arr
+                    .async_retrieve_array_subset_ndarray::<f64>(&subset)
+                    .await
+                    .map_err(zarr_err)?
+                    .into_raw_vec_and_offset();
+                CoordValues::Float64(vals)
+            }
+            _ => {
+                let (vals, _) = arr
+                    .async_retrieve_array_subset_ndarray::<i64>(&subset)
+                    .await
+                    .map_err(zarr_err)?
+                    .into_raw_vec_and_offset();
+                CoordValues::Int64(vals)
+            }
+        };
+
+        debug!(elapsed = ?read_start.elapsed(), "Coordinate read complete");
+        if let Some(ref s) = stats {
+            let bytes = values_needed as u64 * element_bytes;
+            s.record_coord(bytes, read_start.elapsed());
+        }
+        coord_values.push(values);
+    }
+    info!("All coordinates loaded");
+
+    let projected_indices = projection.unwrap_or_else(|| (0..schema.fields().len()).collect());
+    debug!(num_columns = projected_indices.len(), "Building result arrays");
+
+    let mut result_arrays: Vec<ArrayRef> = Vec::new();
+
+    for idx in &projected_indices {
+        let field = schema.field(*idx);
+        let field_name = field.name();
+
+        // Check if this is a coordinate
+        if let Some(coord_idx) = coord_names.iter().position(|n| n == field_name) {
+            debug!(field = %field_name, "Building dictionary array for coordinate");
+            // Create DictionaryArray for coordinate (memory efficient)
+            // Use coord_value_limits for key generation pattern (respects limit)
+            let dict_array = create_coord_dictionary_typed(
+                &coord_values[coord_idx],
+                coord_idx,
+                &coord_value_limits,
+                effective_rows,
+            );
+            result_arrays.push(dict_array);
+        } else {
+            // Data variable - read and flatten based on schema type
+            debug!(field_name = %field_name, "Reading data variable");
+            let read_start = Instant::now();
+            let array_path = format!("/{}/{}", prefix, field_name);
+            debug!(path = %array_path, "Opening data variable array");
+
+            let arr = Array::async_open(store.clone(), &array_path)
+                .await
+                .map_err(zarr_err)?;
+            debug!(shape = ?arr.shape(), "Data variable shape");
+
+            // Use limited subset when limit is applied to avoid reading entire array
+            let subset = if effective_rows < total_rows {
+                let ranges = calculate_limited_subset(arr.shape(), effective_rows);
+                debug!(?ranges, "Using limited subset");
+                ArraySubset::new_with_ranges(&ranges)
+            } else {
+                debug!("Reading full array");
+                ArraySubset::new_with_shape(arr.shape().to_vec())
+            };
+            let num_elements: u64 = subset.num_elements();
+            debug!(num_elements, "Elements to read");
+
+            let array: ArrayRef = match field.data_type() {
+                DataType::Float32 => {
+                    let (vals, _) = arr
+                        .async_retrieve_array_subset_ndarray::<f32>(&subset)
+                        .await
+                        .map_err(zarr_err)?
+                        .into_raw_vec_and_offset();
+                    Arc::new(Float32Array::from(vals))
+                }
+                DataType::Float64 => {
+                    let (vals, _) = arr
+                        .async_retrieve_array_subset_ndarray::<f64>(&subset)
+                        .await
+                        .map_err(zarr_err)?
+                        .into_raw_vec_and_offset();
+                    Arc::new(Float64Array::from(vals))
+                }
+                _ => {
+                    let (vals, _) = arr
+                        .async_retrieve_array_subset_ndarray::<i64>(&subset)
+                        .await
+                        .map_err(zarr_err)?
+                        .into_raw_vec_and_offset();
+                    Arc::new(Int64Array::from(vals))
+                }
+            };
+
+            debug!(elapsed = ?read_start.elapsed(), "Data variable read complete");
+            if let Some(ref s) = stats {
+                let bytes = num_elements * arrow_dtype_to_bytes(field.data_type());
+                s.record_data(bytes, read_start.elapsed());
+            }
+            result_arrays.push(array);
+        }
+    }
+
+    debug!("Building projected schema");
+    let projected_schema = Arc::new(Schema::new(
+        projected_indices
+            .iter()
+            .map(|&i| schema.field(i).clone())
+            .collect::<Vec<_>>(),
+    ));
+
+    // Apply limit if specified
+    let result_arrays = if let Some(limit) = limit {
+        let limit = limit.min(total_rows);
+        debug!(limit, "Applying final limit slice");
+        result_arrays
+            .into_iter()
+            .map(|arr| arr.slice(0, limit))
+            .collect()
+    } else {
+        result_arrays
+    };
+
+    let batch = RecordBatch::try_new(projected_schema.clone(), result_arrays)?;
+    info!(
+        num_rows = batch.num_rows(),
+        num_columns = batch.num_columns(),
+        "RecordBatch created successfully"
+    );
+
+    let stream = stream::iter(vec![Ok(batch)]);
+
+    Ok(Box::pin(RecordBatchStreamAdapter::new(
+        projected_schema,
+        stream,
+    )))
 }

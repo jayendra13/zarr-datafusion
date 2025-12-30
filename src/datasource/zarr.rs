@@ -3,13 +3,30 @@ use async_trait::async_trait;
 use datafusion::catalog::Session;
 use datafusion::{datasource::TableProvider, error::Result, physical_plan::ExecutionPlan};
 use std::sync::Arc;
+use zarrs::storage::AsyncReadableListableStorage;
+use zarrs_object_store::object_store::path::Path as ObjectPath;
 
 use crate::physical_plan::zarr_exec::ZarrExec;
+use crate::reader::schema_inference::ZarrStoreMeta;
 
-#[derive(Debug)]
+/// Cached remote store info (store, prefix, metadata)
+pub type CachedRemoteStore = Option<(AsyncReadableListableStorage, ObjectPath, ZarrStoreMeta)>;
+
 pub struct ZarrTable {
     schema: SchemaRef,
     path: String,
+    /// Cached async store and metadata for remote URLs (avoids recreating on each query)
+    cached_remote: CachedRemoteStore,
+}
+
+impl std::fmt::Debug for ZarrTable {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ZarrTable")
+            .field("schema", &self.schema)
+            .field("path", &self.path)
+            .field("cached_remote", &self.cached_remote.as_ref().map(|(_, p, _)| p))
+            .finish()
+    }
 }
 
 impl ZarrTable {
@@ -17,6 +34,22 @@ impl ZarrTable {
         Self {
             schema,
             path: path.into(),
+            cached_remote: None,
+        }
+    }
+
+    /// Create a ZarrTable with a cached async store and metadata
+    pub fn with_cached_remote(
+        schema: SchemaRef,
+        path: impl Into<String>,
+        store: AsyncReadableListableStorage,
+        prefix: ObjectPath,
+        metadata: ZarrStoreMeta,
+    ) -> Self {
+        Self {
+            schema,
+            path: path.into(),
+            cached_remote: Some((store, prefix, metadata)),
         }
     }
 }
@@ -47,6 +80,7 @@ impl TableProvider for ZarrTable {
             self.path.clone(),
             projection.cloned(),
             limit,
+            self.cached_remote.clone(),
         )))
     }
 }
