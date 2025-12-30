@@ -3,6 +3,7 @@ use async_trait::async_trait;
 use datafusion::catalog::Session;
 use datafusion::{datasource::TableProvider, error::Result, physical_plan::ExecutionPlan};
 use std::sync::Arc;
+use tracing::info;
 use zarrs::storage::AsyncReadableListableStorage;
 use zarrs_object_store::object_store::path::Path as ObjectPath;
 
@@ -75,6 +76,28 @@ impl TableProvider for ZarrTable {
         _filters: &[datafusion::logical_expr::Expr],
         limit: Option<usize>,
     ) -> Result<Arc<dyn ExecutionPlan>> {
+        // Log projection pushdown
+        let total_columns = self.schema.fields().len();
+        if let Some(indices) = projection {
+            let projected_names: Vec<_> = indices
+                .iter()
+                .map(|&i| self.schema.field(i).name().as_str())
+                .collect();
+            info!(
+                projected = indices.len(),
+                total = total_columns,
+                columns = ?projected_names,
+                "Projection pushdown"
+            );
+        } else {
+            info!(projected = total_columns, total = total_columns, "No projection pushdown (all columns)");
+        }
+
+        // Log limit pushdown
+        if let Some(limit) = limit {
+            info!(limit, "Limit pushdown");
+        }
+
         Ok(Arc::new(ZarrExec::new(
             self.schema.clone(),
             self.path.clone(),

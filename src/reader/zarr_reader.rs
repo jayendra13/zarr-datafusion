@@ -134,7 +134,37 @@ pub fn read_zarr(
     // Total rows = product of all coordinate sizes
     let total_rows: usize = coord_sizes.iter().product();
 
-    let projected_indices = projection.unwrap_or_else(|| (0..schema.fields().len()).collect());
+    let total_columns = schema.fields().len();
+    let projected_indices = projection.unwrap_or_else(|| (0..total_columns).collect());
+
+    // Log projection optimization effect
+    let skipped_columns = total_columns - projected_indices.len();
+    if skipped_columns > 0 {
+        let projected_names: Vec<_> = projected_indices
+            .iter()
+            .map(|&i| schema.field(i).name().as_str())
+            .collect();
+        info!(
+            reading = projected_indices.len(),
+            skipping = skipped_columns,
+            columns = ?projected_names,
+            "Projection optimization"
+        );
+    } else {
+        info!(columns = total_columns, "No projection optimization (all columns)");
+    }
+
+    // Log limit info (sync path applies limit via slicing at the end)
+    if let Some(limit) = limit {
+        let effective = limit.min(total_rows);
+        let reduction_pct = 100.0 * (1.0 - (effective as f64 / total_rows as f64));
+        info!(
+            total_rows,
+            effective_rows = effective,
+            reduction_pct = format!("{:.2}%", reduction_pct),
+            "Limit will be applied via slicing"
+        );
+    }
 
     let mut result_arrays: Vec<ArrayRef> = Vec::new();
 
@@ -413,15 +443,34 @@ pub async fn read_zarr_async(
 
     // Total rows = product of all coordinate sizes
     let total_rows: usize = coord_sizes.iter().product();
-    info!(total_rows, "Total rows in dataset (cartesian product)");
 
     // Apply limit early to avoid allocating memory for rows we won't use
     let effective_rows = limit.map(|l| l.min(total_rows)).unwrap_or(total_rows);
-    info!(effective_rows, "Effective rows after limit");
+
+    // Log limit optimization effect
+    if effective_rows < total_rows {
+        let reduction_pct = 100.0 * (1.0 - (effective_rows as f64 / total_rows as f64));
+        info!(
+            total_rows,
+            effective_rows,
+            reduction_pct = format!("{:.2}%", reduction_pct),
+            "Limit optimization applied"
+        );
+    } else {
+        info!(total_rows, "No limit optimization (reading all rows)");
+    }
 
     // Calculate how many values we need from each coordinate
     let coord_value_limits = calculate_coord_limits(&coord_sizes, effective_rows);
-    debug!(?coord_value_limits, "Values needed from each coordinate");
+
+    // Log coordinate reduction details
+    let coord_reduction: Vec<String> = coord_names
+        .iter()
+        .zip(coord_value_limits.iter())
+        .zip(coord_sizes.iter())
+        .map(|((name, &limit), &full)| format!("{}={}/{}", name, limit, full))
+        .collect();
+    debug!(limits = ?coord_reduction, "Coordinate value limits");
 
     // Load only the coordinate values we need for the limit
     debug!("Loading coordinate values");
@@ -480,8 +529,25 @@ pub async fn read_zarr_async(
     }
     info!("All coordinates loaded");
 
-    let projected_indices = projection.unwrap_or_else(|| (0..schema.fields().len()).collect());
-    debug!(num_columns = projected_indices.len(), "Building result arrays");
+    let total_columns = schema.fields().len();
+    let projected_indices = projection.unwrap_or_else(|| (0..total_columns).collect());
+
+    // Log projection optimization effect
+    let skipped_columns = total_columns - projected_indices.len();
+    if skipped_columns > 0 {
+        let projected_names: Vec<_> = projected_indices
+            .iter()
+            .map(|&i| schema.field(i).name().as_str())
+            .collect();
+        info!(
+            reading = projected_indices.len(),
+            skipping = skipped_columns,
+            columns = ?projected_names,
+            "Projection optimization"
+        );
+    } else {
+        info!(columns = total_columns, "No projection optimization (all columns)")
+    }
 
     let mut result_arrays: Vec<ArrayRef> = Vec::new();
 
@@ -514,16 +580,25 @@ pub async fn read_zarr_async(
             debug!(shape = ?arr.shape(), "Data variable shape");
 
             // Use limited subset when limit is applied to avoid reading entire array
+            let full_elements: u64 = arr.shape().iter().product();
             let subset = if effective_rows < total_rows {
                 let ranges = calculate_limited_subset(arr.shape(), effective_rows);
-                debug!(?ranges, "Using limited subset");
-                ArraySubset::new_with_ranges(&ranges)
+                let limited_subset = ArraySubset::new_with_ranges(&ranges);
+                let subset_elements = limited_subset.num_elements();
+                let reduction_pct = 100.0 * (1.0 - (subset_elements as f64 / full_elements as f64));
+                info!(
+                    field = %field_name,
+                    subset_elements,
+                    full_elements,
+                    reduction_pct = format!("{:.2}%", reduction_pct),
+                    "Data subset optimization"
+                );
+                limited_subset
             } else {
-                debug!("Reading full array");
+                debug!(field = %field_name, full_elements, "Reading full array");
                 ArraySubset::new_with_shape(arr.shape().to_vec())
             };
             let num_elements: u64 = subset.num_elements();
-            debug!(num_elements, "Elements to read");
 
             let array: ArrayRef = match field.data_type() {
                 DataType::Float32 => {
