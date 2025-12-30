@@ -1,6 +1,13 @@
+//! Example: Query ERA5 climate data using SQL
+//!
+//! Run with tracing enabled:
+//!   RUST_LOG=info cargo run --example query_era5
+//!   RUST_LOG=debug cargo run --example query_era5
+
 use std::sync::Arc;
 
 use datafusion::prelude::SessionContext;
+use tracing_subscriber::EnvFilter;
 use zarr_datafusion::datasource::zarr::ZarrTable;
 use zarr_datafusion::reader::schema_inference::infer_schema;
 
@@ -19,6 +26,13 @@ async fn run_query(
 
 #[tokio::main]
 async fn main() -> datafusion::error::Result<()> {
+    // Initialize tracing subscriber
+    tracing_subscriber::fmt()
+        .with_env_filter(EnvFilter::from_default_env())
+        .with_target(true)
+        .with_line_number(true)
+        .init();
+
     let ctx = SessionContext::new();
 
     // Load ERA5 data from Zarr v3 store
