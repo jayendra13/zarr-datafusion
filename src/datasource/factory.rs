@@ -9,7 +9,7 @@ use datafusion::logical_expr::CreateExternalTable;
 use tracing::{debug, info, instrument};
 
 use crate::datasource::zarr::ZarrTable;
-use crate::reader::schema_inference::{infer_schema, infer_schema_with_meta_async};
+use crate::reader::schema_inference::{infer_schema_with_meta, infer_schema_with_meta_async};
 use crate::reader::storage::{create_async_store, is_remote_url};
 
 #[derive(Debug, Default)]
@@ -45,9 +45,18 @@ impl TableProviderFactory for ZarrTableFactory {
             )))
         } else {
             info!("Local path detected - using sync schema inference");
-            let schema = Arc::new(infer_schema(&cmd.location)?);
-            info!(num_fields = schema.fields().len(), "Table created successfully");
-            Ok(Arc::new(ZarrTable::new(schema, &cmd.location)))
+            let (schema, metadata) = infer_schema_with_meta(&cmd.location)?;
+            let schema = Arc::new(schema);
+            info!(
+                num_fields = schema.fields().len(),
+                total_rows = metadata.total_rows,
+                "Table created successfully (with metadata for statistics)"
+            );
+            Ok(Arc::new(ZarrTable::with_metadata(
+                schema,
+                &cmd.location,
+                metadata,
+            )))
         }
     }
 }

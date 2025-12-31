@@ -14,7 +14,9 @@ use datafusion::prelude::{SessionConfig, SessionContext};
 use highlight::SqlHelper;
 use rustyline::error::ReadlineError;
 use rustyline::Editor;
+use tracing_subscriber::EnvFilter;
 use zarr_datafusion::datasource::factory::ZarrTableFactory;
+use zarr_datafusion::optimizer::{CountStatisticsRule, MinMaxStatisticsRule};
 use zarr_datafusion::physical_plan::zarr_exec::ZarrExec;
 use zarr_datafusion::reader::stats::{format_bytes, SharedIoStats};
 
@@ -42,6 +44,13 @@ fn get_history_path() -> PathBuf {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    // Initialize tracing subscriber (controlled via RUST_LOG env var)
+    tracing_subscriber::fmt()
+        .with_env_filter(EnvFilter::from_default_env())
+        .with_target(true)
+        .with_line_number(true)
+        .init();
+
     let config = SessionConfig::new().with_information_schema(true);
     let state = SessionStateBuilder::new()
         .with_default_features()
@@ -50,6 +59,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             "ZARR".to_string(),
             Arc::new(ZarrTableFactory) as _,
         )]))
+        .with_optimizer_rule(Arc::new(CountStatisticsRule::new()))
+        .with_optimizer_rule(Arc::new(MinMaxStatisticsRule::new()))
         .build();
     let ctx = SessionContext::new_with_state(state);
 

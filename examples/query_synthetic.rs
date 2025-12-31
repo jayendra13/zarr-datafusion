@@ -8,74 +8,63 @@
 //!   RUST_LOG=info cargo run --example query_synthetic
 //!   RUST_LOG=debug cargo run --example query_synthetic
 
+mod common;
+
 use std::sync::Arc;
-
-use datafusion::prelude::SessionContext;
-use tracing_subscriber::EnvFilter;
 use zarr_datafusion::datasource::zarr::ZarrTable;
-use zarr_datafusion::reader::schema_inference::infer_schema;
-
-async fn run_query(
-    ctx: &SessionContext,
-    description: &str,
-    sql: &str,
-) -> datafusion::error::Result<()> {
-    println!("\n{description}");
-    println!("SQL: {sql}");
-    println!();
-    let df = ctx.sql(sql).await?;
-    df.show().await?;
-    Ok(())
-}
+use zarr_datafusion::reader::schema_inference::infer_schema_with_meta;
 
 #[tokio::main]
 async fn main() -> datafusion::error::Result<()> {
-    // Initialize tracing subscriber
-    tracing_subscriber::fmt()
-        .with_env_filter(EnvFilter::from_default_env())
-        .with_target(true)
-        .with_line_number(true)
-        .init();
+    common::init_tracing();
+    let ctx = common::create_local_context();
 
-    let ctx = SessionContext::new();
-
-    // Load synthetic weather data (Zarr v3)
+    // Load synthetic weather data (Zarr v3) with metadata for statistics
     let store_path = "data/synthetic_v3.zarr";
-    let schema = Arc::new(infer_schema(store_path).expect("Failed to infer schema"));
+    let (schema, metadata) = infer_schema_with_meta(store_path).expect("Failed to infer schema");
+    let schema = Arc::new(schema);
 
     println!("Synthetic Weather Data Schema:");
     for field in schema.fields() {
         println!("  {}: {:?}", field.name(), field.data_type());
     }
+    println!("Total rows: {}", metadata.total_rows);
 
-    let table = Arc::new(ZarrTable::new(schema, store_path));
+    let table = Arc::new(ZarrTable::with_metadata(schema, store_path, metadata));
     ctx.register_table("synthetic", table)?;
 
-    run_query(
+    common::run_query(
         &ctx,
         "Sample data (first 10 rows):",
         "SELECT * FROM synthetic LIMIT 10",
     )
     .await?;
 
-    run_query(
+    common::run_query(
         &ctx,
         "Filtered data (temperature > 5):",
         "SELECT time, lat, lon, temperature FROM synthetic WHERE temperature > 5 LIMIT 10",
     )
     .await?;
 
-    run_query(
+    common::run_query(
         &ctx,
         "Average temperature per day:",
         "SELECT time, AVG(temperature) as avg_temp FROM synthetic GROUP BY time ORDER BY time",
     )
     .await?;
 
-    run_query(
+    common::run_query(
         &ctx,
-        "Total rows:",
+        "Total rows (optimized - uses statistics, no data scan):",
         "SELECT COUNT(temperature) as total FROM synthetic",
+    )
+    .await?;
+
+    common::run_query(
+        &ctx,
+        "Coordinate bounds (optimized - uses statistics, no data scan):",
+        "SELECT MIN(lat) as lat_min, MAX(lat) as lat_max, MIN(lon) as lon_min, MAX(lon) as lon_max FROM synthetic",
     )
     .await?;
 

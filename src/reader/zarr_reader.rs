@@ -7,9 +7,10 @@ use tracing::{debug, info, instrument};
 
 use arrow::{
     array::{
-        ArrayRef, DictionaryArray, Float32Array, Float64Array, Int16Array, Int64Array, RecordBatch,
+        ArrayRef, Float32Array, Float64Array, Int64Array, RecordBatch,
+        RecordBatchOptions,
     },
-    datatypes::{DataType, Int16Type, Schema, SchemaRef},
+    datatypes::{DataType, Schema, SchemaRef},
 };
 use datafusion::{
     common::DataFusionError, error::Result, execution::SendableRecordBatchStream,
@@ -20,6 +21,9 @@ use std::sync::Arc;
 use std::time::Instant;
 use zarrs::{array::Array, array_subset::ArraySubset, filesystem::FilesystemStore};
 
+use super::coord::{
+    calculate_coord_limits, calculate_limited_subset, create_coord_dictionary_typed, CoordValues,
+};
 use super::schema_inference::discover_arrays;
 use super::stats::SharedIoStats;
 use super::tracked_store::TrackedStore;
@@ -50,11 +54,132 @@ fn arrow_dtype_to_bytes(dtype: &DataType) -> u64 {
     }
 }
 
-/// Coordinate values that can be either i64 or f32/f64
-enum CoordValues {
-    Int64(Vec<i64>),
-    Float32(Vec<f32>),
-    Float64(Vec<f64>),
+// =============================================================================
+// Macros for type-dispatched array reading (reduces ~90 lines of duplication)
+//
+// We maintain both sync and async paths because Tokio uses thread pools for
+// file I/O rather than io_uring, adding ~1-5μs overhead per operation. For
+// Zarr's many-chunk workloads, sync is faster for local files.
+// =============================================================================
+
+/// Macro to read coordinate array values with type dispatch.
+/// Handles both sync and async variants of zarrs array retrieval.
+macro_rules! read_coord_values {
+    // Sync version - uses retrieve_array_subset_ndarray
+    (sync, $arr:expr, $subset:expr, $dtype:expr) => {
+        match $dtype {
+            "float32" => {
+                let (vals, _) = $arr
+                    .retrieve_array_subset_ndarray::<f32>($subset)
+                    .map_err(zarr_err)?
+                    .into_raw_vec_and_offset();
+                CoordValues::Float32(vals)
+            }
+            "float64" => {
+                let (vals, _) = $arr
+                    .retrieve_array_subset_ndarray::<f64>($subset)
+                    .map_err(zarr_err)?
+                    .into_raw_vec_and_offset();
+                CoordValues::Float64(vals)
+            }
+            _ => {
+                let (vals, _) = $arr
+                    .retrieve_array_subset_ndarray::<i64>($subset)
+                    .map_err(zarr_err)?
+                    .into_raw_vec_and_offset();
+                CoordValues::Int64(vals)
+            }
+        }
+    };
+    // Async version - uses async_retrieve_array_subset_ndarray
+    (async, $arr:expr, $subset:expr, $dtype:expr) => {
+        match $dtype {
+            "float32" => {
+                let (vals, _) = $arr
+                    .async_retrieve_array_subset_ndarray::<f32>($subset)
+                    .await
+                    .map_err(zarr_err)?
+                    .into_raw_vec_and_offset();
+                CoordValues::Float32(vals)
+            }
+            "float64" => {
+                let (vals, _) = $arr
+                    .async_retrieve_array_subset_ndarray::<f64>($subset)
+                    .await
+                    .map_err(zarr_err)?
+                    .into_raw_vec_and_offset();
+                CoordValues::Float64(vals)
+            }
+            _ => {
+                let (vals, _) = $arr
+                    .async_retrieve_array_subset_ndarray::<i64>($subset)
+                    .await
+                    .map_err(zarr_err)?
+                    .into_raw_vec_and_offset();
+                CoordValues::Int64(vals)
+            }
+        }
+    };
+}
+
+/// Macro to read data variable array with type dispatch.
+/// Returns an ArrayRef based on the Arrow DataType.
+macro_rules! read_data_array {
+    // Sync version
+    (sync, $arr:expr, $subset:expr, $data_type:expr) => {
+        match $data_type {
+            DataType::Float32 => {
+                let (vals, _) = $arr
+                    .retrieve_array_subset_ndarray::<f32>($subset)
+                    .map_err(zarr_err)?
+                    .into_raw_vec_and_offset();
+                Arc::new(Float32Array::from(vals)) as ArrayRef
+            }
+            DataType::Float64 => {
+                let (vals, _) = $arr
+                    .retrieve_array_subset_ndarray::<f64>($subset)
+                    .map_err(zarr_err)?
+                    .into_raw_vec_and_offset();
+                Arc::new(Float64Array::from(vals)) as ArrayRef
+            }
+            _ => {
+                let (vals, _) = $arr
+                    .retrieve_array_subset_ndarray::<i64>($subset)
+                    .map_err(zarr_err)?
+                    .into_raw_vec_and_offset();
+                Arc::new(Int64Array::from(vals)) as ArrayRef
+            }
+        }
+    };
+    // Async version
+    (async, $arr:expr, $subset:expr, $data_type:expr) => {
+        match $data_type {
+            DataType::Float32 => {
+                let (vals, _) = $arr
+                    .async_retrieve_array_subset_ndarray::<f32>($subset)
+                    .await
+                    .map_err(zarr_err)?
+                    .into_raw_vec_and_offset();
+                Arc::new(Float32Array::from(vals)) as ArrayRef
+            }
+            DataType::Float64 => {
+                let (vals, _) = $arr
+                    .async_retrieve_array_subset_ndarray::<f64>($subset)
+                    .await
+                    .map_err(zarr_err)?
+                    .into_raw_vec_and_offset();
+                Arc::new(Float64Array::from(vals)) as ArrayRef
+            }
+            _ => {
+                let (vals, _) = $arr
+                    .async_retrieve_array_subset_ndarray::<i64>($subset)
+                    .await
+                    .map_err(zarr_err)?
+                    .into_raw_vec_and_offset();
+                Arc::new(Int64Array::from(vals)) as ArrayRef
+            }
+        }
+    };
 }
 
 pub fn read_zarr(
@@ -100,29 +225,7 @@ pub fn read_zarr(
 
         let subset = ArraySubset::new_with_shape(arr.shape().to_vec());
         let element_bytes = dtype_to_bytes(dtype);
-        let values = match dtype.as_str() {
-            "float32" => {
-                let (vals, _) = arr
-                    .retrieve_array_subset_ndarray::<f32>(&subset)
-                    .map_err(zarr_err)?
-                    .into_raw_vec_and_offset();
-                CoordValues::Float32(vals)
-            }
-            "float64" => {
-                let (vals, _) = arr
-                    .retrieve_array_subset_ndarray::<f64>(&subset)
-                    .map_err(zarr_err)?
-                    .into_raw_vec_and_offset();
-                CoordValues::Float64(vals)
-            }
-            _ => {
-                let (vals, _) = arr
-                    .retrieve_array_subset_ndarray::<i64>(&subset)
-                    .map_err(zarr_err)?
-                    .into_raw_vec_and_offset();
-                CoordValues::Int64(vals)
-            }
-        };
+        let values = read_coord_values!(sync, arr, &subset, dtype.as_str());
 
         if let Some(ref s) = stats {
             let bytes = size as u64 * element_bytes;
@@ -189,29 +292,7 @@ pub fn read_zarr(
             let subset = ArraySubset::new_with_shape(arr.shape().to_vec());
             let num_elements: u64 = arr.shape().iter().product();
 
-            let array: ArrayRef = match field.data_type() {
-                DataType::Float32 => {
-                    let (vals, _) = arr
-                        .retrieve_array_subset_ndarray::<f32>(&subset)
-                        .map_err(zarr_err)?
-                        .into_raw_vec_and_offset();
-                    Arc::new(Float32Array::from(vals))
-                }
-                DataType::Float64 => {
-                    let (vals, _) = arr
-                        .retrieve_array_subset_ndarray::<f64>(&subset)
-                        .map_err(zarr_err)?
-                        .into_raw_vec_and_offset();
-                    Arc::new(Float64Array::from(vals))
-                }
-                _ => {
-                    let (vals, _) = arr
-                        .retrieve_array_subset_ndarray::<i64>(&subset)
-                        .map_err(zarr_err)?
-                        .into_raw_vec_and_offset();
-                    Arc::new(Int64Array::from(vals))
-                }
-            };
+            let array: ArrayRef = read_data_array!(sync, arr, &subset, field.data_type());
 
             if let Some(ref s) = stats {
                 let bytes = num_elements * arrow_dtype_to_bytes(field.data_type());
@@ -229,6 +310,7 @@ pub fn read_zarr(
     ));
 
     // Apply limit if specified
+    let effective_rows = limit.map(|l| l.min(total_rows)).unwrap_or(total_rows);
     let result_arrays = if let Some(limit) = limit {
         let limit = limit.min(total_rows);
         result_arrays
@@ -239,150 +321,23 @@ pub fn read_zarr(
         result_arrays
     };
 
-    let batch = RecordBatch::try_new(projected_schema.clone(), result_arrays)?;
+    // Handle empty projection (e.g., count(*)) - need to set row count explicitly
+    let batch = if result_arrays.is_empty() {
+        info!(effective_rows, "Empty projection - returning row count only");
+        RecordBatch::try_new_with_options(
+            projected_schema.clone(),
+            result_arrays,
+            &RecordBatchOptions::new().with_row_count(Some(effective_rows)),
+        )?
+    } else {
+        RecordBatch::try_new(projected_schema.clone(), result_arrays)?
+    };
     let stream = stream::iter(vec![Ok(batch)]);
 
     Ok(Box::pin(RecordBatchStreamAdapter::new(
         projected_schema,
         stream,
     )))
-}
-
-/// Create a DictionaryArray for a coordinate column with proper type
-fn create_coord_dictionary_typed(
-    values: &CoordValues,
-    coord_idx: usize,
-    coord_sizes: &[usize],
-    total_rows: usize,
-) -> ArrayRef {
-    let keys = build_coord_keys(values.len(), coord_idx, coord_sizes, total_rows);
-    let keys_array = Int16Array::from(keys);
-
-    match values {
-        CoordValues::Int64(vals) => {
-            let values_array = Int64Array::from(vals.clone());
-            Arc::new(DictionaryArray::<Int16Type>::new(
-                keys_array,
-                Arc::new(values_array),
-            ))
-        }
-        CoordValues::Float32(vals) => {
-            let values_array = Float32Array::from(vals.clone());
-            Arc::new(DictionaryArray::<Int16Type>::new(
-                keys_array,
-                Arc::new(values_array),
-            ))
-        }
-        CoordValues::Float64(vals) => {
-            let values_array = Float64Array::from(vals.clone());
-            Arc::new(DictionaryArray::<Int16Type>::new(
-                keys_array,
-                Arc::new(values_array),
-            ))
-        }
-    }
-}
-
-impl CoordValues {
-    fn len(&self) -> usize {
-        match self {
-            CoordValues::Int64(v) => v.len(),
-            CoordValues::Float32(v) => v.len(),
-            CoordValues::Float64(v) => v.len(),
-        }
-    }
-}
-
-/// Calculate the subset ranges needed for a limited number of rows
-///
-/// For row-major (C) order, the last dimension varies fastest.
-/// Given shape [a, b, c, d] and limit N, we need to figure out
-/// which ranges to read to get exactly N elements.
-fn calculate_limited_subset(shape: &[u64], limit: usize) -> Vec<std::ops::Range<u64>> {
-    let limit = limit as u64;
-    let mut ranges = Vec::with_capacity(shape.len());
-
-    // Work backwards from the last dimension
-    for (i, &dim_size) in shape.iter().enumerate().rev() {
-        if i == shape.len() - 1 {
-            // Last dimension: take min(limit, dim_size)
-            let take = limit.min(dim_size);
-            ranges.push(0..take);
-        } else {
-            // Earlier dimensions: calculate how many complete "slices" we need
-            let inner_size: u64 = shape[i + 1..].iter().product();
-            let slices_needed = (limit + inner_size - 1) / inner_size; // ceil
-            let take = slices_needed.min(dim_size);
-            ranges.push(0..take);
-        }
-    }
-
-    ranges.reverse();
-    ranges
-}
-
-/// Calculate how many values we need from each coordinate for a given row limit
-///
-/// For coords with sizes [a, b, c, d] and limit N rows:
-/// - coord d (last): need min(N, d) values
-/// - coord c: need ceil(N / d) values, capped at c
-/// - coord b: need ceil(N / (c*d)) values, capped at b
-/// - coord a: need ceil(N / (b*c*d)) values, capped at a
-fn calculate_coord_limits(coord_sizes: &[usize], limit: usize) -> Vec<usize> {
-    let mut limits = Vec::with_capacity(coord_sizes.len());
-    let n = coord_sizes.len();
-
-    for i in 0..n {
-        // Product of all coords after this one
-        let inner_size: usize = coord_sizes[i + 1..].iter().product();
-        let inner_size = if inner_size == 0 { 1 } else { inner_size };
-
-        // How many values do we need from this coord?
-        let needed = (limit + inner_size - 1) / inner_size; // ceil
-        let take = needed.min(coord_sizes[i]);
-        limits.push(take);
-    }
-
-    limits
-}
-
-/// Build keys array for DictionaryArray
-///
-/// Instead of expanding [0,1,2] to [0,0,0,1,1,1,2,2,2,...] (700 i64 values = 5600 bytes),
-/// we store:
-///   - values: [0,1,2] (the unique coordinate values)
-///   - keys: [0,0,0,1,1,1,2,2,2,...] (indices into values, as i16)
-///
-/// Memory: 700 i16 keys (1400 bytes) + 3 i64 values (24 bytes) = 1424 bytes (~75% savings)
-///
-/// References:
-/// - Arrow DictionaryArray: https://docs.rs/arrow/latest/arrow/array/struct.DictionaryArray.html
-/// - DataFusion Dictionary support: https://datafusion.apache.org/user-guide/sql/data_types.html
-fn build_coord_keys(
-    num_values: usize,
-    coord_idx: usize,
-    coord_sizes: &[usize],
-    total_rows: usize,
-) -> Vec<i16> {
-    let mut keys: Vec<i16> = Vec::with_capacity(total_rows);
-
-    // Elements after this coordinate (inner loop size)
-    let inner_size: usize = coord_sizes[coord_idx + 1..].iter().product();
-    let inner_size = if inner_size == 0 { 1 } else { inner_size };
-
-    // Elements before this coordinate (outer loop count)
-    let outer_count: usize = coord_sizes[..coord_idx].iter().product();
-    let outer_count = if outer_count == 0 { 1 } else { outer_count };
-
-    for _ in 0..outer_count {
-        for i in 0..num_values {
-            for _ in 0..inner_size {
-                keys.push(i as i16);
-            }
-        }
-    }
-
-    keys
 }
 
 // =============================================================================
@@ -493,32 +448,7 @@ pub async fn read_zarr_async(
         // Read only the subset of values we need for this limit
         let subset = ArraySubset::new_with_ranges(&[0..values_needed as u64]);
         let element_bytes = dtype_to_bytes(dtype);
-        let values = match dtype.as_str() {
-            "float32" => {
-                let (vals, _) = arr
-                    .async_retrieve_array_subset_ndarray::<f32>(&subset)
-                    .await
-                    .map_err(zarr_err)?
-                    .into_raw_vec_and_offset();
-                CoordValues::Float32(vals)
-            }
-            "float64" => {
-                let (vals, _) = arr
-                    .async_retrieve_array_subset_ndarray::<f64>(&subset)
-                    .await
-                    .map_err(zarr_err)?
-                    .into_raw_vec_and_offset();
-                CoordValues::Float64(vals)
-            }
-            _ => {
-                let (vals, _) = arr
-                    .async_retrieve_array_subset_ndarray::<i64>(&subset)
-                    .await
-                    .map_err(zarr_err)?
-                    .into_raw_vec_and_offset();
-                CoordValues::Int64(vals)
-            }
-        };
+        let values = read_coord_values!(async, arr, &subset, dtype.as_str());
 
         debug!(elapsed = ?read_start.elapsed(), "Coordinate read complete");
         if let Some(ref s) = stats {
@@ -600,32 +530,7 @@ pub async fn read_zarr_async(
             };
             let num_elements: u64 = subset.num_elements();
 
-            let array: ArrayRef = match field.data_type() {
-                DataType::Float32 => {
-                    let (vals, _) = arr
-                        .async_retrieve_array_subset_ndarray::<f32>(&subset)
-                        .await
-                        .map_err(zarr_err)?
-                        .into_raw_vec_and_offset();
-                    Arc::new(Float32Array::from(vals))
-                }
-                DataType::Float64 => {
-                    let (vals, _) = arr
-                        .async_retrieve_array_subset_ndarray::<f64>(&subset)
-                        .await
-                        .map_err(zarr_err)?
-                        .into_raw_vec_and_offset();
-                    Arc::new(Float64Array::from(vals))
-                }
-                _ => {
-                    let (vals, _) = arr
-                        .async_retrieve_array_subset_ndarray::<i64>(&subset)
-                        .await
-                        .map_err(zarr_err)?
-                        .into_raw_vec_and_offset();
-                    Arc::new(Int64Array::from(vals))
-                }
-            };
+            let array: ArrayRef = read_data_array!(async, arr, &subset, field.data_type());
 
             debug!(elapsed = ?read_start.elapsed(), "Data variable read complete");
             if let Some(ref s) = stats {
@@ -656,7 +561,17 @@ pub async fn read_zarr_async(
         result_arrays
     };
 
-    let batch = RecordBatch::try_new(projected_schema.clone(), result_arrays)?;
+    // Handle empty projection (e.g., count(*)) - need to set row count explicitly
+    let batch = if result_arrays.is_empty() {
+        info!(effective_rows, "Empty projection - returning row count only");
+        RecordBatch::try_new_with_options(
+            projected_schema.clone(),
+            result_arrays,
+            &RecordBatchOptions::new().with_row_count(Some(effective_rows)),
+        )?
+    } else {
+        RecordBatch::try_new(projected_schema.clone(), result_arrays)?
+    };
     info!(
         num_rows = batch.num_rows(),
         num_columns = batch.num_columns(),

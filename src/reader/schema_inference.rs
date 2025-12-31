@@ -28,10 +28,12 @@
 //! └── humidity/    shape: [7, 10, 10]  → data variable (time × lat × lon)
 //! ```
 
-use arrow::datatypes::{DataType, Field, Schema};
+use arrow::datatypes::{Field, Schema};
 use std::fs;
 use std::path::Path;
 use tracing::{debug, info, instrument};
+
+use super::dtype::{parse_v2_dtype, zarr_dtype_to_arrow, zarr_dtype_to_arrow_dictionary};
 
 /// Zarr format version
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -73,87 +75,14 @@ pub fn detect_zarr_version(
     Err("Could not detect Zarr version: no metadata files found".into())
 }
 
-/// Parse Zarr v2 numpy dtype string to normalized type name
-/// Examples: "<i8" -> "int64", "<f4" -> "float32", "|b1" -> "bool"
-fn parse_v2_dtype(dtype: &str) -> String {
-    // V2 dtype format: [<>|][type_char][byte_size]
-    // < = little-endian, > = big-endian, | = not applicable
-    // Type chars: i=int, u=uint, f=float, b=bool, S=string, U=unicode
-
-    let chars: Vec<char> = dtype.chars().collect();
-    if chars.len() < 2 {
-        return "float64".to_string();
-    }
-
-    // Skip endianness prefix if present
-    let (type_char, size_str) = if chars[0] == '<' || chars[0] == '>' || chars[0] == '|' {
-        if chars.len() < 3 {
-            return "float64".to_string();
-        }
-        (chars[1], &dtype[2..])
-    } else {
-        (chars[0], &dtype[1..])
-    };
-
-    let size: u32 = size_str.parse().unwrap_or(8);
-
-    match type_char {
-        'i' => match size {
-            1 => "int8",
-            2 => "int16",
-            4 => "int32",
-            8 => "int64",
-            _ => "int64",
-        },
-        'u' => match size {
-            1 => "uint8",
-            2 => "uint16",
-            4 => "uint32",
-            8 => "uint64",
-            _ => "uint64",
-        },
-        'f' => match size {
-            2 => "float16",
-            4 => "float32",
-            8 => "float64",
-            _ => "float64",
-        },
-        'b' => "bool",
-        _ => "float64",
-    }
-    .to_string()
-}
-
-fn zarr_dtype_to_arrow(dtype: &str) -> DataType {
-    match dtype {
-        "int8" => DataType::Int8,
-        "int16" => DataType::Int16,
-        "int32" => DataType::Int32,
-        "int64" => DataType::Int64,
-        "uint8" => DataType::UInt8,
-        "uint16" => DataType::UInt16,
-        "uint32" => DataType::UInt32,
-        "uint64" => DataType::UInt64,
-        "float16" => DataType::Float16,
-        "float32" => DataType::Float32,
-        "float64" => DataType::Float64,
-        "bool" => DataType::Boolean,
-        _ => DataType::Utf8,
-    }
-}
-
-/// Convert Zarr dtype to Arrow Dictionary type for coordinates
-/// Uses Int16 keys (supports up to 32K unique values) with the value type from Zarr
-fn zarr_dtype_to_arrow_dictionary(dtype: &str) -> DataType {
-    let value_type = zarr_dtype_to_arrow(dtype);
-    DataType::Dictionary(Box::new(DataType::Int16), Box::new(value_type))
-}
-
 #[derive(Debug, Clone)]
 pub struct ZarrArrayMeta {
     pub name: String,
     pub data_type: String,
     pub shape: Vec<u64>,
+    /// Min/max bounds for coordinate arrays (None for data variables)
+    /// Stored as (min, max) in f64 for simplicity
+    pub coord_min_max: Option<(f64, f64)>,
 }
 
 impl ZarrArrayMeta {
@@ -167,6 +96,7 @@ impl ZarrArrayMeta {
 pub struct ZarrStoreMeta {
     pub coords: Vec<ZarrArrayMeta>,    // 1D arrays (sorted by name)
     pub data_vars: Vec<ZarrArrayMeta>, // nD arrays
+    pub total_rows: usize,             // Product of all coordinate sizes
 }
 
 /// Discover all arrays in a Zarr store (v2 or v3)
@@ -219,12 +149,13 @@ fn discover_arrays_v2(
                     name,
                     data_type,
                     shape,
+                    coord_min_max: None, // Will be computed in separate_and_sort_arrays
                 });
             }
         }
     }
 
-    separate_and_sort_arrays(arrays)
+    separate_and_sort_arrays(arrays, store_path)
 }
 
 /// Discover arrays in a Zarr v3 store
@@ -267,39 +198,150 @@ fn discover_arrays_v3(
                         name,
                         data_type,
                         shape,
+                        coord_min_max: None, // Will be computed in separate_and_sort_arrays
                     });
                 }
             }
         }
     }
 
-    separate_and_sort_arrays(arrays)
+    separate_and_sort_arrays(arrays, store_path)
+}
+
+/// Compute min/max for a coordinate array by reading its data
+/// Returns None if the computation fails (e.g., unsupported dtype, read error)
+fn compute_coord_min_max(store_path: &str, coord_name: &str, data_type: &str) -> Option<(f64, f64)> {
+    use zarrs::array::Array;
+    use zarrs::array_subset::ArraySubset;
+    use zarrs::filesystem::FilesystemStore;
+
+    // Open store and array
+    let store = FilesystemStore::new(store_path).ok()?;
+    let array_path = format!("/{}", coord_name);
+    let array = Array::open(store.into(), &array_path).ok()?;
+
+    // Get the full subset (entire 1D array)
+    let shape = array.shape();
+    let subset = ArraySubset::new_with_start_shape(vec![0], shape.to_vec()).ok()?;
+
+    // Read based on data type and compute min/max
+    match data_type {
+        "float64" => {
+            let data: Vec<f64> = array.retrieve_array_subset_elements(&subset).ok()?;
+            if data.is_empty() {
+                return None;
+            }
+            let min = data.iter().cloned().fold(f64::INFINITY, f64::min);
+            let max = data.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+            Some((min, max))
+        }
+        "float32" => {
+            let data: Vec<f32> = array.retrieve_array_subset_elements(&subset).ok()?;
+            if data.is_empty() {
+                return None;
+            }
+            let min = data.iter().cloned().fold(f32::INFINITY, f32::min) as f64;
+            let max = data.iter().cloned().fold(f32::NEG_INFINITY, f32::max) as f64;
+            Some((min, max))
+        }
+        "int64" => {
+            let data: Vec<i64> = array.retrieve_array_subset_elements(&subset).ok()?;
+            if data.is_empty() {
+                return None;
+            }
+            let min = *data.iter().min()? as f64;
+            let max = *data.iter().max()? as f64;
+            Some((min, max))
+        }
+        "int32" => {
+            let data: Vec<i32> = array.retrieve_array_subset_elements(&subset).ok()?;
+            if data.is_empty() {
+                return None;
+            }
+            let min = *data.iter().min()? as f64;
+            let max = *data.iter().max()? as f64;
+            Some((min, max))
+        }
+        "int16" => {
+            let data: Vec<i16> = array.retrieve_array_subset_elements(&subset).ok()?;
+            if data.is_empty() {
+                return None;
+            }
+            let min = *data.iter().min()? as f64;
+            let max = *data.iter().max()? as f64;
+            Some((min, max))
+        }
+        "uint64" => {
+            let data: Vec<u64> = array.retrieve_array_subset_elements(&subset).ok()?;
+            if data.is_empty() {
+                return None;
+            }
+            let min = *data.iter().min()? as f64;
+            let max = *data.iter().max()? as f64;
+            Some((min, max))
+        }
+        "uint32" => {
+            let data: Vec<u32> = array.retrieve_array_subset_elements(&subset).ok()?;
+            if data.is_empty() {
+                return None;
+            }
+            let min = *data.iter().min()? as f64;
+            let max = *data.iter().max()? as f64;
+            Some((min, max))
+        }
+        _ => {
+            debug!(data_type = %data_type, "Unsupported data type for min/max computation");
+            None
+        }
+    }
 }
 
 /// Separate arrays into coordinates and data variables, then sort
+/// Also computes min/max for coordinate arrays by reading their data
 fn separate_and_sort_arrays(
     arrays: Vec<ZarrArrayMeta>,
+    store_path: &str,
 ) -> Result<ZarrStoreMeta, Box<dyn std::error::Error + Send + Sync>> {
-    let mut coords: Vec<_> = arrays
-        .iter()
-        .filter(|a| a.is_coordinate())
-        .cloned()
-        .collect();
-    let mut data_vars: Vec<_> = arrays
-        .iter()
-        .filter(|a| !a.is_coordinate())
-        .cloned()
-        .collect();
+    // Use into_iter + partition for single-pass, zero-clone separation
+    let (mut coords, mut data_vars): (Vec<_>, Vec<_>) = arrays
+        .into_iter()
+        .partition(|a| a.is_coordinate());
 
     coords.sort_by(|a, b| a.name.cmp(&b.name));
     data_vars.sort_by(|a, b| a.name.cmp(&b.name));
 
-    Ok(ZarrStoreMeta { coords, data_vars })
+    // Compute min/max for each coordinate by reading the data
+    for coord in &mut coords {
+        if let Some(min_max) = compute_coord_min_max(store_path, &coord.name, &coord.data_type) {
+            debug!(
+                coord = %coord.name,
+                min = min_max.0,
+                max = min_max.1,
+                "Computed coordinate min/max"
+            );
+            coord.coord_min_max = Some(min_max);
+        }
+    }
+
+    // Compute total_rows = product of all coordinate sizes
+    let total_rows: usize = coords
+        .iter()
+        .map(|c| c.shape[0] as usize)
+        .product();
+
+    Ok(ZarrStoreMeta { coords, data_vars, total_rows })
 }
 
 /// Infer Arrow schema from Zarr store metadata (v2 or v3)
 /// Coordinates use DictionaryArray for memory efficiency (stores unique values once)
 pub fn infer_schema(store_path: &str) -> Result<Schema, Box<dyn std::error::Error + Send + Sync>> {
+    let (schema, _meta) = infer_schema_with_meta(store_path)?;
+    Ok(schema)
+}
+
+/// Infer Arrow schema and return the store metadata for statistics
+/// This allows caching the metadata for later use during query execution
+pub fn infer_schema_with_meta(store_path: &str) -> Result<(Schema, ZarrStoreMeta), Box<dyn std::error::Error + Send + Sync>> {
     let meta = discover_arrays(store_path)?;
 
     let mut fields: Vec<Field> = Vec::new();
@@ -323,7 +365,7 @@ pub fn infer_schema(store_path: &str) -> Result<Schema, Box<dyn std::error::Erro
         ));
     }
 
-    Ok(Schema::new(fields))
+    Ok((Schema::new(fields), meta))
 }
 
 // =============================================================================
@@ -499,11 +541,12 @@ async fn discover_arrays_v2_async(
                 name,
                 data_type,
                 shape,
+                coord_min_max: None, // Not computed for async/remote stores yet
             });
         }
     }
 
-    separate_and_sort_arrays(arrays)
+    separate_and_sort_arrays_async(arrays)
 }
 
 /// Async version of discover_arrays_v3 for remote stores
@@ -559,12 +602,34 @@ async fn discover_arrays_v3_async(
                     name,
                     data_type,
                     shape,
+                    coord_min_max: None, // Not computed for async/remote stores yet
                 });
             }
         }
     }
 
-    separate_and_sort_arrays(arrays)
+    separate_and_sort_arrays_async(arrays)
+}
+
+/// Separate arrays into coordinates and data variables (async version, no min/max computation)
+fn separate_and_sort_arrays_async(
+    arrays: Vec<ZarrArrayMeta>,
+) -> Result<ZarrStoreMeta, Box<dyn std::error::Error + Send + Sync>> {
+    // Use into_iter + partition for single-pass, zero-clone separation
+    let (mut coords, mut data_vars): (Vec<_>, Vec<_>) = arrays
+        .into_iter()
+        .partition(|a| a.is_coordinate());
+
+    coords.sort_by(|a, b| a.name.cmp(&b.name));
+    data_vars.sort_by(|a, b| a.name.cmp(&b.name));
+
+    // Compute total_rows = product of all coordinate sizes
+    let total_rows: usize = coords
+        .iter()
+        .map(|c| c.shape[0] as usize)
+        .product();
+
+    Ok(ZarrStoreMeta { coords, data_vars, total_rows })
 }
 
 /// Async version of infer_schema for remote object stores
@@ -612,48 +677,7 @@ pub async fn infer_schema_with_meta_async(
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    // ==================== parse_v2_dtype tests ====================
-
-    #[test]
-    fn test_parse_v2_dtype_all_types() {
-        let cases = [
-            // Integers
-            ("<i8", "int64"),
-            ("<i4", "int32"),
-            ("<i2", "int16"),
-            ("<i1", "int8"),
-            // Unsigned integers
-            ("<u8", "uint64"),
-            ("<u4", "uint32"),
-            ("<u2", "uint16"),
-            ("<u1", "uint8"),
-            // Floats
-            ("<f8", "float64"),
-            ("<f4", "float32"),
-            ("<f2", "float16"),
-            // Bool
-            ("|b1", "bool"),
-        ];
-        for (input, expected) in cases {
-            assert_eq!(parse_v2_dtype(input), expected, "Failed for {}", input);
-        }
-    }
-
-    #[test]
-    fn test_parse_v2_dtype_big_endian() {
-        assert_eq!(parse_v2_dtype(">i8"), "int64");
-        assert_eq!(parse_v2_dtype(">f4"), "float32");
-    }
-
-    #[test]
-    fn test_parse_v2_dtype_edge_cases() {
-        // Malformed/short strings default to float64
-        assert_eq!(parse_v2_dtype("x"), "float64");
-        assert_eq!(parse_v2_dtype(""), "float64");
-        // Unknown type char defaults to float64
-        assert_eq!(parse_v2_dtype("<x8"), "float64");
-    }
+    use arrow::datatypes::DataType;
 
     // ==================== detect_zarr_version tests ====================
 
@@ -686,30 +710,6 @@ mod tests {
         assert!(detect_zarr_version("data/nonexistent.zarr").is_err());
     }
 
-    // ==================== zarr_dtype_to_arrow tests ====================
-
-    #[test]
-    fn test_zarr_dtype_to_arrow_all_types() {
-        let cases = [
-            ("int8", DataType::Int8),
-            ("int16", DataType::Int16),
-            ("int32", DataType::Int32),
-            ("int64", DataType::Int64),
-            ("uint8", DataType::UInt8),
-            ("uint16", DataType::UInt16),
-            ("uint32", DataType::UInt32),
-            ("uint64", DataType::UInt64),
-            ("float16", DataType::Float16),
-            ("float32", DataType::Float32),
-            ("float64", DataType::Float64),
-            ("bool", DataType::Boolean),
-            ("unknown", DataType::Utf8), // fallback
-        ];
-        for (input, expected) in cases {
-            assert_eq!(zarr_dtype_to_arrow(input), expected, "Failed for {}", input);
-        }
-    }
-
     // ==================== ZarrArrayMeta tests ====================
 
     #[test]
@@ -719,6 +719,7 @@ mod tests {
             name: "lat".to_string(),
             data_type: "float64".to_string(),
             shape: vec![10],
+            coord_min_max: Some((0.0, 90.0)),
         };
         assert!(coord.is_coordinate());
 
@@ -727,6 +728,7 @@ mod tests {
             name: "temp".to_string(),
             data_type: "float64".to_string(),
             shape: vec![10, 10],
+            coord_min_max: None,
         };
         assert!(!data_2d.is_coordinate());
 
@@ -734,6 +736,7 @@ mod tests {
             name: "temp".to_string(),
             data_type: "float64".to_string(),
             shape: vec![7, 10, 10],
+            coord_min_max: None,
         };
         assert!(!data_3d.is_coordinate());
     }
