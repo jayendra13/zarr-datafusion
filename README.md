@@ -1,5 +1,7 @@
 # zarr-datafusion
 
+[![Tests](https://github.com/jayendra13/zarr-datafusion/actions/workflows/test.yml/badge.svg)](https://github.com/jayendra13/zarr-datafusion/actions/workflows/test.yml)
+
 A Rust library that integrates [Zarr](https://zarr.dev/) (v2 and v3) array storage with [Apache DataFusion](https://datafusion.apache.org/) for querying multidimensional scientific data using SQL.
 
 ## Overview
