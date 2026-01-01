@@ -6,10 +6,7 @@
 use tracing::{debug, info, instrument};
 
 use arrow::{
-    array::{
-        ArrayRef, Float32Array, Float64Array, Int64Array, RecordBatch,
-        RecordBatchOptions,
-    },
+    array::{ArrayRef, Float32Array, Float64Array, Int64Array, RecordBatch, RecordBatchOptions},
     datatypes::{DataType, Schema, SchemaRef},
 };
 use datafusion::{
@@ -254,7 +251,10 @@ pub fn read_zarr(
             "Projection optimization"
         );
     } else {
-        info!(columns = total_columns, "No projection optimization (all columns)");
+        info!(
+            columns = total_columns,
+            "No projection optimization (all columns)"
+        );
     }
 
     // Log limit info (sync path applies limit via slicing at the end)
@@ -323,7 +323,10 @@ pub fn read_zarr(
 
     // Handle empty projection (e.g., count(*)) - need to set row count explicitly
     let batch = if result_arrays.is_empty() {
-        info!(effective_rows, "Empty projection - returning row count only");
+        info!(
+            effective_rows,
+            "Empty projection - returning row count only"
+        );
         RecordBatch::try_new_with_options(
             projected_schema.clone(),
             result_arrays,
@@ -443,9 +446,14 @@ pub async fn read_zarr_async(
             .map_err(zarr_err)?;
 
         let values_needed = coord_value_limits[i];
-        debug!(values_needed, full_size = coord_sizes[i], "Reading coordinate subset");
+        debug!(
+            values_needed,
+            full_size = coord_sizes[i],
+            "Reading coordinate subset"
+        );
 
         // Read only the subset of values we need for this limit
+        #[allow(clippy::single_range_in_vec_init)]
         let subset = ArraySubset::new_with_ranges(&[0..values_needed as u64]);
         let element_bytes = dtype_to_bytes(dtype);
         let values = read_coord_values!(async, arr, &subset, dtype.as_str());
@@ -476,7 +484,10 @@ pub async fn read_zarr_async(
             "Projection optimization"
         );
     } else {
-        info!(columns = total_columns, "No projection optimization (all columns)")
+        info!(
+            columns = total_columns,
+            "No projection optimization (all columns)"
+        )
     }
 
     let mut result_arrays: Vec<ArrayRef> = Vec::new();
@@ -563,7 +574,10 @@ pub async fn read_zarr_async(
 
     // Handle empty projection (e.g., count(*)) - need to set row count explicitly
     let batch = if result_arrays.is_empty() {
-        info!(effective_rows, "Empty projection - returning row count only");
+        info!(
+            effective_rows,
+            "Empty projection - returning row count only"
+        );
         RecordBatch::try_new_with_options(
             projected_schema.clone(),
             result_arrays,

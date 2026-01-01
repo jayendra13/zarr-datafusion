@@ -210,7 +210,11 @@ fn discover_arrays_v3(
 
 /// Compute min/max for a coordinate array by reading its data
 /// Returns None if the computation fails (e.g., unsupported dtype, read error)
-fn compute_coord_min_max(store_path: &str, coord_name: &str, data_type: &str) -> Option<(f64, f64)> {
+fn compute_coord_min_max(
+    store_path: &str,
+    coord_name: &str,
+    data_type: &str,
+) -> Option<(f64, f64)> {
     use zarrs::array::Array;
     use zarrs::array_subset::ArraySubset;
     use zarrs::filesystem::FilesystemStore;
@@ -303,9 +307,8 @@ fn separate_and_sort_arrays(
     store_path: &str,
 ) -> Result<ZarrStoreMeta, Box<dyn std::error::Error + Send + Sync>> {
     // Use into_iter + partition for single-pass, zero-clone separation
-    let (mut coords, mut data_vars): (Vec<_>, Vec<_>) = arrays
-        .into_iter()
-        .partition(|a| a.is_coordinate());
+    let (mut coords, mut data_vars): (Vec<_>, Vec<_>) =
+        arrays.into_iter().partition(|a| a.is_coordinate());
 
     coords.sort_by(|a, b| a.name.cmp(&b.name));
     data_vars.sort_by(|a, b| a.name.cmp(&b.name));
@@ -324,12 +327,13 @@ fn separate_and_sort_arrays(
     }
 
     // Compute total_rows = product of all coordinate sizes
-    let total_rows: usize = coords
-        .iter()
-        .map(|c| c.shape[0] as usize)
-        .product();
+    let total_rows: usize = coords.iter().map(|c| c.shape[0] as usize).product();
 
-    Ok(ZarrStoreMeta { coords, data_vars, total_rows })
+    Ok(ZarrStoreMeta {
+        coords,
+        data_vars,
+        total_rows,
+    })
 }
 
 /// Infer Arrow schema from Zarr store metadata (v2 or v3)
@@ -341,7 +345,9 @@ pub fn infer_schema(store_path: &str) -> Result<Schema, Box<dyn std::error::Erro
 
 /// Infer Arrow schema and return the store metadata for statistics
 /// This allows caching the metadata for later use during query execution
-pub fn infer_schema_with_meta(store_path: &str) -> Result<(Schema, ZarrStoreMeta), Box<dyn std::error::Error + Send + Sync>> {
+pub fn infer_schema_with_meta(
+    store_path: &str,
+) -> Result<(Schema, ZarrStoreMeta), Box<dyn std::error::Error + Send + Sync>> {
     let meta = discover_arrays(store_path)?;
 
     let mut fields: Vec<Field> = Vec::new();
@@ -436,7 +442,9 @@ pub async fn detect_zarr_version_async(
     };
     let store_prefix = StorePrefix::new(&prefix_str)
         .map_err(|e| format!("Invalid prefix '{}': {}", prefix_str, e))?;
-    let entries = store.list_dir(&store_prefix).await
+    let entries = store
+        .list_dir(&store_prefix)
+        .await
         .map_err(|e| format!("Failed to list directory: {}", e))?;
 
     for subdir in entries.prefixes() {
@@ -466,10 +474,7 @@ async fn store_key_exists(store: &AsyncReadableListableStorage, key: &str) -> bo
         Err(_) => return false,
     };
 
-    match store.get(&store_key).await {
-        Ok(Some(_)) => true,
-        _ => false,
-    }
+    matches!(store.get(&store_key).await, Ok(Some(_)))
 }
 
 /// Read a key from the async store as string
@@ -479,8 +484,7 @@ async fn store_get_string(
 ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
     use zarrs::storage::{AsyncReadableStorageTraits, StoreKey};
 
-    let store_key = StoreKey::new(key)
-        .map_err(|e| format!("Invalid key '{}': {}", key, e))?;
+    let store_key = StoreKey::new(key).map_err(|e| format!("Invalid key '{}': {}", key, e))?;
 
     let bytes = store
         .get(&store_key)
@@ -509,7 +513,9 @@ async fn discover_arrays_v2_async(
     };
     let store_prefix = StorePrefix::new(&prefix_str)
         .map_err(|e| format!("Invalid prefix '{}': {}", prefix_str, e))?;
-    let entries = store.list_dir(&store_prefix).await
+    let entries = store
+        .list_dir(&store_prefix)
+        .await
         .map_err(|e| format!("Failed to list directory: {}", e))?;
 
     for subdir in entries.prefixes() {
@@ -546,7 +552,7 @@ async fn discover_arrays_v2_async(
         }
     }
 
-    separate_and_sort_arrays_async(arrays)
+    separate_and_sort_arrays_async(store, prefix, arrays).await
 }
 
 /// Async version of discover_arrays_v3 for remote stores
@@ -566,7 +572,9 @@ async fn discover_arrays_v3_async(
     };
     let store_prefix = StorePrefix::new(&prefix_str)
         .map_err(|e| format!("Invalid prefix '{}': {}", prefix_str, e))?;
-    let entries = store.list_dir(&store_prefix).await
+    let entries = store
+        .list_dir(&store_prefix)
+        .await
         .map_err(|e| format!("Failed to list directory: {}", e))?;
 
     for subdir in entries.prefixes() {
@@ -608,28 +616,115 @@ async fn discover_arrays_v3_async(
         }
     }
 
-    separate_and_sort_arrays_async(arrays)
+    separate_and_sort_arrays_async(store, prefix, arrays).await
 }
 
-/// Separate arrays into coordinates and data variables (async version, no min/max computation)
-fn separate_and_sort_arrays_async(
+/// Separate arrays into coordinates and data variables (async version with min/max computation)
+async fn separate_and_sort_arrays_async(
+    store: &AsyncReadableListableStorage,
+    prefix: &ObjectPath,
     arrays: Vec<ZarrArrayMeta>,
 ) -> Result<ZarrStoreMeta, Box<dyn std::error::Error + Send + Sync>> {
+    use zarrs::array::Array;
+    use zarrs::array_subset::ArraySubset;
+
     // Use into_iter + partition for single-pass, zero-clone separation
-    let (mut coords, mut data_vars): (Vec<_>, Vec<_>) = arrays
-        .into_iter()
-        .partition(|a| a.is_coordinate());
+    let (mut coords, mut data_vars): (Vec<_>, Vec<_>) =
+        arrays.into_iter().partition(|a| a.is_coordinate());
 
     coords.sort_by(|a, b| a.name.cmp(&b.name));
     data_vars.sort_by(|a, b| a.name.cmp(&b.name));
 
-    // Compute total_rows = product of all coordinate sizes
-    let total_rows: usize = coords
-        .iter()
-        .map(|c| c.shape[0] as usize)
-        .product();
+    // Compute min/max for each coordinate by reading the data (async)
+    for coord in &mut coords {
+        // Path format: "/{prefix}/{coord_name}" - zarrs expects absolute paths
+        let coord_path = format!("/{}/{}", prefix.as_ref(), coord.name);
+        debug!(coord = %coord.name, path = %coord_path, "Attempting to compute min/max");
+        match Array::async_open(store.clone(), &coord_path).await {
+            Err(e) => {
+                debug!(coord = %coord.name, error = %e, "Failed to open coordinate array");
+                continue;
+            }
+            Ok(arr) => {
+                let shape = arr.shape();
+                if let Ok(subset) = ArraySubset::new_with_start_shape(vec![0], shape.to_vec()) {
+                    let min_max: Option<(f64, f64)> = match coord.data_type.as_str() {
+                        "float64" => arr
+                            .async_retrieve_array_subset_elements::<f64>(&subset)
+                            .await
+                            .ok()
+                            .filter(|data| !data.is_empty())
+                            .map(|data| {
+                                let min = data.iter().cloned().fold(f64::INFINITY, f64::min);
+                                let max = data.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+                                (min, max)
+                            }),
+                        "float32" => arr
+                            .async_retrieve_array_subset_elements::<f32>(&subset)
+                            .await
+                            .ok()
+                            .filter(|data| !data.is_empty())
+                            .map(|data| {
+                                let min = data.iter().cloned().fold(f32::INFINITY, f32::min) as f64;
+                                let max =
+                                    data.iter().cloned().fold(f32::NEG_INFINITY, f32::max) as f64;
+                                (min, max)
+                            }),
+                        "int64" => arr
+                            .async_retrieve_array_subset_elements::<i64>(&subset)
+                            .await
+                            .ok()
+                            .filter(|data| !data.is_empty())
+                            .and_then(|data| {
+                                let min = *data.iter().min()? as f64;
+                                let max = *data.iter().max()? as f64;
+                                Some((min, max))
+                            }),
+                        "int32" => arr
+                            .async_retrieve_array_subset_elements::<i32>(&subset)
+                            .await
+                            .ok()
+                            .filter(|data| !data.is_empty())
+                            .and_then(|data| {
+                                let min = *data.iter().min()? as f64;
+                                let max = *data.iter().max()? as f64;
+                                Some((min, max))
+                            }),
+                        "int16" => arr
+                            .async_retrieve_array_subset_elements::<i16>(&subset)
+                            .await
+                            .ok()
+                            .filter(|data| !data.is_empty())
+                            .and_then(|data| {
+                                let min = *data.iter().min()? as f64;
+                                let max = *data.iter().max()? as f64;
+                                Some((min, max))
+                            }),
+                        _ => None,
+                    };
 
-    Ok(ZarrStoreMeta { coords, data_vars, total_rows })
+                    if let Some((min, max)) = min_max {
+                        debug!(
+                            coord = %coord.name,
+                            min = min,
+                            max = max,
+                            "Computed coordinate min/max (async)"
+                        );
+                        coord.coord_min_max = Some((min, max));
+                    }
+                }
+            } // end Ok(arr) =>
+        } // end match
+    }
+
+    // Compute total_rows = product of all coordinate sizes
+    let total_rows: usize = coords.iter().map(|c| c.shape[0] as usize).product();
+
+    Ok(ZarrStoreMeta {
+        coords,
+        data_vars,
+        total_rows,
+    })
 }
 
 /// Async version of infer_schema for remote object stores

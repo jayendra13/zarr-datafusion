@@ -3,9 +3,7 @@
 //! Provides utilities for building DictionaryArrays from coordinate values,
 //! calculating subset ranges for limit optimization, and building coordinate keys.
 
-use arrow::array::{
-    ArrayRef, DictionaryArray, Float32Array, Float64Array, Int16Array, Int64Array,
-};
+use arrow::array::{ArrayRef, DictionaryArray, Float32Array, Float64Array, Int16Array, Int64Array};
 use arrow::datatypes::Int16Type;
 use std::sync::Arc;
 
@@ -123,7 +121,7 @@ pub fn calculate_limited_subset(shape: &[u64], limit: usize) -> Vec<std::ops::Ra
         } else {
             // Earlier dimensions: calculate how many complete "slices" we need
             let inner_size: u64 = shape[i + 1..].iter().product();
-            let slices_needed = (limit + inner_size - 1) / inner_size; // ceil
+            let slices_needed = limit.div_ceil(inner_size);
             let take = slices_needed.min(dim_size);
             ranges.push(0..take);
         }
@@ -150,7 +148,7 @@ pub fn calculate_coord_limits(coord_sizes: &[usize], limit: usize) -> Vec<usize>
         let inner_size = if inner_size == 0 { 1 } else { inner_size };
 
         // How many values do we need from this coord?
-        let needed = (limit + inner_size - 1) / inner_size; // ceil
+        let needed = limit.div_ceil(inner_size);
         let take = needed.min(coord_sizes[i]);
         limits.push(take);
     }

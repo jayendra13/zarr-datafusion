@@ -33,9 +33,12 @@ impl TableProviderFactory for ZarrTableFactory {
             debug!("Store created, inferring schema");
             let (schema, metadata) = infer_schema_with_meta_async(&store, &prefix)
                 .await
-                .map_err(|e| DataFusionError::External(e))?;
+                .map_err(DataFusionError::External)?;
             let schema = Arc::new(schema);
-            info!(num_fields = schema.fields().len(), "Table created successfully (with cached store and metadata)");
+            info!(
+                num_fields = schema.fields().len(),
+                "Table created successfully (with cached store and metadata)"
+            );
             Ok(Arc::new(ZarrTable::with_cached_remote(
                 schema,
                 &cmd.location,
