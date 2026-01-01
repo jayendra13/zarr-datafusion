@@ -80,7 +80,8 @@ async fn test_format_v2_v3_same_data() {
         let col_v2 = format!("{:?}", batch_v2.column(i));
         let col_v3 = format!("{:?}", batch_v3.column(i));
         assert_eq!(
-            col_v2, col_v3,
+            col_v2,
+            col_v3,
             "Column {} should have identical values",
             batch_v2.schema().field(i).name()
         );
@@ -126,7 +127,8 @@ async fn test_format_blosc_same_as_uncompressed() {
         let col_plain = format!("{:?}", batch_plain.column(i));
         let col_blosc = format!("{:?}", batch_blosc.column(i));
         assert_eq!(
-            col_plain, col_blosc,
+            col_plain,
+            col_blosc,
             "Column {} should be identical between compressed and uncompressed",
             batch_plain.schema().field(i).name()
         );

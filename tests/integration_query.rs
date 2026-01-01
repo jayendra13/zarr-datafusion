@@ -5,8 +5,8 @@
 mod common;
 
 use arrow::array::{DictionaryArray, Int64Array};
-use arrow::datatypes::Int16Type;
 use arrow::datatypes::DataType;
+use arrow::datatypes::Int16Type;
 use common::*;
 
 #[tokio::test]
@@ -68,9 +68,11 @@ async fn test_query_with_order_by() {
     let ctx = create_test_context();
     register_zarr_table(&ctx, "data", SYNTHETIC_V3);
 
-    let batch =
-        execute_query_single(&ctx, "SELECT temperature FROM data ORDER BY temperature LIMIT 20")
-            .await;
+    let batch = execute_query_single(
+        &ctx,
+        "SELECT temperature FROM data ORDER BY temperature LIMIT 20",
+    )
+    .await;
 
     // Verify ascending order
     let temp_col = batch

@@ -53,7 +53,6 @@ async fn test_error_table_not_registered() {
     assert!(result.is_err(), "Should fail for unregistered table");
 }
 
-
 #[test]
 fn test_error_message_contains_path() {
     let bad_path = "/definitely/not/a/real/zarr/store";
@@ -62,10 +61,7 @@ fn test_error_message_contains_path() {
     if let Err(e) = result {
         let error_msg = e.to_string();
         // Error message should be informative
-        assert!(
-            !error_msg.is_empty(),
-            "Error message should not be empty"
-        );
+        assert!(!error_msg.is_empty(), "Error message should not be empty");
     }
 }
 
