@@ -145,7 +145,10 @@ impl OptimizerRule for MinMaxStatisticsRule {
                     let alias_name = get_expr_alias(aggr_expr, &aggregate.schema);
 
                     // Find column index to get statistics
-                    let col_idx = schema.fields().iter().position(|f| f.name() == &column_name);
+                    let col_idx = schema
+                        .fields()
+                        .iter()
+                        .position(|f| f.name() == &column_name);
 
                     if let Some(idx) = col_idx {
                         let col_stats = &statistics.column_statistics;
@@ -379,9 +382,7 @@ fn unwrap_to_table_scan(plan: &LogicalPlan) -> Option<&TableScan> {
 }
 
 /// Create a new plan that returns MIN/MAX values as constants
-fn create_minmax_plan(
-    minmax_values: &[(String, ScalarValue)],
-) -> Result<Transformed<LogicalPlan>> {
+fn create_minmax_plan(minmax_values: &[(String, ScalarValue)]) -> Result<Transformed<LogicalPlan>> {
     // Create literal expressions for each value with their aliases
     let exprs: Vec<Expr> = minmax_values
         .iter()

@@ -152,9 +152,11 @@ async fn test_pushdown_limit_with_order_by() {
     let ctx = create_test_context();
     register_zarr_table(&ctx, "data", SYNTHETIC_V3);
 
-    let batch =
-        execute_query_single(&ctx, "SELECT temperature FROM data ORDER BY temperature LIMIT 5")
-            .await;
+    let batch = execute_query_single(
+        &ctx,
+        "SELECT temperature FROM data ORDER BY temperature LIMIT 5",
+    )
+    .await;
 
     assert_eq!(batch.num_rows(), 5);
 }

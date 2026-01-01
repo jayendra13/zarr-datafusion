@@ -28,8 +28,14 @@ impl std::fmt::Debug for ZarrTable {
         f.debug_struct("ZarrTable")
             .field("schema", &self.schema)
             .field("path", &self.path)
-            .field("cached_remote", &self.cached_remote.as_ref().map(|(_, p, _)| p))
-            .field("total_rows", &self.store_meta.as_ref().map(|m| m.total_rows))
+            .field(
+                "cached_remote",
+                &self.cached_remote.as_ref().map(|(_, p, _)| p),
+            )
+            .field(
+                "total_rows",
+                &self.store_meta.as_ref().map(|m| m.total_rows),
+            )
             .finish()
     }
 }
@@ -110,7 +116,11 @@ impl TableProvider for ZarrTable {
                 "Projection pushdown"
             );
         } else {
-            info!(projected = total_columns, total = total_columns, "No projection pushdown (all columns)");
+            info!(
+                projected = total_columns,
+                total = total_columns,
+                "No projection pushdown (all columns)"
+            );
         }
 
         // Log limit pushdown
@@ -206,12 +216,18 @@ fn scalar_values_from_f64(
     min: f64,
     max: f64,
     data_type: &arrow::datatypes::DataType,
-) -> (datafusion::common::ScalarValue, datafusion::common::ScalarValue) {
+) -> (
+    datafusion::common::ScalarValue,
+    datafusion::common::ScalarValue,
+) {
     use arrow::datatypes::DataType;
     use datafusion::common::ScalarValue;
 
     match data_type {
-        DataType::Float64 => (ScalarValue::Float64(Some(min)), ScalarValue::Float64(Some(max))),
+        DataType::Float64 => (
+            ScalarValue::Float64(Some(min)),
+            ScalarValue::Float64(Some(max)),
+        ),
         DataType::Float32 => (
             ScalarValue::Float32(Some(min as f32)),
             ScalarValue::Float32(Some(max as f32)),
@@ -237,6 +253,9 @@ fn scalar_values_from_f64(
             ScalarValue::UInt32(Some(max as u32)),
         ),
         // Fallback to Float64
-        _ => (ScalarValue::Float64(Some(min)), ScalarValue::Float64(Some(max))),
+        _ => (
+            ScalarValue::Float64(Some(min)),
+            ScalarValue::Float64(Some(max)),
+        ),
     }
 }

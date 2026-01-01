@@ -63,8 +63,7 @@ impl StorageLocation {
     pub fn parse(location: &str) -> Result<Self, StorageError> {
         if location.starts_with("s3://") || location.starts_with("gs://") {
             // Cloud URL - extract path from URL
-            let url = Url::parse(location)
-                .map_err(|e| StorageError::InvalidUrl(e.to_string()))?;
+            let url = Url::parse(location).map_err(|e| StorageError::InvalidUrl(e.to_string()))?;
             let path = url.path().trim_start_matches('/').to_string();
             Ok(StorageLocation {
                 url: location.to_string(),
@@ -179,7 +178,11 @@ async fn create_gcs_store(
 
     let async_store: AsyncReadableListableStorage = Arc::new(AsyncObjectStore::new(store));
     let object_path = ObjectPath::from(path);
-    info!(bucket = bucket, path = path, "GCS store created successfully");
+    info!(
+        bucket = bucket,
+        path = path,
+        "GCS store created successfully"
+    );
 
     Ok((async_store, object_path))
 }

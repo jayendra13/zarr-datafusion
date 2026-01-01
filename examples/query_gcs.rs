@@ -49,7 +49,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     df.show().await?;
 
     // Count query - should be instant with optimization (no data scan)
-    let query = "SELECT count(hybrid) FROM era5;";
+    let query = "SELECT max(hybrid) as max_hybrid, min(hybrid) as min_hybrid, max(longitude) as max_longitude, min(longitude) as min_longitude, max(latitude) as max_latitude, min(latitude) as min_latitude, max(time) as max_time, min(time) as min_time FROM era5;";
     println!("\nExecuting query (optimized - uses statistics, no data scan):");
     println!("{}", query);
     println!("------------------------------------------------------------------------");

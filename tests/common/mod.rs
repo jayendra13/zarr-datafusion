@@ -91,10 +91,7 @@ pub async fn execute_query_single(ctx: &SessionContext, sql: &str) -> RecordBatc
 }
 
 /// Get the physical plan for a query
-pub async fn get_physical_plan(
-    ctx: &SessionContext,
-    sql: &str,
-) -> Arc<dyn ExecutionPlan> {
+pub async fn get_physical_plan(ctx: &SessionContext, sql: &str) -> Arc<dyn ExecutionPlan> {
     let df = ctx.sql(sql).await.expect("Query failed");
     df.create_physical_plan()
         .await
