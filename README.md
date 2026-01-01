@@ -3,6 +3,8 @@
 [![CI](https://github.com/jayendra13/zarr-datafusion/actions/workflows/test.yml/badge.svg)](https://github.com/jayendra13/zarr-datafusion/actions/workflows/test.yml)
 [![codecov](https://codecov.io/gh/jayendra13/zarr-datafusion/graph/badge.svg)](https://codecov.io/gh/jayendra13/zarr-datafusion)
 ![MSRV](https://img.shields.io/badge/rust-1.88+-orange.svg)
+[![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
+[![GitHub commit activity](https://img.shields.io/github/commit-activity/m/jayendra13/zarr-datafusion)](https://github.com/jayendra13/zarr-datafusion/commits/main)
 
 A Rust library that integrates [Zarr](https://zarr.dev/) (v2 and v3) array storage with [Apache DataFusion](https://datafusion.apache.org/) for querying multidimensional scientific data using SQL.
 
