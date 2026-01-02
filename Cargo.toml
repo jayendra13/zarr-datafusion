@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2021"
 license = "Apache-2.0"
 rust-version = "1.88"
+description = "Extending DataFusion to do SQL queries on Zarr data."
 
 [dependencies]
 arrow = "57.1.0"
