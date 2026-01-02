@@ -171,3 +171,146 @@ async fn test_pushdown_limit_one() {
     assert_eq!(batch.num_rows(), 1);
     assert_eq!(batch.num_columns(), 5);
 }
+
+// =============================================================================
+// Filter pushdown tests
+// =============================================================================
+
+#[tokio::test]
+async fn test_pushdown_filter_single_coordinate() {
+    let ctx = create_test_context();
+    register_zarr_table(&ctx, "data", SYNTHETIC_V3);
+
+    // Filter on time coordinate (first coordinate in synthetic data)
+    // synthetic data has time = [0, 1, 2, 3, 4, 5, 6]
+    let batch = execute_query_single(&ctx, "SELECT * FROM data WHERE time = 0").await;
+
+    // Should return rows where time = 0 (all lat × lon combinations)
+    // With time fixed, rows = lat(10) × lon(10) = 100
+    assert_eq!(
+        batch.num_rows(),
+        100,
+        "Should return lat × lon rows for time=0"
+    );
+}
+
+#[tokio::test]
+async fn test_pushdown_filter_multiple_coordinates() {
+    let ctx = create_test_context();
+    register_zarr_table(&ctx, "data", SYNTHETIC_V3);
+
+    // Filter on time and lat coordinates
+    let batch = execute_query_single(&ctx, "SELECT * FROM data WHERE time = 0 AND lat = 0").await;
+
+    // With time and lat fixed, rows = lon(10) = 10
+    assert_eq!(
+        batch.num_rows(),
+        10,
+        "Should return lon rows for time=0 AND lat=0"
+    );
+}
+
+#[tokio::test]
+async fn test_pushdown_filter_all_coordinates() {
+    let ctx = create_test_context();
+    register_zarr_table(&ctx, "data", SYNTHETIC_V3);
+
+    // Filter on all coordinates - should return single row
+    let batch = execute_query_single(
+        &ctx,
+        "SELECT * FROM data WHERE time = 0 AND lat = 0 AND lon = 0",
+    )
+    .await;
+
+    assert_eq!(
+        batch.num_rows(),
+        1,
+        "Should return single row when all coordinates specified"
+    );
+}
+
+#[tokio::test]
+async fn test_pushdown_filter_with_projection() {
+    let ctx = create_test_context();
+    register_zarr_table(&ctx, "data", SYNTHETIC_V3);
+
+    // Filter with specific columns
+    let batch = execute_query_single(
+        &ctx,
+        "SELECT temperature, humidity FROM data WHERE time = 0 AND lat = 0",
+    )
+    .await;
+
+    assert_eq!(batch.num_columns(), 2, "Should project only 2 columns");
+    assert_eq!(batch.num_rows(), 10, "Should return filtered rows");
+}
+
+#[tokio::test]
+async fn test_pushdown_filter_with_limit() {
+    let ctx = create_test_context();
+    register_zarr_table(&ctx, "data", SYNTHETIC_V3);
+
+    // Filter + limit combination
+    let batch = execute_query_single(&ctx, "SELECT * FROM data WHERE time = 0 LIMIT 5").await;
+
+    assert_eq!(batch.num_rows(), 5, "Should return limited rows");
+}
+
+#[tokio::test]
+async fn test_pushdown_filter_preserves_data_correctness() {
+    let ctx = create_test_context();
+    register_zarr_table(&ctx, "data", SYNTHETIC_V3);
+
+    // Filter on time coordinate (which is Int64)
+    let batch = execute_query_single(&ctx, "SELECT time FROM data WHERE time = 3").await;
+
+    // All returned time values should be 3
+    use arrow::array::{Array, AsArray};
+    use arrow::datatypes::Int16Type;
+    let time_col = batch.column(0);
+    let time_dict = time_col.as_dictionary::<Int16Type>();
+
+    // Check that all dictionary keys resolve to value 3
+    for i in 0..batch.num_rows() {
+        if !time_dict.is_null(i) {
+            let key = time_dict.keys().value(i);
+            let values = time_dict.values();
+            let value = values
+                .as_any()
+                .downcast_ref::<arrow::array::Int64Array>()
+                .expect("time should be Int64")
+                .value(key as usize);
+            assert_eq!(value, 3, "All time values should be 3");
+        }
+    }
+}
+
+#[tokio::test]
+async fn test_pushdown_filter_nonexistent_value_returns_empty() {
+    let ctx = create_test_context();
+    register_zarr_table(&ctx, "data", SYNTHETIC_V3);
+
+    // Filter on value that doesn't exist
+    let batches = execute_query(&ctx, "SELECT * FROM data WHERE time = 9999").await;
+
+    // Should return 0 rows (filter not found in coordinates)
+    let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+    assert_eq!(
+        total_rows, 0,
+        "Should return no rows for non-existent filter value"
+    );
+}
+
+#[tokio::test]
+async fn test_pushdown_filter_on_data_variable_not_pushed() {
+    let ctx = create_test_context();
+    register_zarr_table(&ctx, "data", SYNTHETIC_V3);
+
+    // Filter on data variable (temperature) - should NOT be pushed down
+    // but should still work via DataFusion's filter
+    let batches = execute_query(&ctx, "SELECT * FROM data WHERE temperature > 290 LIMIT 10").await;
+
+    // Should still return results (filter applied by DataFusion)
+    let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+    assert!(total_rows <= 10, "Should respect limit");
+}

@@ -3,7 +3,7 @@
 //! See [`super::schema_inference`] for assumptions about Zarr store structure
 //! (1D coordinates, nD data variables as Cartesian product of coordinates).
 
-use tracing::{debug, info, instrument};
+use tracing::{debug, info, instrument, warn};
 
 use arrow::{
     array::{ArrayRef, Float32Array, Float64Array, Int64Array, RecordBatch, RecordBatchOptions},
@@ -20,6 +20,10 @@ use zarrs::{array::Array, array_subset::ArraySubset, filesystem::FilesystemStore
 
 use super::coord::{
     calculate_coord_limits, calculate_limited_subset, create_coord_dictionary_typed, CoordValues,
+};
+use super::filter::{
+    calculate_coord_ranges, calculate_filtered_rows, coord_ranges_to_array_ranges, CoordFilters,
+    CoordValuesRef,
 };
 use super::schema_inference::discover_arrays;
 use super::stats::SharedIoStats;
@@ -185,6 +189,7 @@ pub fn read_zarr(
     projection: Option<Vec<usize>>,
     limit: Option<usize>,
     stats: Option<SharedIoStats>,
+    coord_filters: Option<CoordFilters>,
 ) -> Result<SendableRecordBatchStream> {
     let fs_store = Arc::new(FilesystemStore::new(store_path).map_err(zarr_err)?);
 
@@ -231,8 +236,85 @@ pub fn read_zarr(
         coord_values.push(values);
     }
 
-    // Total rows = product of all coordinate sizes
+    // Total rows = product of all coordinate sizes (before filtering)
     let total_rows: usize = coord_sizes.iter().product();
+
+    // Calculate coordinate ranges based on filters
+    let coord_ranges = if let Some(ref filters) = coord_filters {
+        // Convert coord_values to refs for filtering
+        let coord_refs: Vec<CoordValuesRef> = coord_values
+            .iter()
+            .map(|v| match v {
+                CoordValues::Int64(vals) => CoordValuesRef::Int64(vals),
+                CoordValues::Float32(vals) => CoordValuesRef::Float32(vals),
+                CoordValues::Float64(vals) => CoordValuesRef::Float64(vals),
+            })
+            .collect();
+
+        match calculate_coord_ranges(filters, &coord_names, &coord_refs) {
+            Some(ranges) => {
+                let filtered_rows = calculate_filtered_rows(&ranges);
+                let reduction_pct = 100.0 * (1.0 - (filtered_rows as f64 / total_rows as f64));
+                info!(
+                    total_rows,
+                    filtered_rows,
+                    reduction_pct = format!("{:.2}%", reduction_pct),
+                    filters = ?filters.filters.keys().collect::<Vec<_>>(),
+                    "Filter pushdown optimization"
+                );
+                Some(ranges)
+            }
+            None => {
+                // Filter value not found - return empty result
+                warn!("Filter value not found in coordinates - returning empty result");
+                let projected_schema = Arc::new(Schema::new(
+                    projection
+                        .as_ref()
+                        .map(|indices| {
+                            indices
+                                .iter()
+                                .map(|&i| schema.field(i).as_ref().clone())
+                                .collect::<Vec<_>>()
+                        })
+                        .unwrap_or_else(|| {
+                            schema.fields().iter().map(|f| f.as_ref().clone()).collect()
+                        }),
+                ));
+                let batch = RecordBatch::new_empty(projected_schema.clone());
+                let stream = stream::iter(vec![Ok(batch)]);
+                return Ok(Box::pin(RecordBatchStreamAdapter::new(
+                    projected_schema,
+                    stream,
+                )));
+            }
+        }
+    } else {
+        None
+    };
+
+    // Calculate effective sizes based on filters
+    let (effective_coord_sizes, effective_rows) = if let Some(ref ranges) = coord_ranges {
+        let sizes: Vec<usize> = ranges.iter().map(|(start, end)| end - start).collect();
+        let rows = calculate_filtered_rows(ranges);
+        (sizes, rows)
+    } else {
+        (coord_sizes.clone(), total_rows)
+    };
+
+    // Extract filtered coordinate values
+    let filtered_coord_values: Vec<CoordValues> = if let Some(ref ranges) = coord_ranges {
+        coord_values
+            .iter()
+            .zip(ranges.iter())
+            .map(|(values, (start, end))| match values {
+                CoordValues::Int64(vals) => CoordValues::Int64(vals[*start..*end].to_vec()),
+                CoordValues::Float32(vals) => CoordValues::Float32(vals[*start..*end].to_vec()),
+                CoordValues::Float64(vals) => CoordValues::Float64(vals[*start..*end].to_vec()),
+            })
+            .collect()
+    } else {
+        coord_values
+    };
 
     let total_columns = schema.fields().len();
     let projected_indices = projection.unwrap_or_else(|| (0..total_columns).collect());
@@ -257,16 +339,20 @@ pub fn read_zarr(
         );
     }
 
-    // Log limit info (sync path applies limit via slicing at the end)
+    // Apply limit (after filter reduction)
+    let final_rows = limit
+        .map(|l| l.min(effective_rows))
+        .unwrap_or(effective_rows);
     if let Some(limit) = limit {
-        let effective = limit.min(total_rows);
-        let reduction_pct = 100.0 * (1.0 - (effective as f64 / total_rows as f64));
-        info!(
-            total_rows,
-            effective_rows = effective,
-            reduction_pct = format!("{:.2}%", reduction_pct),
-            "Limit will be applied via slicing"
-        );
+        if limit < effective_rows {
+            let reduction_pct = 100.0 * (1.0 - (final_rows as f64 / effective_rows as f64));
+            info!(
+                effective_rows,
+                final_rows,
+                reduction_pct = format!("{:.2}%", reduction_pct),
+                "Limit optimization"
+            );
+        }
     }
 
     let mut result_arrays: Vec<ArrayRef> = Vec::new();
@@ -279,18 +365,25 @@ pub fn read_zarr(
         if let Some(coord_idx) = coord_names.iter().position(|n| n == field_name) {
             // Create DictionaryArray for coordinate (memory efficient)
             let dict_array = create_coord_dictionary_typed(
-                &coord_values[coord_idx],
+                &filtered_coord_values[coord_idx],
                 coord_idx,
-                &coord_sizes,
-                total_rows,
+                &effective_coord_sizes,
+                effective_rows,
             );
             result_arrays.push(dict_array);
         } else {
-            // Data variable - read and flatten based on schema type
+            // Data variable - read filtered subset
             let read_start = Instant::now();
             let arr = Array::open(store.clone(), &format!("/{}", field_name)).map_err(zarr_err)?;
-            let subset = ArraySubset::new_with_shape(arr.shape().to_vec());
-            let num_elements: u64 = arr.shape().iter().product();
+
+            // Calculate the subset to read based on coordinate filters
+            let subset = if let Some(ref ranges) = coord_ranges {
+                let array_ranges = coord_ranges_to_array_ranges(ranges);
+                ArraySubset::new_with_ranges(&array_ranges)
+            } else {
+                ArraySubset::new_with_shape(arr.shape().to_vec())
+            };
+            let num_elements: u64 = subset.num_elements();
 
             let array: ArrayRef = read_data_array!(sync, arr, &subset, field.data_type());
 
@@ -309,10 +402,9 @@ pub fn read_zarr(
             .collect::<Vec<_>>(),
     ));
 
-    // Apply limit if specified
-    let effective_rows = limit.map(|l| l.min(total_rows)).unwrap_or(total_rows);
+    // Apply limit if specified (slice the already-filtered arrays)
     let result_arrays = if let Some(limit) = limit {
-        let limit = limit.min(total_rows);
+        let limit = limit.min(effective_rows);
         result_arrays
             .into_iter()
             .map(|arr| arr.slice(0, limit))
@@ -323,14 +415,11 @@ pub fn read_zarr(
 
     // Handle empty projection (e.g., count(*)) - need to set row count explicitly
     let batch = if result_arrays.is_empty() {
-        info!(
-            effective_rows,
-            "Empty projection - returning row count only"
-        );
+        info!(final_rows, "Empty projection - returning row count only");
         RecordBatch::try_new_with_options(
             projected_schema.clone(),
             result_arrays,
-            &RecordBatchOptions::new().with_row_count(Some(effective_rows)),
+            &RecordBatchOptions::new().with_row_count(Some(final_rows)),
         )?
     } else {
         RecordBatch::try_new(projected_schema.clone(), result_arrays)?
@@ -352,6 +441,7 @@ use zarrs::storage::AsyncReadableListableStorage;
 use zarrs_object_store::object_store::path::Path as ObjectPath;
 
 /// Async version of read_zarr for remote object stores
+#[allow(clippy::too_many_arguments)]
 #[instrument(level = "info", skip_all)]
 pub async fn read_zarr_async(
     store: AsyncReadableListableStorage,
@@ -361,6 +451,7 @@ pub async fn read_zarr_async(
     limit: Option<usize>,
     stats: Option<SharedIoStats>,
     cached_meta: Option<ZarrStoreMeta>,
+    coord_filters: Option<CoordFilters>,
 ) -> Result<SendableRecordBatchStream> {
     info!("Starting async Zarr read");
 
@@ -399,73 +490,133 @@ pub async fn read_zarr_async(
         .collect();
     debug!(?coord_names, ?coord_sizes, "Coordinate info");
 
-    // Total rows = product of all coordinate sizes
+    // Total rows = product of all coordinate sizes (before filtering)
     let total_rows: usize = coord_sizes.iter().product();
 
-    // Apply limit early to avoid allocating memory for rows we won't use
-    let effective_rows = limit.map(|l| l.min(total_rows)).unwrap_or(total_rows);
+    // First, load all coordinate values (needed for filter matching)
+    debug!("Loading coordinate values for filter matching");
+    let mut all_coord_values: Vec<CoordValues> = Vec::new();
 
-    // Log limit optimization effect
-    if effective_rows < total_rows {
-        let reduction_pct = 100.0 * (1.0 - (effective_rows as f64 / total_rows as f64));
-        info!(
-            total_rows,
-            effective_rows,
-            reduction_pct = format!("{:.2}%", reduction_pct),
-            "Limit optimization applied"
-        );
-    } else {
-        info!(total_rows, "No limit optimization (reading all rows)");
-    }
-
-    // Calculate how many values we need from each coordinate
-    let coord_value_limits = calculate_coord_limits(&coord_sizes, effective_rows);
-
-    // Log coordinate reduction details
-    let coord_reduction: Vec<String> = coord_names
-        .iter()
-        .zip(coord_value_limits.iter())
-        .zip(coord_sizes.iter())
-        .map(|((name, &limit), &full)| format!("{}={}/{}", name, limit, full))
-        .collect();
-    debug!(limits = ?coord_reduction, "Coordinate value limits");
-
-    // Load only the coordinate values we need for the limit
-    debug!("Loading coordinate values");
-    let mut coord_values: Vec<CoordValues> = Vec::new();
-
-    // TODO:: This can happen in parallel for all coordinates
-    for (i, (coord, dtype)) in store_meta.coords.iter().zip(coord_types.iter()).enumerate() {
-        debug!(coord_name = %coord.name, "Reading coordinate");
+    for (coord, dtype) in store_meta.coords.iter().zip(coord_types.iter()) {
         let read_start = Instant::now();
         let array_path = format!("/{}/{}", prefix, coord.name);
-        debug!(path = %array_path, "Opening coordinate array");
 
         let arr = Array::async_open(store.clone(), &array_path)
             .await
             .map_err(zarr_err)?;
 
-        let values_needed = coord_value_limits[i];
-        debug!(
-            values_needed,
-            full_size = coord_sizes[i],
-            "Reading coordinate subset"
-        );
-
-        // Read only the subset of values we need for this limit
-        #[allow(clippy::single_range_in_vec_init)]
-        let subset = ArraySubset::new_with_ranges(&[0..values_needed as u64]);
+        let subset = ArraySubset::new_with_shape(arr.shape().to_vec());
         let element_bytes = dtype_to_bytes(dtype);
         let values = read_coord_values!(async, arr, &subset, dtype.as_str());
 
-        debug!(elapsed = ?read_start.elapsed(), "Coordinate read complete");
         if let Some(ref s) = stats {
-            let bytes = values_needed as u64 * element_bytes;
+            let bytes = coord.shape[0] * element_bytes;
             s.record_coord(bytes, read_start.elapsed());
         }
-        coord_values.push(values);
+        all_coord_values.push(values);
     }
-    info!("All coordinates loaded");
+
+    // Calculate coordinate ranges based on filters
+    let coord_ranges = if let Some(ref filters) = coord_filters {
+        let coord_refs: Vec<CoordValuesRef> = all_coord_values
+            .iter()
+            .map(|v| match v {
+                CoordValues::Int64(vals) => CoordValuesRef::Int64(vals),
+                CoordValues::Float32(vals) => CoordValuesRef::Float32(vals),
+                CoordValues::Float64(vals) => CoordValuesRef::Float64(vals),
+            })
+            .collect();
+
+        match calculate_coord_ranges(filters, &coord_names, &coord_refs) {
+            Some(ranges) => {
+                let filtered_rows = calculate_filtered_rows(&ranges);
+                let reduction_pct = 100.0 * (1.0 - (filtered_rows as f64 / total_rows as f64));
+                info!(
+                    total_rows,
+                    filtered_rows,
+                    reduction_pct = format!("{:.2}%", reduction_pct),
+                    filters = ?filters.filters.keys().collect::<Vec<_>>(),
+                    "Filter pushdown optimization"
+                );
+                Some(ranges)
+            }
+            None => {
+                // Filter value not found - return empty result
+                warn!("Filter value not found in coordinates - returning empty result");
+                let projected_schema = Arc::new(Schema::new(
+                    projection
+                        .as_ref()
+                        .map(|indices| {
+                            indices
+                                .iter()
+                                .map(|&i| schema.field(i).as_ref().clone())
+                                .collect::<Vec<_>>()
+                        })
+                        .unwrap_or_else(|| {
+                            schema.fields().iter().map(|f| f.as_ref().clone()).collect()
+                        }),
+                ));
+                let batch = RecordBatch::new_empty(projected_schema.clone());
+                let stream = stream::iter(vec![Ok(batch)]);
+                return Ok(Box::pin(RecordBatchStreamAdapter::new(
+                    projected_schema,
+                    stream,
+                )));
+            }
+        }
+    } else {
+        None
+    };
+    debug!(?coord_ranges, "Coordinate ranges calculated");
+
+    // Calculate effective sizes based on filters
+    let (effective_coord_sizes, rows_after_filter) = if let Some(ref ranges) = coord_ranges {
+        let sizes: Vec<usize> = ranges.iter().map(|(start, end)| end - start).collect();
+        let rows = calculate_filtered_rows(ranges);
+        (sizes, rows)
+    } else {
+        (coord_sizes.clone(), total_rows)
+    };
+
+    // Extract filtered coordinate values
+    let filtered_coord_values: Vec<CoordValues> = if let Some(ref ranges) = coord_ranges {
+        all_coord_values
+            .iter()
+            .zip(ranges.iter())
+            .map(|(values, (start, end))| match values {
+                CoordValues::Int64(vals) => CoordValues::Int64(vals[*start..*end].to_vec()),
+                CoordValues::Float32(vals) => CoordValues::Float32(vals[*start..*end].to_vec()),
+                CoordValues::Float64(vals) => CoordValues::Float64(vals[*start..*end].to_vec()),
+            })
+            .collect()
+    } else {
+        all_coord_values
+    };
+
+    // Apply limit (after filter reduction)
+    let effective_rows = limit
+        .map(|l| l.min(rows_after_filter))
+        .unwrap_or(rows_after_filter);
+
+    // Log limit optimization effect
+    if effective_rows < rows_after_filter {
+        let reduction_pct = 100.0 * (1.0 - (effective_rows as f64 / rows_after_filter as f64));
+        info!(
+            rows_after_filter,
+            effective_rows,
+            reduction_pct = format!("{:.2}%", reduction_pct),
+            "Limit optimization applied"
+        );
+    }
+
+    // Calculate how many values we need from each coordinate (for limit optimization on top of filter)
+    let coord_value_limits = if effective_rows < rows_after_filter {
+        calculate_coord_limits(&effective_coord_sizes, effective_rows)
+    } else {
+        effective_coord_sizes.clone()
+    };
+
+    info!("Coordinates loaded and filtered");
 
     let total_columns = schema.fields().len();
     let projected_indices = projection.unwrap_or_else(|| (0..total_columns).collect());
@@ -500,16 +651,15 @@ pub async fn read_zarr_async(
         if let Some(coord_idx) = coord_names.iter().position(|n| n == field_name) {
             debug!(field = %field_name, "Building dictionary array for coordinate");
             // Create DictionaryArray for coordinate (memory efficient)
-            // Use coord_value_limits for key generation pattern (respects limit)
             let dict_array = create_coord_dictionary_typed(
-                &coord_values[coord_idx],
+                &filtered_coord_values[coord_idx],
                 coord_idx,
                 &coord_value_limits,
                 effective_rows,
             );
             result_arrays.push(dict_array);
         } else {
-            // Data variable - read and flatten based on schema type
+            // Data variable - read filtered subset
             debug!(field_name = %field_name, "Reading data variable");
             let read_start = Instant::now();
             let array_path = format!("/{}/{}", prefix, field_name);
@@ -520,9 +670,22 @@ pub async fn read_zarr_async(
                 .map_err(zarr_err)?;
             debug!(shape = ?arr.shape(), "Data variable shape");
 
-            // Use limited subset when limit is applied to avoid reading entire array
+            // Calculate the subset to read based on coordinate filters
             let full_elements: u64 = arr.shape().iter().product();
-            let subset = if effective_rows < total_rows {
+            let subset = if let Some(ref ranges) = coord_ranges {
+                let array_ranges = coord_ranges_to_array_ranges(ranges);
+                let filtered_subset = ArraySubset::new_with_ranges(&array_ranges);
+                let subset_elements = filtered_subset.num_elements();
+                let reduction_pct = 100.0 * (1.0 - (subset_elements as f64 / full_elements as f64));
+                info!(
+                    field = %field_name,
+                    subset_elements,
+                    full_elements,
+                    reduction_pct = format!("{:.2}%", reduction_pct),
+                    "Filter-based data subset optimization"
+                );
+                filtered_subset
+            } else if effective_rows < total_rows {
                 let ranges = calculate_limited_subset(arr.shape(), effective_rows);
                 let limited_subset = ArraySubset::new_with_ranges(&ranges);
                 let subset_elements = limited_subset.num_elements();
@@ -532,7 +695,7 @@ pub async fn read_zarr_async(
                     subset_elements,
                     full_elements,
                     reduction_pct = format!("{:.2}%", reduction_pct),
-                    "Data subset optimization"
+                    "Limit-based data subset optimization"
                 );
                 limited_subset
             } else {
@@ -560,9 +723,12 @@ pub async fn read_zarr_async(
             .collect::<Vec<_>>(),
     ));
 
-    // Apply limit if specified
+    // Apply final limit slice if needed
+    let final_rows = limit
+        .map(|l| l.min(rows_after_filter))
+        .unwrap_or(rows_after_filter);
     let result_arrays = if let Some(limit) = limit {
-        let limit = limit.min(total_rows);
+        let limit = limit.min(rows_after_filter);
         debug!(limit, "Applying final limit slice");
         result_arrays
             .into_iter()
@@ -574,14 +740,11 @@ pub async fn read_zarr_async(
 
     // Handle empty projection (e.g., count(*)) - need to set row count explicitly
     let batch = if result_arrays.is_empty() {
-        info!(
-            effective_rows,
-            "Empty projection - returning row count only"
-        );
+        info!(final_rows, "Empty projection - returning row count only");
         RecordBatch::try_new_with_options(
             projected_schema.clone(),
             result_arrays,
-            &RecordBatchOptions::new().with_row_count(Some(effective_rows)),
+            &RecordBatchOptions::new().with_row_count(Some(final_rows)),
         )?
     } else {
         RecordBatch::try_new(projected_schema.clone(), result_arrays)?

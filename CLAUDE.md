@@ -10,23 +10,56 @@ zarr-datafusion is a Rust library integrating Zarr (v2 and v3) array storage wit
 
 ```bash
 cargo build                      # Build the library
-cargo run --example query_zarr   # Run the example
-cargo run --bin zarr-cli         # Run interactive SQL CLI
 cargo test                       # Run all tests
 cargo clippy                     # Run linter
 cargo fmt                        # Format code
+cargo run --bin zarr-cli         # Run interactive SQL CLI
+cargo run --example query_synthetic  # Run synthetic data example
+cargo run --example query_era5       # Run ERA5 climate data example
+cargo run --example query_gcs        # Run GCS remote read example
 ```
 
 ## Architecture
 
 ```
 src/
-├── bin/zarr_cli.rs              # Interactive SQL REPL
+├── lib.rs                       # Crate root, exports modules
+├── bin/zarr_cli/
+│   ├── main.rs                  # Interactive SQL REPL with history
+│   └── highlight.rs             # SQL syntax highlighting
 ├── reader/
+│   ├── mod.rs                   # Reader module exports
 │   ├── schema_inference.rs      # Infer Arrow schema from Zarr metadata
-│   └── zarr_reader.rs           # Zarr reading, flattening nD→2D, Arrow conversion
-├── datasource/zarr.rs           # ZarrTable: DataFusion TableProvider
-└── physical_plan/zarr_exec.rs   # ZarrExec: DataFusion ExecutionPlan
+│   ├── zarr_reader.rs           # Zarr reading, flattening nD→2D, Arrow conversion
+│   ├── filter.rs                # Filter pushdown: parse WHERE clauses for coord filters
+│   ├── stats.rs                 # I/O statistics tracking (bytes, timing)
+│   ├── storage.rs               # Storage backends (local, GCS, S3)
+│   ├── tracked_store.rs         # Wrapped store for tracking disk I/O
+│   ├── coord.rs                 # Coordinate handling utilities
+│   └── dtype.rs                 # Data type conversions
+├── datasource/
+│   ├── zarr.rs                  # ZarrTable: DataFusion TableProvider
+│   └── factory.rs               # TableFactory for registering Zarr tables
+├── optimizer/
+│   ├── mod.rs                   # Optimizer module exports
+│   ├── minmax_optimization.rs   # MIN()/MAX() → constant folding from stats
+│   └── count_optimization.rs    # COUNT(*) → constant folding from stats
+└── physical_plan/
+    └── zarr_exec.rs             # ZarrExec: DataFusion ExecutionPlan
+
+examples/
+├── common/mod.rs                # Shared example utilities
+├── query_synthetic.rs           # Query local synthetic Zarr data
+├── query_era5.rs                # Query ERA5 climate data
+└── query_gcs.rs                 # Query remote Zarr from GCS
+
+tests/
+├── common/mod.rs                # Shared test utilities
+├── integration_query.rs         # Basic SQL query tests
+├── integration_formats.rs       # Zarr v2/v3 format tests
+├── integration_optimizer.rs     # Optimizer rule tests
+├── integration_pushdown.rs      # Filter/projection pushdown tests
+└── integration_error.rs         # Error handling tests
 ```
 
 **Data flow**: SQL query → ZarrTable.scan() → ZarrExec.execute() → read_zarr() → RecordBatch
@@ -34,6 +67,11 @@ src/
 **Key features**:
 - **Schema inference**: Automatically detects coordinates (1D) and data variables (nD) from Zarr metadata
 - **Projection pushdown**: Only loads arrays needed for the query
+- **Filter pushdown**: Coordinate equality filters (e.g., `time = X`) reduce data reads
+- **Limit pushdown**: LIMIT clauses stop reading early
+- **Optimizer rules**: MIN/MAX/COUNT queries use statistics instead of scanning
+- **I/O statistics**: Track bytes read, timing breakdown, compression ratio
+- **Remote storage**: GCS and S3 support via object_store
 - **DictionaryArray for coordinates**: Memory-efficient encoding (~75% savings)
 
 ## Assumptions
@@ -54,6 +92,23 @@ weather.zarr/
 └── humidity/     shape: [10, 10, 7]   → data variable (lat × lon × time)
 ```
 
+## Python Scripts
+
+**Always use `uv` for running Python commands.** Dependencies are specified inline via `--with` flags.
+
+```bash
+# Generate test data (see scripts/generate_data.sh for dependencies)
+./scripts/generate_data.sh
+
+# Run Python scripts directly with uv
+uv run --with zarr --with numpy --with xarray --with gcsfs --with dask --with numcodecs scripts/data_gen.py
+
+# One-off Python commands
+uv run --with numpy python -c "import numpy; print(numpy.__version__)"
+```
+
+Check `scripts/generate_data.sh` for the canonical list of Python dependencies.
+
 ## Test Data
 
 ```bash
@@ -71,9 +126,34 @@ Synthetic data: time(7), lat(10), lon(10), temperature(7×10×10), humidity(7×1
 ## Key Types
 
 - `ZarrTable` — DataFusion TableProvider for Zarr stores
-- `ZarrExec` — Physical execution plan
+- `ZarrExec` — Physical execution plan (supports local and remote async reads)
 - `ZarrVersion` — Enum for v2/v3 format detection
+- `CoordFilters` — Parsed coordinate filters for pushdown (e.g., `time = X`)
+- `ZarrIoStats` — Thread-safe I/O statistics (bytes, timing, array counts)
+- `MinMaxStatisticsRule` — Optimizer rule for MIN/MAX → constant folding
+- `CountStatisticsRule` — Optimizer rule for COUNT → constant folding
 - `infer_schema()` — Infers Arrow schema from Zarr v2/v3 metadata
 - `detect_zarr_version()` — Detects Zarr format version from metadata files
-- `read_zarr()` — Reads Zarr arrays into Arrow RecordBatch
+- `read_zarr()` — Reads Zarr arrays into Arrow RecordBatch (sync, local)
+- `read_zarr_async()` — Reads Zarr arrays from remote stores (async, GCS/S3)
 - `DictionaryArray<Int16Type>` — Used for coordinate columns (keys=indices, values=unique coords)
+
+## Debugging
+
+```bash
+# Run with tracing logs
+RUST_LOG=debug cargo run --example query_gcs
+RUST_LOG=zarr_datafusion=debug cargo run --example query_gcs
+
+# Interactive debugging with lldb
+cargo build --example query_gcs
+rust-lldb target/debug/examples/query_gcs
+
+# In lldb:
+(lldb) breakpoint set -n main
+(lldb) run
+(lldb) n                    # step over
+(lldb) s                    # step into
+(lldb) frame variable       # show local variables
+(lldb) p variable_name      # print variable
+```

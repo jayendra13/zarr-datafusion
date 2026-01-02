@@ -14,8 +14,9 @@
 //!    of all coordinates. For coordinates `[time(7), lat(10), lon(10)]`, data variables must
 //!    have shape `[7, 10, 10]` (i.e., `time × lat × lon`).
 //!
-//! 4. **Dimension ordering**: Coordinates are sorted alphabetically, and data variable dimensions
-//!    are assumed to follow this same order.
+//! 4. **Dimension ordering**: Coordinates are inferred to match the Zarr arrays' native
+//!    dimension ordering when possible (by matching data variable shapes to coordinate sizes).
+//!    If the ordering cannot be inferred unambiguously, we fall back to alphabetical ordering.
 //!
 //! # Example
 //!
@@ -300,6 +301,62 @@ fn compute_coord_min_max(
     }
 }
 
+/// Attempt to infer coordinate ordering from data variable shapes.
+///
+/// We prefer to preserve the native dimension order of Zarr arrays by matching
+/// each data variable's shape to the sizes of discovered coordinates. If a
+/// matching data variable cannot be found or the mapping is ambiguous (e.g.,
+/// multiple coordinates share the same size), we fall back to alphabetical
+/// ordering for stability.
+fn infer_coord_order_from_data_vars(
+    mut coords: Vec<ZarrArrayMeta>,
+    data_vars: &[ZarrArrayMeta],
+) -> Vec<ZarrArrayMeta> {
+    // If we have nothing to infer from, keep alphabetical ordering
+    if coords.is_empty() || data_vars.is_empty() {
+        coords.sort_by(|a, b| a.name.cmp(&b.name));
+        return coords;
+    }
+
+    // Find the first data variable whose dimensionality equals the number
+    // of coordinates and whose shape can be matched to coordinate sizes.
+    for var in data_vars {
+        if var.shape.len() != coords.len() {
+            continue;
+        }
+
+        let mut ordered: Vec<ZarrArrayMeta> = Vec::with_capacity(coords.len());
+        let mut used = vec![false; coords.len()];
+        let mut success = true;
+
+        for &dim_size in &var.shape {
+            let mut found: Option<usize> = None;
+            for (j, c) in coords.iter().enumerate() {
+                if !used[j] && c.shape.get(0) == Some(&dim_size) {
+                    found = Some(j);
+                    break;
+                }
+            }
+
+            if let Some(j) = found {
+                ordered.push(coords[j].clone());
+                used[j] = true;
+            } else {
+                success = false;
+                break;
+            }
+        }
+
+        if success && ordered.len() == coords.len() {
+            return ordered;
+        }
+    }
+
+    // Fallback to alphabetical ordering if we couldn't infer a mapping
+    coords.sort_by(|a, b| a.name.cmp(&b.name));
+    coords
+}
+
 /// Separate arrays into coordinates and data variables, then sort
 /// Also computes min/max for coordinate arrays by reading their data
 fn separate_and_sort_arrays(
@@ -310,8 +367,13 @@ fn separate_and_sort_arrays(
     let (mut coords, mut data_vars): (Vec<_>, Vec<_>) =
         arrays.into_iter().partition(|a| a.is_coordinate());
 
-    coords.sort_by(|a, b| a.name.cmp(&b.name));
+    // Keep data variables in stable alphabetical order for determinism
     data_vars.sort_by(|a, b| a.name.cmp(&b.name));
+
+    // Try to reorder coordinates to match Zarr arrays' native dimension order
+    // by examining a representative data variable's shape. Fall back to
+    // alphabetical ordering when the mapping is ambiguous.
+    coords = infer_coord_order_from_data_vars(coords, &data_vars);
 
     // Compute min/max for each coordinate by reading the data
     for coord in &mut coords {
@@ -632,8 +694,13 @@ async fn separate_and_sort_arrays_async(
     let (mut coords, mut data_vars): (Vec<_>, Vec<_>) =
         arrays.into_iter().partition(|a| a.is_coordinate());
 
-    coords.sort_by(|a, b| a.name.cmp(&b.name));
+    // Keep data variables in stable alphabetical order for determinism
     data_vars.sort_by(|a, b| a.name.cmp(&b.name));
+
+    // Try to reorder coordinates to match Zarr arrays' native dimension order
+    // by examining a representative data variable's shape. Fall back to
+    // alphabetical ordering when the mapping is ambiguous.
+    coords = infer_coord_order_from_data_vars(coords, &data_vars);
 
     // Compute min/max for each coordinate by reading the data (async)
     for coord in &mut coords {
@@ -842,10 +909,10 @@ mod tests {
     fn test_discover_arrays_v2() {
         let meta = discover_arrays("data/synthetic_v2.zarr").unwrap();
 
-        // 3 coordinates (sorted): lat, lon, time
+        // 3 coordinates (native Zarr ordering): time, lat, lon
         assert_eq!(meta.coords.len(), 3);
         let coord_names: Vec<_> = meta.coords.iter().map(|c| c.name.as_str()).collect();
-        assert_eq!(coord_names, vec!["lat", "lon", "time"]);
+        assert_eq!(coord_names, vec!["time", "lon", "lat"]);
 
         // 2 data variables (sorted): humidity, temperature
         assert_eq!(meta.data_vars.len(), 2);
@@ -853,9 +920,9 @@ mod tests {
         assert_eq!(var_names, vec!["humidity", "temperature"]);
 
         // Shapes
-        assert_eq!(meta.coords[0].shape, vec![10]); // lat
+        assert_eq!(meta.coords[0].shape, vec![7]); // lat
         assert_eq!(meta.coords[1].shape, vec![10]); // lon
-        assert_eq!(meta.coords[2].shape, vec![7]); // time
+        assert_eq!(meta.coords[2].shape, vec![10]); // time
         assert_eq!(meta.data_vars[0].shape, vec![7, 10, 10]); // humidity
         assert_eq!(meta.data_vars[1].shape, vec![7, 10, 10]); // temperature
 
@@ -869,12 +936,12 @@ mod tests {
     fn test_discover_arrays_v3() {
         let meta = discover_arrays("data/synthetic_v3.zarr").unwrap();
 
-        // Same structure as v2
+        // Same structure as v2 (native ordering)
         assert_eq!(meta.coords.len(), 3);
         assert_eq!(meta.data_vars.len(), 2);
 
         let coord_names: Vec<_> = meta.coords.iter().map(|c| c.name.as_str()).collect();
-        assert_eq!(coord_names, vec!["lat", "lon", "time"]);
+        assert_eq!(coord_names, vec!["time", "lon" ,"lat"]);
 
         let var_names: Vec<_> = meta.data_vars.iter().map(|v| v.name.as_str()).collect();
         assert_eq!(var_names, vec!["humidity", "temperature"]);
@@ -890,7 +957,7 @@ mod tests {
         assert_eq!(schema.fields().len(), 5);
 
         let names: Vec<_> = schema.fields().iter().map(|f| f.name().as_str()).collect();
-        assert_eq!(names, vec!["lat", "lon", "time", "humidity", "temperature"]);
+        assert_eq!(names, vec!["time", "lon", "lat", "humidity", "temperature"]);
     }
 
     #[test]

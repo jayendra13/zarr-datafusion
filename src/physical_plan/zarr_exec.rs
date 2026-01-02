@@ -1,3 +1,4 @@
+use crate::reader::filter::CoordFilters;
 use crate::reader::schema_inference::ZarrStoreMeta;
 use crate::reader::stats::{SharedIoStats, ZarrIoStats};
 use crate::reader::storage::is_remote_url;
@@ -26,6 +27,8 @@ pub struct ZarrExec {
     io_stats: SharedIoStats,
     /// Cached remote store and metadata (avoids recreating on each query)
     cached_remote: CachedRemoteStore,
+    /// Coordinate filters for filter pushdown (e.g., time = X, hybrid = Y)
+    coord_filters: Option<CoordFilters>,
 }
 
 impl std::fmt::Debug for ZarrExec {
@@ -36,6 +39,13 @@ impl std::fmt::Debug for ZarrExec {
             .field("projection", &self.projection)
             .field("limit", &self.limit)
             .field("has_cached_remote", &self.cached_remote.is_some())
+            .field(
+                "coord_filters",
+                &self
+                    .coord_filters
+                    .as_ref()
+                    .map(|f| f.filters.keys().collect::<Vec<_>>()),
+            )
             .finish()
     }
 }
@@ -46,10 +56,21 @@ impl DisplayAs for ZarrExec {
         _t: datafusion::physical_plan::DisplayFormatType,
         f: &mut std::fmt::Formatter,
     ) -> std::fmt::Result {
-        match self.limit {
-            Some(limit) => write!(f, "ZarrExec: path={}, limit={}", self.path, limit),
-            None => write!(f, "ZarrExec: path={}", self.path),
+        let mut parts = vec![format!("path={}", self.path)];
+        if let Some(limit) = self.limit {
+            parts.push(format!("limit={}", limit));
         }
+        if let Some(ref filters) = self.coord_filters {
+            if !filters.is_empty() {
+                let filter_strs: Vec<_> = filters
+                    .filters
+                    .iter()
+                    .map(|(k, v)| format!("{}={}", k, v))
+                    .collect();
+                parts.push(format!("filters=[{}]", filter_strs.join(", ")));
+            }
+        }
+        write!(f, "ZarrExec: {}", parts.join(", "))
     }
 }
 
@@ -60,6 +81,7 @@ impl ZarrExec {
         projection: Option<Vec<usize>>,
         limit: Option<usize>,
         cached_remote: CachedRemoteStore,
+        coord_filters: Option<CoordFilters>,
     ) -> Self {
         // Compute projected schema for plan properties
         let projected_schema = if let Some(ref indices) = projection {
@@ -87,6 +109,7 @@ impl ZarrExec {
             properties,
             io_stats: Arc::new(ZarrIoStats::new()),
             cached_remote,
+            coord_filters,
         }
     }
 
@@ -129,6 +152,7 @@ impl ExecutionPlan for ZarrExec {
             limit = ?self.limit,
             projection = ?self.projection,
             has_cached_remote = self.cached_remote.is_some(),
+            has_coord_filters = self.coord_filters.is_some(),
             "ZarrExec::execute called"
         );
 
@@ -141,6 +165,7 @@ impl ExecutionPlan for ZarrExec {
                 self.limit,
                 self.io_stats.clone(),
                 self.cached_remote.clone(),
+                self.coord_filters.clone(),
             )
         } else {
             info!("Using local (sync) execution path");
@@ -150,6 +175,7 @@ impl ExecutionPlan for ZarrExec {
                 self.projection.clone(),
                 self.limit,
                 Some(self.io_stats.clone()),
+                self.coord_filters.clone(),
             )
         }
     }
@@ -163,6 +189,7 @@ fn execute_remote(
     limit: Option<usize>,
     stats: SharedIoStats,
     cached_remote: CachedRemoteStore,
+    coord_filters: Option<CoordFilters>,
 ) -> datafusion::error::Result<datafusion::execution::SendableRecordBatchStream> {
     use crate::reader::storage::create_async_store;
     use arrow::record_batch::RecordBatch;
@@ -210,6 +237,7 @@ fn execute_remote(
             limit,
             Some(stats),
             cached_meta,
+            coord_filters,
         )
         .await?;
 
