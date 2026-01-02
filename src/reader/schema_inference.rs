@@ -332,7 +332,7 @@ fn infer_coord_order_from_data_vars(
         for &dim_size in &var.shape {
             let mut found: Option<usize> = None;
             for (j, c) in coords.iter().enumerate() {
-                if !used[j] && c.shape.get(0) == Some(&dim_size) {
+                if !used[j] && c.shape.first() == Some(&dim_size) {
                     found = Some(j);
                     break;
                 }
