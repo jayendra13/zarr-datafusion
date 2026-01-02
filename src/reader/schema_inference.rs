@@ -941,7 +941,7 @@ mod tests {
         assert_eq!(meta.data_vars.len(), 2);
 
         let coord_names: Vec<_> = meta.coords.iter().map(|c| c.name.as_str()).collect();
-        assert_eq!(coord_names, vec!["time", "lon" ,"lat"]);
+        assert_eq!(coord_names, vec!["time", "lon", "lat"]);
 
         let var_names: Vec<_> = meta.data_vars.iter().map(|v| v.name.as_str()).collect();
         assert_eq!(var_names, vec!["humidity", "temperature"]);
