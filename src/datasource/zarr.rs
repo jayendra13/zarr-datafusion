@@ -2,13 +2,15 @@ use arrow::datatypes::SchemaRef;
 use async_trait::async_trait;
 use datafusion::catalog::Session;
 use datafusion::common::stats::{ColumnStatistics, Precision, Statistics};
+use datafusion::logical_expr::{Expr, TableProviderFilterPushDown};
 use datafusion::{datasource::TableProvider, error::Result, physical_plan::ExecutionPlan};
 use std::sync::Arc;
-use tracing::info;
+use tracing::{debug, info};
 use zarrs::storage::AsyncReadableListableStorage;
 use zarrs_object_store::object_store::path::Path as ObjectPath;
 
 use crate::physical_plan::zarr_exec::ZarrExec;
+use crate::reader::filter::parse_coord_filters;
 use crate::reader::schema_inference::ZarrStoreMeta;
 
 /// Cached remote store info (store, prefix, metadata)
@@ -95,11 +97,26 @@ impl TableProvider for ZarrTable {
         datafusion::datasource::TableType::Base
     }
 
+    /// Indicate which filters can be pushed down to the scan
+    ///
+    /// Returns `Inexact` for all filters - we'll handle coordinate equality
+    /// filters during scan, but DataFusion should still apply filters post-scan
+    /// for correctness (in case we miss any).
+    fn supports_filters_pushdown(
+        &self,
+        filters: &[&Expr],
+    ) -> Result<Vec<TableProviderFilterPushDown>> {
+        Ok(filters
+            .iter()
+            .map(|_| TableProviderFilterPushDown::Inexact)
+            .collect())
+    }
+
     async fn scan(
         &self,
         _state: &dyn Session,
         projection: Option<&Vec<usize>>,
-        _filters: &[datafusion::logical_expr::Expr],
+        filters: &[datafusion::logical_expr::Expr],
         limit: Option<usize>,
     ) -> Result<Arc<dyn ExecutionPlan>> {
         // Log projection pushdown
@@ -128,12 +145,38 @@ impl TableProvider for ZarrTable {
             info!(limit, "Limit pushdown");
         }
 
+        // Parse coordinate filters for filter pushdown
+        debug!(
+            num_filters = filters.len(),
+            filters = ?filters,
+            "Filters passed to scan()"
+        );
+        let coord_filters = if let Some(meta) = &self.store_meta {
+            let coord_names: Vec<String> = meta.coords.iter().map(|c| c.name.clone()).collect();
+            debug!(?coord_names, "Coordinate names from metadata");
+            let parsed = parse_coord_filters(filters, &coord_names);
+            if !parsed.is_empty() {
+                info!(
+                    num_filters = parsed.len(),
+                    coords = ?parsed.filters.keys().collect::<Vec<_>>(),
+                    "Filter pushdown"
+                );
+                Some(parsed)
+            } else {
+                None
+            }
+        } else {
+            // No metadata available - can't do filter pushdown
+            None
+        };
+
         Ok(Arc::new(ZarrExec::new(
             self.schema.clone(),
             self.path.clone(),
             projection.cloned(),
             limit,
             self.cached_remote.clone(),
+            coord_filters,
         )))
     }
 

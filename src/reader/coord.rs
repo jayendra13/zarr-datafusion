@@ -8,6 +8,7 @@ use arrow::datatypes::Int16Type;
 use std::sync::Arc;
 
 /// Coordinate values that can be either i64 or f32/f64
+#[derive(Debug)]
 pub enum CoordValues {
     Int64(Vec<i64>),
     Float32(Vec<f32>),
