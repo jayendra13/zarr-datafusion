@@ -1,5 +1,7 @@
 # zarr-datafusion
 
+[![Crates.io](https://img.shields.io/crates/v/zarr-datafusion.svg)](https://crates.io/crates/zarr-datafusion)
+[![docs.rs](https://docs.rs/zarr-datafusion/badge.svg)](https://docs.rs/zarr-datafusion)
 [![CI](https://github.com/jayendra13/zarr-datafusion/actions/workflows/test.yml/badge.svg)](https://github.com/jayendra13/zarr-datafusion/actions/workflows/test.yml)
 [![codecov](https://codecov.io/gh/jayendra13/zarr-datafusion/graph/badge.svg)](https://codecov.io/gh/jayendra13/zarr-datafusion)
 ![MSRV](https://img.shields.io/badge/rust-1.88+-orange.svg)

@@ -5,6 +5,12 @@ edition = "2021"
 license = "Apache-2.0"
 rust-version = "1.88"
 description = "Extending DataFusion to do SQL queries on Zarr data."
+repository = "https://github.com/jayendra13/zarr-datafusion"
+homepage = "https://github.com/jayendra13/zarr-datafusion"
+documentation = "https://docs.rs/zarr-datafusion"
+readme = "README.md"
+keywords = ["zarr", "datafusion", "sql", "arrow", "scientific-data"]
+categories = ["database", "science", "data-structures"]
 
 [dependencies]
 arrow = "57.1.0"

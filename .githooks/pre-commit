@@ -1,0 +1,23 @@
+#!/usr/bin/env sh
+set -euo pipefail
+
+echo "Running cargo fmt --all -- --check"
+if ! cargo fmt --all -- --check; then
+  echo "\nERROR: Formatting check failed. Run: cargo fmt --all and stage the changes before committing."
+  exit 1
+fi
+
+echo "Running cargo clippy --all-targets -- -D warnings"
+# Use --all-targets so clippy also checks benches, tests and examples
+if ! cargo clippy --all-targets -- -D warnings; then
+  echo "\nERROR: Clippy reported warnings/errors. Fix them before committing."
+  exit 1
+fi
+
+echo "Running cargo test --workspace"
+if ! cargo test --workspace --quiet; then
+  echo "\nERROR: Some tests failed. Fix test failures before committing."
+  exit 1
+fi
+
+echo "✅ Pre-commit checks passed: fmt, clippy, tests."
