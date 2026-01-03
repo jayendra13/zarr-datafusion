@@ -126,6 +126,18 @@ Average temperature per day:
 +------+----------+
 ```
 
+## Pre-commit hooks
+
+To enable a Git pre-commit hook that runs `cargo fmt`, `cargo clippy`, and `cargo test`, run:
+
+```sh
+./scripts/install-hooks.sh
+```
+
+This sets `git config core.hooksPath .githooks` and makes the pre-commit hook executable. The hook runs checks and prevents commits if formatting, lints, or tests fail.
+
+---
+
 ## Building
 
 ```bash
