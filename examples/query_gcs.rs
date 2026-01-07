@@ -42,14 +42,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     .await?;
     println!("Table registered in {:?}\n", start.elapsed());
 
-    // Show schema
+    // Show schema with extended Zarr metadata
     println!("Schema:");
     println!("-------");
-    let df = ctx.sql("DESCRIBE era5").await?;
+    let df = ctx.sql("SELECT * FROM zarr_describe('era5')").await?;
     df.show().await?;
 
-    // Count query - should be instant with optimization (no data scan)
-    let query = "SELECT latitude, longitude, temperature FROM era5 WHERE time=1095744 AND hybrid=136 LIMIT 50;";
+    // Sample query with LIMIT
+    let query = "SELECT * FROM era5 LIMIT 10;";
     println!("\nExecuting query (optimized - uses statistics, no data scan):");
     println!("{}", query);
     println!("------------------------------------------------------------------------");

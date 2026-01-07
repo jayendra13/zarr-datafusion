@@ -81,6 +81,11 @@ impl ZarrTable {
             store_meta: Some(metadata),
         }
     }
+
+    /// Get the store metadata (for dimension info display)
+    pub fn store_meta(&self) -> Option<&ZarrStoreMeta> {
+        self.store_meta.as_ref()
+    }
 }
 
 #[async_trait]

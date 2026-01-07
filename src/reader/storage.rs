@@ -4,6 +4,7 @@
 //! - Local filesystem: plain paths or `file:///path`
 //! - AWS S3: `s3://bucket/path`
 //! - Google Cloud Storage: `gs://bucket/path`
+//! - HTTP/HTTPS: `http://host/path` or `https://host/path`
 
 use std::sync::Arc;
 use tracing::{debug, info, instrument};
@@ -11,9 +12,12 @@ use url::Url;
 use zarrs::storage::AsyncReadableListableStorage;
 use zarrs_object_store::object_store::aws::AmazonS3Builder;
 use zarrs_object_store::object_store::gcp::GoogleCloudStorageBuilder;
+use zarrs_object_store::object_store::http::HttpBuilder;
 use zarrs_object_store::object_store::path::Path as ObjectPath;
 use zarrs_object_store::object_store::Error as ObjectStoreError;
 use zarrs_object_store::AsyncObjectStore;
+
+use super::async_tracked_store::AsyncTrackedStore;
 
 /// Error type for storage operations
 #[derive(Debug)]
@@ -61,8 +65,12 @@ pub struct StorageLocation {
 impl StorageLocation {
     /// Parse a URL or path into a StorageLocation
     pub fn parse(location: &str) -> Result<Self, StorageError> {
-        if location.starts_with("s3://") || location.starts_with("gs://") {
-            // Cloud URL - extract path from URL
+        if location.starts_with("s3://")
+            || location.starts_with("gs://")
+            || location.starts_with("http://")
+            || location.starts_with("https://")
+        {
+            // Remote URL - extract path from URL
             let url = Url::parse(location).map_err(|e| StorageError::InvalidUrl(e.to_string()))?;
             let path = url.path().trim_start_matches('/').to_string();
             Ok(StorageLocation {
@@ -95,7 +103,8 @@ impl StorageLocation {
 ///
 /// - `s3://bucket/path` - AWS S3 (credentials from environment)
 /// - `gs://bucket/path` - Google Cloud Storage (credentials from environment or anonymous)
-/// - `file:///path` or plain path - Local filesystem
+/// - `http://host/path` or `https://host/path` - HTTP/HTTPS remote stores
+/// - `file:///path` or plain path - Local filesystem (not supported for async)
 ///
 /// # Environment Variables
 ///
@@ -122,6 +131,9 @@ pub async fn create_async_store(
     } else if location.starts_with("gs://") {
         info!("Creating GCS store");
         create_gcs_store(location).await
+    } else if location.starts_with("http://") || location.starts_with("https://") {
+        info!("Creating HTTP store");
+        create_http_store(location).await
     } else {
         debug!("Local filesystem - not supported for async");
         Err(StorageError::InvalidUrl(
@@ -144,7 +156,9 @@ async fn create_s3_store(
         .with_bucket_name(bucket)
         .build()?;
 
-    let async_store: AsyncReadableListableStorage = Arc::new(AsyncObjectStore::new(store));
+    let object_store = Arc::new(AsyncObjectStore::new(store));
+    let tracked_store = AsyncTrackedStore::new(object_store, None);
+    let async_store: AsyncReadableListableStorage = Arc::new(tracked_store);
     let object_path = ObjectPath::from(path);
 
     Ok((async_store, object_path))
@@ -176,7 +190,9 @@ async fn create_gcs_store(
                 .build()
         })?;
 
-    let async_store: AsyncReadableListableStorage = Arc::new(AsyncObjectStore::new(store));
+    let object_store = Arc::new(AsyncObjectStore::new(store));
+    let tracked_store = AsyncTrackedStore::new(object_store, None);
+    let async_store: AsyncReadableListableStorage = Arc::new(tracked_store);
     let object_path = ObjectPath::from(path);
     info!(
         bucket = bucket,
@@ -187,9 +203,52 @@ async fn create_gcs_store(
     Ok((async_store, object_path))
 }
 
-/// Check if a location is a remote (cloud) URL
+/// Create an HTTP/HTTPS storage backend
+#[instrument(level = "debug")]
+async fn create_http_store(
+    url: &str,
+) -> Result<(AsyncReadableListableStorage, ObjectPath), StorageError> {
+    let parsed = Url::parse(url).map_err(|e| StorageError::InvalidUrl(e.to_string()))?;
+
+    // Extract base URL (scheme + host + port) for the HttpBuilder
+    let host = parsed
+        .host_str()
+        .ok_or_else(|| StorageError::InvalidUrl("Missing host in HTTP URL".to_string()))?;
+    let base_url = if let Some(port) = parsed.port() {
+        format!("{}://{}:{}", parsed.scheme(), host, port)
+    } else {
+        format!("{}://{}", parsed.scheme(), host)
+    };
+
+    // Path within the store (everything after the host)
+    let path = parsed.path().trim_start_matches('/');
+    debug!(base_url = %base_url, path = path, "Parsed HTTP URL");
+
+    let store = HttpBuilder::new()
+        .with_url(&base_url)
+        .build()
+        .map_err(StorageError::ObjectStore)?;
+
+    let object_store = Arc::new(AsyncObjectStore::new(store));
+    let tracked_store = AsyncTrackedStore::new(object_store, None);
+    let async_store: AsyncReadableListableStorage = Arc::new(tracked_store);
+    let object_path = ObjectPath::from(path);
+
+    info!(
+        base_url = %base_url,
+        path = path,
+        "HTTP store created successfully"
+    );
+
+    Ok((async_store, object_path))
+}
+
+/// Check if a location is a remote (cloud or HTTP) URL
 pub fn is_remote_url(location: &str) -> bool {
-    location.starts_with("s3://") || location.starts_with("gs://")
+    location.starts_with("s3://")
+        || location.starts_with("gs://")
+        || location.starts_with("http://")
+        || location.starts_with("https://")
 }
 
 #[cfg(test)]
@@ -228,7 +287,31 @@ mod tests {
     fn test_is_remote_url() {
         assert!(is_remote_url("s3://bucket/path"));
         assert!(is_remote_url("gs://bucket/path"));
+        assert!(is_remote_url("http://example.com/path"));
+        assert!(is_remote_url("https://example.com/path"));
         assert!(!is_remote_url("/local/path"));
         assert!(!is_remote_url("file:///local/path"));
+    }
+
+    #[test]
+    fn test_parse_http_url() {
+        let loc = StorageLocation::parse("http://example.com/path/to/data.zarr").unwrap();
+        assert!(loc.is_remote);
+        assert_eq!(loc.path, "path/to/data.zarr");
+    }
+
+    #[test]
+    fn test_parse_https_url() {
+        let loc =
+            StorageLocation::parse("https://data.dynamical.org/noaa/gfs/latest.zarr").unwrap();
+        assert!(loc.is_remote);
+        assert_eq!(loc.path, "noaa/gfs/latest.zarr");
+    }
+
+    #[test]
+    fn test_parse_https_url_with_port() {
+        let loc = StorageLocation::parse("https://example.com:8080/path/data.zarr").unwrap();
+        assert!(loc.is_remote);
+        assert_eq!(loc.path, "path/data.zarr");
     }
 }

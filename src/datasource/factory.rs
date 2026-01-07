@@ -35,6 +35,16 @@ impl TableProviderFactory for ZarrTableFactory {
                 .await
                 .map_err(DataFusionError::External)?;
             let schema = Arc::new(schema);
+
+            // Validate that we found at least one array
+            if schema.fields().is_empty() {
+                return Err(DataFusionError::Plan(format!(
+                    "No arrays found in Zarr store at '{}'. \
+                     Check that the URL is correct and the store is accessible.",
+                    cmd.location
+                )));
+            }
+
             info!(
                 num_fields = schema.fields().len(),
                 "Table created successfully (with cached store and metadata)"
@@ -50,6 +60,16 @@ impl TableProviderFactory for ZarrTableFactory {
             info!("Local path detected - using sync schema inference");
             let (schema, metadata) = infer_schema_with_meta(&cmd.location)?;
             let schema = Arc::new(schema);
+
+            // Validate that we found at least one array
+            if schema.fields().is_empty() {
+                return Err(DataFusionError::Plan(format!(
+                    "No arrays found in Zarr store at '{}'. \
+                     Check that the path is correct and contains valid Zarr data.",
+                    cmd.location
+                )));
+            }
+
             info!(
                 num_fields = schema.fields().len(),
                 total_rows = metadata.total_rows,

@@ -5,6 +5,7 @@
 
 use arrow::array::{ArrayRef, DictionaryArray, Float32Array, Float64Array, Int16Array, Int64Array};
 use arrow::datatypes::Int16Type;
+use tracing::debug;
 use std::sync::Arc;
 
 /// Coordinate values that can be either i64 or f32/f64
@@ -28,6 +29,22 @@ impl CoordValues {
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }
+
+    /// Returns a summary string showing [first, ..., last] for large arrays
+    pub fn summary(&self) -> String {
+        match self {
+            CoordValues::Int64(v) if v.len() > 2 => {
+                format!("[{}, ..., {}] (len={})", v.first().unwrap(), v.last().unwrap(), v.len())
+            }
+            CoordValues::Float32(v) if v.len() > 2 => {
+                format!("[{}, ..., {}] (len={})", v.first().unwrap(), v.last().unwrap(), v.len())
+            }
+            CoordValues::Float64(v) if v.len() > 2 => {
+                format!("[{}, ..., {}] (len={})", v.first().unwrap(), v.last().unwrap(), v.len())
+            }
+            _ => format!("{:?}", self),
+        }
+    }
 }
 
 /// Create a DictionaryArray for a coordinate column with proper type
@@ -37,6 +54,10 @@ pub fn create_coord_dictionary_typed(
     coord_sizes: &[usize],
     total_rows: usize,
 ) -> ArrayRef {
+
+    debug!("Creating coord dictionary array: values={}, coord_idx={}, coord_sizes={:?}, total_rows={}",
+        values.summary(), coord_idx, coord_sizes, total_rows);
+
     let keys = build_coord_keys(values.len(), coord_idx, coord_sizes, total_rows);
     let keys_array = Int16Array::from(keys);
 
@@ -65,14 +86,32 @@ pub fn create_coord_dictionary_typed(
     }
 }
 
-/// Build keys array for DictionaryArray
+/// Compute coordinate key for a single row index
 ///
-/// Instead of expanding [0,1,2] to [0,0,0,1,1,1,2,2,2,...] (700 i64 values = 5600 bytes),
-/// we store:
-///   - values: [0,1,2] (the unique coordinate values)
-///   - keys: [0,0,0,1,1,1,2,2,2,...] (indices into values, as i16)
+/// For a Cartesian product of coordinates with sizes [a, b, c, d], row index maps to:
+///   key[0] = (row_idx / (b*c*d)) % a
+///   key[1] = (row_idx / (c*d)) % b
+///   key[2] = (row_idx / d) % c
+///   key[3] = row_idx % d
 ///
-/// Memory: 700 i16 keys (1400 bytes) + 3 i64 values (24 bytes) = 1424 bytes (~75% savings)
+/// This is the mathematical property of row-major (C) order arrays.
+#[inline]
+pub fn compute_coord_key(row_idx: usize, coord_idx: usize, coord_sizes: &[usize]) -> i16 {
+    // Product of all coordinate sizes after this one
+    let inner_size: usize = coord_sizes[coord_idx + 1..].iter().product();
+    let inner_size = if inner_size == 0 { 1 } else { inner_size };
+
+    let num_values = coord_sizes[coord_idx];
+    ((row_idx / inner_size) % num_values) as i16
+}
+
+/// Build keys array for DictionaryArray using on-demand computation
+///
+/// Uses the Cartesian product formula to compute keys without nested loops.
+/// Supports computing keys for a range of rows (start_row..start_row+num_rows)
+/// to enable batched/streaming processing.
+///
+/// For full expansion, use start_row=0 and num_rows=total_rows.
 ///
 /// References:
 /// - Arrow DictionaryArray: https://docs.rs/arrow/latest/arrow/array/struct.DictionaryArray.html
@@ -83,25 +122,28 @@ pub fn build_coord_keys(
     coord_sizes: &[usize],
     total_rows: usize,
 ) -> Vec<i16> {
-    let mut keys: Vec<i16> = Vec::with_capacity(total_rows);
+    build_coord_keys_range(num_values, coord_idx, coord_sizes, 0, total_rows)
+}
 
-    // Elements after this coordinate (inner loop size)
+/// Build keys array for a range of rows [start_row, start_row + num_rows)
+///
+/// This enables batched processing without materializing the full Cartesian product.
+pub fn build_coord_keys_range(
+    _num_values: usize,
+    coord_idx: usize,
+    coord_sizes: &[usize],
+    start_row: usize,
+    num_rows: usize,
+) -> Vec<i16> {
+    // Pre-compute inner_size once (product of sizes after this coordinate)
     let inner_size: usize = coord_sizes[coord_idx + 1..].iter().product();
     let inner_size = if inner_size == 0 { 1 } else { inner_size };
+    let coord_size = coord_sizes[coord_idx];
 
-    // Elements before this coordinate (outer loop count)
-    let outer_count: usize = coord_sizes[..coord_idx].iter().product();
-    let outer_count = if outer_count == 0 { 1 } else { outer_count };
-
-    for _ in 0..outer_count {
-        for i in 0..num_values {
-            for _ in 0..inner_size {
-                keys.push(i as i16);
-            }
-        }
-    }
-
-    keys
+    // Compute keys for the requested range
+    (start_row..start_row + num_rows)
+        .map(|row_idx| ((row_idx / inner_size) % coord_size) as i16)
+        .collect()
 }
 
 /// Calculate the subset ranges needed for a limited number of rows

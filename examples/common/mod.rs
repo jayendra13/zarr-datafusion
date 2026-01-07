@@ -28,6 +28,7 @@ use datafusion::prelude::SessionContext;
 use tracing_subscriber::EnvFilter;
 use zarr_datafusion::datasource::factory::ZarrTableFactory;
 use zarr_datafusion::optimizer::{CountStatisticsRule, MinMaxStatisticsRule};
+use zarr_datafusion::udtf::register_zarr_functions;
 
 /// Initialize the tracing subscriber with environment-based filtering.
 ///
@@ -47,19 +48,23 @@ pub fn init_tracing() {
 ///
 /// Includes the CountStatisticsRule and MinMaxStatisticsRule optimizers
 /// for efficient count(*) and min/max queries on coordinates.
+/// Also registers zarr_describe() table function for extended DESCRIBE output.
 pub fn create_local_context() -> SessionContext {
     let state = SessionStateBuilder::new()
         .with_default_features()
         .with_optimizer_rule(Arc::new(CountStatisticsRule::new()))
         .with_optimizer_rule(Arc::new(MinMaxStatisticsRule::new()))
         .build();
-    SessionContext::new_with_state(state)
+    let ctx = SessionContext::new_with_state(state);
+    register_zarr_functions(&ctx);
+    ctx
 }
 
 /// Create a SessionContext configured for remote Zarr access (GCS, S3, etc).
 ///
 /// Includes ZarrTableFactory for `CREATE EXTERNAL TABLE ... STORED AS ZARR`,
 /// plus CountStatisticsRule and MinMaxStatisticsRule optimizers.
+/// Also registers zarr_describe() table function for extended DESCRIBE output.
 pub fn create_remote_context() -> SessionContext {
     let state = SessionStateBuilder::new()
         .with_default_features()
@@ -70,7 +75,9 @@ pub fn create_remote_context() -> SessionContext {
         .with_optimizer_rule(Arc::new(CountStatisticsRule::new()))
         .with_optimizer_rule(Arc::new(MinMaxStatisticsRule::new()))
         .build();
-    SessionContext::new_with_state(state)
+    let ctx = SessionContext::new_with_state(state);
+    register_zarr_functions(&ctx);
+    ctx
 }
 
 /// Execute a SQL query and display results with a description.
