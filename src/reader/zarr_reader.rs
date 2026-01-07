@@ -508,7 +508,7 @@ pub async fn read_zarr_async(
         let subset = ArraySubset::new_with_shape(arr.shape().to_vec());
         let element_bytes = dtype_to_bytes(dtype);
         let values = read_coord_values!(async, arr, &subset, dtype.as_str());
-
+        debug!(path = %array_path, "Coordinate values loaded");
         if let Some(ref s) = stats {
             let bytes = coord.shape[0] * element_bytes;
             s.record_coord(bytes, read_start.elapsed());
@@ -610,7 +610,8 @@ pub async fn read_zarr_async(
     }
 
     // Calculate how many values we need from each coordinate (for limit optimization on top of filter)
-    let coord_value_limits = if effective_rows < rows_after_filter {
+    // TODO: Use this for optimized coordinate loading in the future
+    let _coord_value_limits = if effective_rows < rows_after_filter {
         calculate_coord_limits(&effective_coord_sizes, effective_rows)
     } else {
         effective_coord_sizes.clone()
@@ -654,7 +655,7 @@ pub async fn read_zarr_async(
             let dict_array = create_coord_dictionary_typed(
                 &filtered_coord_values[coord_idx],
                 coord_idx,
-                &coord_value_limits,
+                &effective_coord_sizes,
                 effective_rows,
             );
             result_arrays.push(dict_array);

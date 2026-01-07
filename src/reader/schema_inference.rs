@@ -81,6 +81,8 @@ pub struct ZarrArrayMeta {
     pub name: String,
     pub data_type: String,
     pub shape: Vec<u64>,
+    /// Chunk sizes for this array (e.g., [160, 145, 144])
+    pub chunks: Option<Vec<u64>>,
     /// Min/max bounds for coordinate arrays (None for data variables)
     /// Stored as (min, max) in f64 for simplicity
     pub coord_min_max: Option<(f64, f64)>,
@@ -89,6 +91,12 @@ pub struct ZarrArrayMeta {
 impl ZarrArrayMeta {
     pub fn is_coordinate(&self) -> bool {
         self.shape.len() == 1
+    }
+
+    /// Returns true if this is a scalar array (shape=[])
+    /// Scalars don't fit the Cartesian product model and should be filtered out
+    pub fn is_scalar(&self) -> bool {
+        self.shape.is_empty()
     }
 }
 
@@ -141,6 +149,11 @@ fn discover_arrays_v2(
                     .map(|arr| arr.iter().filter_map(|v| v.as_u64()).collect())
                     .unwrap_or_default();
 
+                let chunks: Option<Vec<u64>> = meta
+                    .get("chunks")
+                    .and_then(|v| v.as_array())
+                    .map(|arr| arr.iter().filter_map(|v| v.as_u64()).collect());
+
                 // V2 uses numpy dtype format like "<i8", "<f4"
                 let dtype_raw = meta.get("dtype").and_then(|v| v.as_str()).unwrap_or("<f8");
 
@@ -150,6 +163,7 @@ fn discover_arrays_v2(
                     name,
                     data_type,
                     shape,
+                    chunks,
                     coord_min_max: None, // Will be computed in separate_and_sort_arrays
                 });
             }
@@ -189,6 +203,14 @@ fn discover_arrays_v3(
                         .map(|arr| arr.iter().filter_map(|v| v.as_u64()).collect())
                         .unwrap_or_default();
 
+                    // V3 chunk_grid.configuration.chunk_shape
+                    let chunks: Option<Vec<u64>> = meta
+                        .get("chunk_grid")
+                        .and_then(|v| v.get("configuration"))
+                        .and_then(|v| v.get("chunk_shape"))
+                        .and_then(|v| v.as_array())
+                        .map(|arr| arr.iter().filter_map(|v| v.as_u64()).collect());
+
                     let data_type = meta
                         .get("data_type")
                         .and_then(|v| v.as_str())
@@ -199,6 +221,7 @@ fn discover_arrays_v3(
                         name,
                         data_type,
                         shape,
+                        chunks,
                         coord_min_max: None, // Will be computed in separate_and_sort_arrays
                     });
                 }
@@ -415,7 +438,6 @@ pub fn infer_schema_with_meta(
     let mut fields: Vec<Field> = Vec::new();
 
     // Coordinates use Dictionary encoding for memory efficiency
-    // Instead of [0,0,0,1,1,1,2,2,2] we store {values: [0,1,2], indices: [0,0,0,1,1,1,2,2,2]}
     for coord in &meta.coords {
         fields.push(Field::new(
             &coord.name,
@@ -433,6 +455,9 @@ pub fn infer_schema_with_meta(
         ));
     }
 
+    // Note: Schema metadata causes issues with DataFusion's optimizer schema comparisons.
+    // Instead of storing metadata in the schema, we return ZarrStoreMeta which contains
+    // all dimension info. The CLI can access this via the ZarrTable struct.
     Ok((Schema::new(fields), meta))
 }
 
@@ -449,7 +474,25 @@ pub async fn discover_arrays_async(
     store: &AsyncReadableListableStorage,
     prefix: &ObjectPath,
 ) -> Result<ZarrStoreMeta, Box<dyn std::error::Error + Send + Sync>> {
-    debug!("Detecting Zarr version");
+    // First, try consolidated metadata (.zmetadata) - works for HTTP stores
+    // that don't support directory listing
+    if let Some(meta) = discover_arrays_from_zmetadata_async(store, prefix).await? {
+        info!(
+            coords = meta.coords.len(),
+            data_vars = meta.data_vars.len(),
+            "Arrays discovered from consolidated metadata"
+        );
+        for coord in &meta.coords {
+            debug!(name = %coord.name, shape = ?coord.shape, dtype = %coord.data_type, "Coordinate");
+        }
+        for var in &meta.data_vars {
+            debug!(name = %var.name, shape = ?var.shape, dtype = %var.data_type, "Data variable");
+        }
+        return Ok(meta);
+    }
+
+    // Fall back to directory listing for v2/v3 detection
+    debug!("Detecting Zarr version via directory listing");
     let version = detect_zarr_version_async(store, prefix).await?;
     info!(?version, "Zarr version detected");
 
@@ -527,7 +570,7 @@ pub async fn detect_zarr_version_async(
     Err("Could not detect Zarr version: no metadata files found".into())
 }
 
-/// Check if a key exists in the async store
+/// Check if a key exists in the async store (without downloading content)
 async fn store_key_exists(store: &AsyncReadableListableStorage, key: &str) -> bool {
     use zarrs::storage::{AsyncReadableStorageTraits, StoreKey};
 
@@ -536,7 +579,8 @@ async fn store_key_exists(store: &AsyncReadableListableStorage, key: &str) -> bo
         Err(_) => return false,
     };
 
-    matches!(store.get(&store_key).await, Ok(Some(_)))
+    // Use size_key() instead of get() to check existence without downloading content
+    matches!(store.size_key(&store_key).await, Ok(Some(_)))
 }
 
 /// Read a key from the async store as string
@@ -556,6 +600,89 @@ async fn store_get_string(
 
     String::from_utf8(bytes.to_vec())
         .map_err(|e| format!("Invalid UTF-8 in '{}': {}", key, e).into())
+}
+
+/// Try to discover arrays from consolidated .zmetadata file (Zarr v2)
+///
+/// This is the preferred method for HTTP stores since they don't support directory listing.
+/// The .zmetadata file contains all array metadata in a single JSON file.
+#[instrument(level = "debug", skip_all)]
+async fn discover_arrays_from_zmetadata_async(
+    store: &AsyncReadableListableStorage,
+    prefix: &ObjectPath,
+) -> Result<Option<ZarrStoreMeta>, Box<dyn std::error::Error + Send + Sync>> {
+    let zmetadata_path = if prefix.as_ref().is_empty() {
+        ".zmetadata".to_string()
+    } else {
+        format!("{}/.zmetadata", prefix.as_ref().trim_end_matches('/'))
+    };
+
+    debug!(path = %zmetadata_path, "Checking for consolidated metadata");
+
+    // Try to read .zmetadata - return None if not found
+    let content = match store_get_string(store, &zmetadata_path).await {
+        Ok(c) => c,
+        Err(_) => {
+            debug!("No .zmetadata found, will use directory listing");
+            return Ok(None);
+        }
+    };
+
+    info!("Found consolidated metadata in .zmetadata");
+
+    let meta: serde_json::Value = serde_json::from_str(&content)
+        .map_err(|e| format!("Failed to parse .zmetadata: {}", e))?;
+
+    let metadata = meta
+        .get("metadata")
+        .ok_or("Missing 'metadata' key in .zmetadata")?;
+
+    let mut arrays: Vec<ZarrArrayMeta> = Vec::new();
+
+    // Parse each array from consolidated metadata
+    // Keys are like "temperature_2m/.zarray" or "time/.zattrs"
+    for (key, value) in metadata
+        .as_object()
+        .ok_or("'metadata' is not an object")?
+    {
+        if key.ends_with("/.zarray") {
+            let name = key.trim_end_matches("/.zarray").to_string();
+
+            let shape: Vec<u64> = value
+                .get("shape")
+                .and_then(|v| v.as_array())
+                .map(|arr| arr.iter().filter_map(|v| v.as_u64()).collect())
+                .unwrap_or_default();
+
+            let chunks: Option<Vec<u64>> = value
+                .get("chunks")
+                .and_then(|v| v.as_array())
+                .map(|arr| arr.iter().filter_map(|v| v.as_u64()).collect());
+
+            let dtype_raw = value.get("dtype").and_then(|v| v.as_str()).unwrap_or("<f8");
+            let data_type = parse_v2_dtype(dtype_raw);
+
+            debug!(name = %name, shape = ?shape, chunks = ?chunks, dtype = %data_type, "Found array in .zmetadata");
+
+            arrays.push(ZarrArrayMeta {
+                name,
+                data_type,
+                shape,
+                chunks,
+                coord_min_max: None,
+            });
+        }
+    }
+
+    if arrays.is_empty() {
+        debug!("No arrays found in .zmetadata");
+        return Ok(None);
+    }
+
+    info!(count = arrays.len(), "Discovered arrays from .zmetadata");
+    separate_and_sort_arrays_async(store, prefix, arrays)
+        .await
+        .map(Some)
 }
 
 /// Async version of discover_arrays_v2 for remote stores
@@ -602,6 +729,11 @@ async fn discover_arrays_v2_async(
                 .map(|arr| arr.iter().filter_map(|v| v.as_u64()).collect())
                 .unwrap_or_default();
 
+            let chunks: Option<Vec<u64>> = meta
+                .get("chunks")
+                .and_then(|v| v.as_array())
+                .map(|arr| arr.iter().filter_map(|v| v.as_u64()).collect());
+
             let dtype_raw = meta.get("dtype").and_then(|v| v.as_str()).unwrap_or("<f8");
             let data_type = parse_v2_dtype(dtype_raw);
 
@@ -609,6 +741,7 @@ async fn discover_arrays_v2_async(
                 name,
                 data_type,
                 shape,
+                chunks,
                 coord_min_max: None, // Not computed for async/remote stores yet
             });
         }
@@ -662,6 +795,14 @@ async fn discover_arrays_v3_async(
                     .map(|arr| arr.iter().filter_map(|v| v.as_u64()).collect())
                     .unwrap_or_default();
 
+                // V3 chunk_grid.configuration.chunk_shape
+                let chunks: Option<Vec<u64>> = meta
+                    .get("chunk_grid")
+                    .and_then(|v| v.get("configuration"))
+                    .and_then(|v| v.get("chunk_shape"))
+                    .and_then(|v| v.as_array())
+                    .map(|arr| arr.iter().filter_map(|v| v.as_u64()).collect());
+
                 let data_type = meta
                     .get("data_type")
                     .and_then(|v| v.as_str())
@@ -672,6 +813,7 @@ async fn discover_arrays_v3_async(
                     name,
                     data_type,
                     shape,
+                    chunks,
                     coord_min_max: None, // Not computed for async/remote stores yet
                 });
             }
@@ -681,14 +823,16 @@ async fn discover_arrays_v3_async(
     separate_and_sort_arrays_async(store, prefix, arrays).await
 }
 
-/// Separate arrays into coordinates and data variables (async version with min/max computation)
+/// Separate arrays into coordinates and data variables (async version)
 async fn separate_and_sort_arrays_async(
-    store: &AsyncReadableListableStorage,
-    prefix: &ObjectPath,
+    _store: &AsyncReadableListableStorage,
+    _prefix: &ObjectPath,
     arrays: Vec<ZarrArrayMeta>,
 ) -> Result<ZarrStoreMeta, Box<dyn std::error::Error + Send + Sync>> {
-    use zarrs::array::Array;
-    use zarrs::array_subset::ArraySubset;
+
+    // Filter out scalar arrays (shape=[]) - they don't fit the Cartesian product model
+    // Examples: spatial_ref (CRS metadata), other auxiliary scalars
+    let arrays: Vec<_> = arrays.into_iter().filter(|a| !a.is_scalar()).collect();
 
     // Use into_iter + partition for single-pass, zero-clone separation
     let (mut coords, mut data_vars): (Vec<_>, Vec<_>) =
@@ -702,87 +846,20 @@ async fn separate_and_sort_arrays_async(
     // alphabetical ordering when the mapping is ambiguous.
     coords = infer_coord_order_from_data_vars(coords, &data_vars);
 
-    // Compute min/max for each coordinate by reading the data (async)
-    for coord in &mut coords {
-        // Path format: "/{prefix}/{coord_name}" - zarrs expects absolute paths
-        let coord_path = format!("/{}/{}", prefix.as_ref(), coord.name);
-        debug!(coord = %coord.name, path = %coord_path, "Attempting to compute min/max");
-        match Array::async_open(store.clone(), &coord_path).await {
-            Err(e) => {
-                debug!(coord = %coord.name, error = %e, "Failed to open coordinate array");
-                continue;
-            }
-            Ok(arr) => {
-                let shape = arr.shape();
-                if let Ok(subset) = ArraySubset::new_with_start_shape(vec![0], shape.to_vec()) {
-                    let min_max: Option<(f64, f64)> = match coord.data_type.as_str() {
-                        "float64" => arr
-                            .async_retrieve_array_subset_elements::<f64>(&subset)
-                            .await
-                            .ok()
-                            .filter(|data| !data.is_empty())
-                            .map(|data| {
-                                let min = data.iter().cloned().fold(f64::INFINITY, f64::min);
-                                let max = data.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
-                                (min, max)
-                            }),
-                        "float32" => arr
-                            .async_retrieve_array_subset_elements::<f32>(&subset)
-                            .await
-                            .ok()
-                            .filter(|data| !data.is_empty())
-                            .map(|data| {
-                                let min = data.iter().cloned().fold(f32::INFINITY, f32::min) as f64;
-                                let max =
-                                    data.iter().cloned().fold(f32::NEG_INFINITY, f32::max) as f64;
-                                (min, max)
-                            }),
-                        "int64" => arr
-                            .async_retrieve_array_subset_elements::<i64>(&subset)
-                            .await
-                            .ok()
-                            .filter(|data| !data.is_empty())
-                            .and_then(|data| {
-                                let min = *data.iter().min()? as f64;
-                                let max = *data.iter().max()? as f64;
-                                Some((min, max))
-                            }),
-                        "int32" => arr
-                            .async_retrieve_array_subset_elements::<i32>(&subset)
-                            .await
-                            .ok()
-                            .filter(|data| !data.is_empty())
-                            .and_then(|data| {
-                                let min = *data.iter().min()? as f64;
-                                let max = *data.iter().max()? as f64;
-                                Some((min, max))
-                            }),
-                        "int16" => arr
-                            .async_retrieve_array_subset_elements::<i16>(&subset)
-                            .await
-                            .ok()
-                            .filter(|data| !data.is_empty())
-                            .and_then(|data| {
-                                let min = *data.iter().min()? as f64;
-                                let max = *data.iter().max()? as f64;
-                                Some((min, max))
-                            }),
-                        _ => None,
-                    };
-
-                    if let Some((min, max)) = min_max {
-                        debug!(
-                            coord = %coord.name,
-                            min = min,
-                            max = max,
-                            "Computed coordinate min/max (async)"
-                        );
-                        coord.coord_min_max = Some((min, max));
-                    }
-                }
-            } // end Ok(arr) =>
-        } // end match
-    }
+    // TODO: Coordinate min/max statistics for remote stores
+    //
+    // Currently we skip min/max computation for remote stores to avoid expensive
+    // chunk fetches during table registration. This means MIN()/MAX() queries on
+    // coordinates will scan data instead of using statistics.
+    //
+    // Future optimization options:
+    // 1. Skip entirely (current) - fastest registration, queries scan data
+    // 2. Lazy computation - compute min/max on first MIN/MAX query and cache
+    // 3. First/last chunk only - assume sorted coordinates, read only 2 chunks
+    //    instead of all chunks (e.g., time/0 and time/19 for 20-chunk array)
+    //
+    // For now, coord_min_max remains None for remote stores.
+    debug!("Skipping min/max computation for remote store (optimization)");
 
     // Compute total_rows = product of all coordinate sizes
     let total_rows: usize = coords.iter().map(|c| c.shape[0] as usize).product();
@@ -816,6 +893,7 @@ pub async fn infer_schema_with_meta_async(
 
     let mut fields: Vec<Field> = Vec::new();
 
+    // Coordinates use Dictionary encoding for memory efficiency
     for coord in &meta.coords {
         fields.push(Field::new(
             &coord.name,
@@ -824,6 +902,7 @@ pub async fn infer_schema_with_meta_async(
         ));
     }
 
+    // Data variables use regular arrays
     for var in &meta.data_vars {
         fields.push(Field::new(
             &var.name,
@@ -832,6 +911,9 @@ pub async fn infer_schema_with_meta_async(
         ));
     }
 
+    // Note: Schema metadata causes issues with DataFusion's optimizer schema comparisons.
+    // Instead of storing metadata in the schema, we return ZarrStoreMeta which contains
+    // all dimension info. The CLI can access this via the ZarrTable struct.
     info!(num_fields = fields.len(), "Schema inferred");
     Ok((Schema::new(fields), meta))
 }
@@ -881,6 +963,7 @@ mod tests {
             name: "lat".to_string(),
             data_type: "float64".to_string(),
             shape: vec![10],
+            chunks: Some(vec![10]),
             coord_min_max: Some((0.0, 90.0)),
         };
         assert!(coord.is_coordinate());
@@ -890,6 +973,7 @@ mod tests {
             name: "temp".to_string(),
             data_type: "float64".to_string(),
             shape: vec![10, 10],
+            chunks: Some(vec![5, 5]),
             coord_min_max: None,
         };
         assert!(!data_2d.is_coordinate());
@@ -898,6 +982,7 @@ mod tests {
             name: "temp".to_string(),
             data_type: "float64".to_string(),
             shape: vec![7, 10, 10],
+            chunks: Some(vec![7, 5, 5]),
             coord_min_max: None,
         };
         assert!(!data_3d.is_coordinate());

@@ -19,6 +19,7 @@ use zarr_datafusion::datasource::factory::ZarrTableFactory;
 use zarr_datafusion::optimizer::{CountStatisticsRule, MinMaxStatisticsRule};
 use zarr_datafusion::physical_plan::zarr_exec::ZarrExec;
 use zarr_datafusion::reader::stats::{format_bytes, SharedIoStats};
+use zarr_datafusion::udtf::register_zarr_functions;
 
 const HISTORY_FILE: &str = ".zarr_cli_history";
 
@@ -64,6 +65,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         .build();
     let ctx = SessionContext::new_with_state(state);
 
+    // Register Zarr-specific table functions
+    register_zarr_functions(&ctx);
+
     println!("Zarr-DataFusion CLI");
     println!("\nType SQL queries or 'help' for commands.\n");
 
@@ -96,6 +100,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
                 if line.starts_with("\\d") || line.eq_ignore_ascii_case("show tables") {
                     match ctx.sql("SHOW TABLES").await {
+                        Ok(df) => {
+                            if let Err(e) = df.show().await {
+                                eprintln!("Error: {e}");
+                            }
+                        }
+                        Err(e) => eprintln!("Error: {e}"),
+                    }
+                    continue;
+                }
+
+                // Custom DESCRIBE with extended Zarr metadata
+                if let Some(table_name) = parse_describe_query(line) {
+                    let query = format!("SELECT * FROM zarr_describe('{}')", table_name);
+                    match ctx.sql(&query).await {
                         Ok(df) => {
                             if let Err(e) = df.show().await {
                                 eprintln!("Error: {e}");
@@ -298,4 +316,19 @@ fn spawn_live_stats(stats: SharedIoStats, stop: Arc<AtomicBool>) -> tokio::task:
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
     })
+}
+
+/// Parse DESCRIBE query and extract table name
+/// Matches: DESCRIBE table, DESCRIBE table;, DESC table
+fn parse_describe_query(line: &str) -> Option<String> {
+    let line = line.trim().trim_end_matches(';').trim();
+    let upper = line.to_uppercase();
+
+    if upper.starts_with("DESCRIBE ") || upper.starts_with("DESC ") {
+        let parts: Vec<&str> = line.split_whitespace().collect();
+        if parts.len() >= 2 {
+            return Some(parts[1].to_string());
+        }
+    }
+    None
 }
