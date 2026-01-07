@@ -630,8 +630,8 @@ async fn discover_arrays_from_zmetadata_async(
 
     info!("Found consolidated metadata in .zmetadata");
 
-    let meta: serde_json::Value = serde_json::from_str(&content)
-        .map_err(|e| format!("Failed to parse .zmetadata: {}", e))?;
+    let meta: serde_json::Value =
+        serde_json::from_str(&content).map_err(|e| format!("Failed to parse .zmetadata: {}", e))?;
 
     let metadata = meta
         .get("metadata")
@@ -641,10 +641,7 @@ async fn discover_arrays_from_zmetadata_async(
 
     // Parse each array from consolidated metadata
     // Keys are like "temperature_2m/.zarray" or "time/.zattrs"
-    for (key, value) in metadata
-        .as_object()
-        .ok_or("'metadata' is not an object")?
-    {
+    for (key, value) in metadata.as_object().ok_or("'metadata' is not an object")? {
         if key.ends_with("/.zarray") {
             let name = key.trim_end_matches("/.zarray").to_string();
 
@@ -829,7 +826,6 @@ async fn separate_and_sort_arrays_async(
     _prefix: &ObjectPath,
     arrays: Vec<ZarrArrayMeta>,
 ) -> Result<ZarrStoreMeta, Box<dyn std::error::Error + Send + Sync>> {
-
     // Filter out scalar arrays (shape=[]) - they don't fit the Cartesian product model
     // Examples: spatial_ref (CRS metadata), other auxiliary scalars
     let arrays: Vec<_> = arrays.into_iter().filter(|a| !a.is_scalar()).collect();

@@ -5,8 +5,8 @@
 
 use arrow::array::{ArrayRef, DictionaryArray, Float32Array, Float64Array, Int16Array, Int64Array};
 use arrow::datatypes::Int16Type;
-use tracing::debug;
 use std::sync::Arc;
+use tracing::debug;
 
 /// Coordinate values that can be either i64 or f32/f64
 #[derive(Debug)]
@@ -34,13 +34,28 @@ impl CoordValues {
     pub fn summary(&self) -> String {
         match self {
             CoordValues::Int64(v) if v.len() > 2 => {
-                format!("[{}, ..., {}] (len={})", v.first().unwrap(), v.last().unwrap(), v.len())
+                format!(
+                    "[{}, ..., {}] (len={})",
+                    v.first().unwrap(),
+                    v.last().unwrap(),
+                    v.len()
+                )
             }
             CoordValues::Float32(v) if v.len() > 2 => {
-                format!("[{}, ..., {}] (len={})", v.first().unwrap(), v.last().unwrap(), v.len())
+                format!(
+                    "[{}, ..., {}] (len={})",
+                    v.first().unwrap(),
+                    v.last().unwrap(),
+                    v.len()
+                )
             }
             CoordValues::Float64(v) if v.len() > 2 => {
-                format!("[{}, ..., {}] (len={})", v.first().unwrap(), v.last().unwrap(), v.len())
+                format!(
+                    "[{}, ..., {}] (len={})",
+                    v.first().unwrap(),
+                    v.last().unwrap(),
+                    v.len()
+                )
             }
             _ => format!("{:?}", self),
         }
@@ -54,9 +69,13 @@ pub fn create_coord_dictionary_typed(
     coord_sizes: &[usize],
     total_rows: usize,
 ) -> ArrayRef {
-
-    debug!("Creating coord dictionary array: values={}, coord_idx={}, coord_sizes={:?}, total_rows={}",
-        values.summary(), coord_idx, coord_sizes, total_rows);
+    debug!(
+        "Creating coord dictionary array: values={}, coord_idx={}, coord_sizes={:?}, total_rows={}",
+        values.summary(),
+        coord_idx,
+        coord_sizes,
+        total_rows
+    );
 
     let keys = build_coord_keys(values.len(), coord_idx, coord_sizes, total_rows);
     let keys_array = Int16Array::from(keys);

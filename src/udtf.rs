@@ -138,12 +138,15 @@ fn build_describe_batch(schema: &SchemaRef, meta: Option<&ZarrStoreMeta>) -> Res
             dimensions.push(Some(format!("({})", name)));
             sizes.push(Some(coord.shape[0].to_string()));
             // Coords typically have simple chunks
-            chunks_col.push(
-                coord
-                    .chunks
-                    .as_ref()
-                    .map(|c| format!("({})", c.iter().map(|v| v.to_string()).collect::<Vec<_>>().join(", "))),
-            );
+            chunks_col.push(coord.chunks.as_ref().map(|c| {
+                format!(
+                    "({})",
+                    c.iter()
+                        .map(|v| v.to_string())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                )
+            }));
         } else if let Some(data_var) = data_var_map.get(name.as_str()) {
             types.push(Some("data_var".to_string()));
             dimensions.push(Some(dims_str.clone()));
@@ -151,12 +154,15 @@ fn build_describe_batch(schema: &SchemaRef, meta: Option<&ZarrStoreMeta>) -> Res
             let total: u64 = data_var.shape.iter().product();
             sizes.push(Some(total.to_string()));
             // Show chunk sizes like "(160, 145, 144)"
-            chunks_col.push(
-                data_var
-                    .chunks
-                    .as_ref()
-                    .map(|c| format!("({})", c.iter().map(|v| v.to_string()).collect::<Vec<_>>().join(", "))),
-            );
+            chunks_col.push(data_var.chunks.as_ref().map(|c| {
+                format!(
+                    "({})",
+                    c.iter()
+                        .map(|v| v.to_string())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                )
+            }));
         } else {
             // No Zarr metadata or unknown
             types.push(None);
