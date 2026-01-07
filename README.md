@@ -10,6 +10,33 @@
 
 A Rust library that integrates [Zarr](https://zarr.dev/) (v2 and v3) array storage with [Apache DataFusion](https://datafusion.apache.org/) for querying multidimensional scientific data using SQL.
 
+## Quick Start
+
+```bash
+# Install and run the CLI
+cargo install zarr-datafusion
+zarr-cli
+
+# Or run from source
+cargo run --bin zarr-cli
+```
+
+```sql
+-- Load a Zarr store (local or cloud)
+zarr> CREATE EXTERNAL TABLE era5 STORED AS ZARR
+      LOCATION 'gs://gcp-public-data-arco-era5/ar/model-level-1h-0p25deg.zarr-v1';
+
+-- Explore schema with extended metadata
+zarr> DESCRIBE era5;
+
+-- Query with SQL
+zarr> SELECT latitude, longitude, AVG(2m_temperature)
+      FROM era5
+      WHERE time > '2020-01-01'
+      GROUP BY latitude, longitude
+      LIMIT 10;
+```
+
 ## Overview
 
 This library allows you to query Zarr stores (commonly used for weather, climate, and scientific datasets) using DataFusion's SQL engine. It flattens multidimensional arrays into a tabular format, enabling SQL queries over gridded data. Both Zarr v2 and v3 formats are supported.
@@ -71,8 +98,35 @@ synthetic_v2.zarr/
 - **Zarr v2 and v3 support** via the [zarrs](https://crates.io/crates/zarrs) crate
 - **Schema inference**: Automatically infers Arrow schema from Zarr metadata
 - **Projection pushdown**: Only reads arrays that are needed for the query
+- **Filter pushdown**: Coordinate equality filters reduce data reads
 - **Memory efficient coordinates**: Uses Arrow DictionaryArray for coordinate columns (~75% memory savings)
 - **SQL interface**: Full DataFusion SQL support (filtering, aggregation, joins, etc.)
+- **Cloud storage**: Read directly from GCS and S3 buckets
+- **Interactive CLI**: SQL shell with syntax highlighting, history, and I/O statistics
+
+## Prerequisites
+
+### Rust
+
+Install Rust via [rustup](https://rustup.rs/):
+
+```bash
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+```
+
+### uv (for test data generation)
+
+[uv](https://docs.astral.sh/uv/) is used to run Python scripts for generating test data. Install it:
+
+```bash
+# macOS/Linux
+curl -LsSf https://astral.sh/uv/install.sh | sh
+
+# Or with Homebrew
+brew install uv
+```
+
+The Python scripts use zarr, numpy, xarray, and other scientific packages. These are installed automatically by uv when running the scripts.
 
 ## Usage
 
@@ -182,9 +236,16 @@ An interactive SQL shell is included for exploring Zarr data:
 cargo run --bin zarr-cli
 ```
 
+### Features
+
+- **SQL syntax highlighting** for better readability
+- **Command history** persisted to `~/.zarr_cli_history`
+- **Live I/O statistics** during query execution
+- **Extended DESCRIBE** with Zarr metadata (type, dimensions, chunk sizes)
+
 ### Loading Zarr Data
 
-Use standard SQL `CREATE EXTERNAL TABLE` syntax to load Zarr stores (v2 or v3):
+Use standard SQL `CREATE EXTERNAL TABLE` syntax to load Zarr stores:
 
 ```sql
 zarr> CREATE EXTERNAL TABLE weather STORED AS ZARR LOCATION 'data/synthetic_v3.zarr';
@@ -193,21 +254,48 @@ zarr> SELECT * FROM weather LIMIT 5;
 zarr> DROP TABLE weather;
 ```
 
-The schema is automatically inferred from Zarr metadata (v2 or v3). Coordinate arrays (1D) become columns, and data arrays (nD) are flattened.
+Load data from cloud storage (GCS, S3):
+
+```sql
+zarr> CREATE EXTERNAL TABLE era5 STORED AS ZARR LOCATION 'gs://gcp-public-data-arco-era5/ar/model-level-1h-0p25deg.zarr-v1';
+zarr> SELECT * FROM era5 LIMIT 10;
+```
+
+### Extended DESCRIBE
+
+The `DESCRIBE` command shows extended Zarr metadata including variable type, dimensions, sizes, and chunk configuration:
+
+```sql
+zarr> DESCRIBE era5;
+```
+
+Output:
+```
++-------------------------+------------------------------------+-------------+----------+------------------------------------------+-------------+-----------------+
+| column_name             | data_type                          | is_nullable | type     | dimension                                | size        | chunks          |
++-------------------------+------------------------------------+-------------+----------+------------------------------------------+-------------+-----------------+
+| time                    | Dictionary(Int16, Timestamp(...))  | NO          | coord    | (time)                                   | 82920       | (82920)         |
+| latitude                | Dictionary(Int16, Float64)         | NO          | coord    | (latitude)                               | 721         | (721)           |
+| longitude               | Dictionary(Int16, Float64)         | NO          | coord    | (longitude)                              | 1440        | (1440)          |
+| 2m_temperature          | Float32                            | YES         | data_var | (time: 82920, latitude: 721, ...)        | 86090860800 | (160, 145, 144) |
++-------------------------+------------------------------------+-------------+----------+------------------------------------------+-------------+-----------------+
+```
+
+You can also use `zarr_describe()` directly in SQL:
+
+```sql
+zarr> SELECT column_name, type, dimension FROM zarr_describe('era5') WHERE type = 'coord';
+```
+
+### I/O Statistics
+
+After each query, statistics are displayed:
 
 ```
-Zarr-DataFusion CLI
-
-Type SQL queries or 'help' for commands.
-
-zarr> CREATE EXTERNAL TABLE synthetic_v2 STORED AS ZARR LOCATION 'data/synthetic_v2.zarr';
-zarr> CREATE EXTERNAL TABLE synthetic_v3 STORED AS ZARR LOCATION 'data/synthetic_v3.zarr';
-zarr> CREATE EXTERNAL TABLE era5 STORED AS ZARR LOCATION 'data/era5_v3.zarr';
-zarr> SHOW TABLES;
-zarr> SELECT * FROM synthetic_v2 LIMIT 5;
-zarr> help
-zarr> quit
+5 rows · 3 arrays · 6.70 KB disk · 13.92 KB mem · 0.013s
 ```
+
+This shows rows returned, arrays read, compressed bytes from disk, uncompressed bytes in memory, and execution time.
 
 ### Example Queries
 
@@ -257,16 +345,24 @@ LIMIT 10;
 
 ```
 src/
-├── bin/
-│   └── zarr_cli.rs       # Interactive SQL shell (REPL)
+├── bin/zarr_cli/
+│   ├── main.rs              # Interactive SQL shell (REPL)
+│   └── highlight.rs         # SQL syntax highlighting
 ├── reader/
 │   ├── schema_inference.rs  # Infer Arrow schema from Zarr metadata
-│   └── zarr_reader.rs       # Low-level Zarr reading and Arrow conversion
+│   ├── zarr_reader.rs       # Zarr reading and Arrow conversion
+│   ├── filter.rs            # Filter pushdown for coordinates
+│   ├── storage.rs           # Storage backends (local, GCS, S3)
+│   └── stats.rs             # I/O statistics tracking
 ├── datasource/
-│   ├── zarr.rs           # DataFusion TableProvider implementation
-│   └── factory.rs        # TableProviderFactory for CREATE EXTERNAL TABLE
-└── physical_plan/
-    └── zarr_exec.rs      # DataFusion ExecutionPlan for scanning
+│   ├── zarr.rs              # DataFusion TableProvider implementation
+│   └── factory.rs           # TableProviderFactory for CREATE EXTERNAL TABLE
+├── optimizer/
+│   ├── minmax_optimization.rs  # MIN/MAX → constant folding
+│   └── count_optimization.rs   # COUNT(*) → constant folding
+├── physical_plan/
+│   └── zarr_exec.rs         # DataFusion ExecutionPlan for scanning
+└── udtf.rs                  # zarr_describe() table function
 ```
 
 ## Dependencies
@@ -285,12 +381,15 @@ src/
 - [x] Read ERA5 climate dataset from local disk
 - [x] Zarr v2 support (without codecs)
 - [x] Zarr Codecs (Blosc, etc.)
+- [x] Read from cloud storage (GCS/S3) via `object_store` crate
+- [x] Extended DESCRIBE with Zarr metadata (`zarr_describe()` UDTF)
+- [x] MIN/MAX/COUNT optimizer rules (use statistics, skip data scan)
 
 ### Pushdown Optimizations
 - [x] Projection pushdown (only read requested columns)
 - [x] Limit pushdown (slice results to limit)
-- [ ] Filter pushdown
-  - [ ] Coordinate equality (`WHERE lat = 5`)
+- [x] Filter pushdown for coordinate equality (`WHERE lat = 5`)
+- [ ] Filter pushdown (advanced)
   - [ ] Coordinate range (`WHERE time BETWEEN 2 AND 4`)
   - [ ] Partition pruning (skip chunks based on coordinate ranges)
   - [ ] Data variable filter (`WHERE temperature > 20`)
@@ -298,14 +397,14 @@ src/
 - [ ] Top-K optimization (`ORDER BY x LIMIT k` without full sort)
 
 ### REPL Experience
-- [ ] Tab completion (tables, columns, SQL keywords)
 - [x] Syntax highlighting
-- [ ] Multi-line query editing
 - [x] Query history persistence (~/.zarr_cli_history)
+- [x] Timing and I/O statistics
+- [x] Live progress during query execution
+- [x] Extended DESCRIBE with Zarr metadata
+- [ ] Tab completion (tables, columns, SQL keywords)
+- [ ] Multi-line query editing
 - [ ] Output formats (table, csv, json, parquet)
-- [x] Timing statistics (`5 rows returned in 0.012s`)
-- [ ] Progress bar for long-running queries
-- [ ] `.schema <table>` command for quick schema view
 - [ ] Pager support for large results (less/more)
 
 ### Performance
@@ -321,7 +420,7 @@ src/
 - [ ] Expose Zarr attributes in Arrow schema metadata
 
 ### Cloud & Storage
-- [ ] Read from cloud storage (S3/GCS/Azure) via `object_store` crate
+- [x] Read from cloud storage (GCS/S3) via `object_store` crate
 - [ ] HTTP/HTTPS Zarr backend
 - [ ] Async chunk prefetching
 - [ ] LRU cache for frequently accessed chunks
