@@ -19,7 +19,6 @@
 // functions are used by every example
 #![allow(dead_code)]
 
-use std::collections::HashMap;
 use std::sync::Arc;
 
 use datafusion::error::Result;
@@ -68,10 +67,7 @@ pub fn create_local_context() -> SessionContext {
 pub fn create_remote_context() -> SessionContext {
     let state = SessionStateBuilder::new()
         .with_default_features()
-        .with_table_factories(HashMap::from([(
-            "ZARR".to_string(),
-            Arc::new(ZarrTableFactory) as _,
-        )]))
+        .with_table_factory("ZARR".to_string(), Arc::new(ZarrTableFactory) as _)
         .with_optimizer_rule(Arc::new(CountStatisticsRule::new()))
         .with_optimizer_rule(Arc::new(MinMaxStatisticsRule::new()))
         .build();
