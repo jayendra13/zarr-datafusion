@@ -32,10 +32,10 @@ pub fn register_zarr_functions(ctx: &SessionContext) {
 ///
 /// Returns columns:
 /// - column_name: Name of the column
-/// - data_type: Arrow data type
-/// - is_nullable: YES or NO
 /// - type: "coord", "data_var", or empty for non-Zarr tables
-/// - dimension: Dimension name for coords, "[dim1, dim2, ...]" for data vars
+/// - dimension: Dimension name for coords, "(dim1: size1, ...)" for data vars
+/// - size: Number of elements
+/// - chunks: Chunk sizes as "(c1, c2, ...)"
 pub struct ZarrDescribeFunc {
     ctx: SessionContext,
 }
@@ -66,10 +66,11 @@ impl TableFunctionImpl for ZarrDescribeFunc {
 
         // Try to get Zarr-specific metadata
         let zarr_table = provider.as_any().downcast_ref::<ZarrTable>();
+        let is_zarr_table = zarr_table.is_some();
         let store_meta = zarr_table.and_then(|t| t.store_meta());
 
-        // Build the extended describe RecordBatch
-        let batch = build_describe_batch(&schema, store_meta)?;
+        // Build the describe RecordBatch (with Zarr-specific columns only for Zarr tables)
+        let batch = build_describe_batch(&schema, store_meta, is_zarr_table)?;
 
         // Return as MemTable
         Ok(Arc::new(MemTable::try_new(
@@ -91,7 +92,44 @@ fn extract_string_literal(expr: &Expr) -> Result<String> {
 }
 
 /// Build a RecordBatch with extended describe information
-fn build_describe_batch(schema: &SchemaRef, meta: Option<&ZarrStoreMeta>) -> Result<RecordBatch> {
+/// For Zarr tables, includes type, dimension, size, chunks columns
+/// For non-Zarr tables, only includes column_name, data_type, is_nullable
+fn build_describe_batch(
+    schema: &SchemaRef,
+    meta: Option<&ZarrStoreMeta>,
+    is_zarr_table: bool,
+) -> Result<RecordBatch> {
+    // Build basic column arrays (common to all tables)
+    let mut column_names: Vec<String> = Vec::new();
+    let mut data_types: Vec<String> = Vec::new();
+    let mut is_nullables: Vec<String> = Vec::new();
+
+    for field in schema.fields() {
+        column_names.push(field.name().clone());
+        data_types.push(format!("{:?}", field.data_type()));
+        is_nullables.push(if field.is_nullable() { "YES" } else { "NO" }.to_string());
+    }
+
+    let column_name_array = Arc::new(StringArray::from(column_names));
+    let data_type_array = Arc::new(StringArray::from(data_types));
+    let is_nullable_array = Arc::new(StringArray::from(is_nullables));
+
+    // For non-Zarr tables, return only basic columns
+    if !is_zarr_table {
+        let output_schema = Arc::new(Schema::new(vec![
+            Field::new("column_name", DataType::Utf8, false),
+            Field::new("data_type", DataType::Utf8, false),
+            Field::new("is_nullable", DataType::Utf8, false),
+        ]));
+
+        return RecordBatch::try_new(
+            output_schema,
+            vec![column_name_array, data_type_array, is_nullable_array],
+        )
+        .map_err(|e| DataFusionError::ArrowError(Box::new(e), None));
+    }
+
+    // For Zarr tables, include extended metadata columns
     use std::collections::HashMap;
 
     // Build lookup maps from metadata
@@ -117,10 +155,7 @@ fn build_describe_batch(schema: &SchemaRef, meta: Option<&ZarrStoreMeta>) -> Res
         })
         .unwrap_or_default();
 
-    // Build arrays for each column
-    let mut column_names: Vec<String> = Vec::new();
-    let mut data_types: Vec<String> = Vec::new();
-    let mut is_nullables: Vec<String> = Vec::new();
+    // Build Zarr-specific arrays
     let mut types: Vec<Option<String>> = Vec::new();
     let mut dimensions: Vec<Option<String>> = Vec::new();
     let mut sizes: Vec<Option<String>> = Vec::new();
@@ -128,9 +163,6 @@ fn build_describe_batch(schema: &SchemaRef, meta: Option<&ZarrStoreMeta>) -> Res
 
     for field in schema.fields() {
         let name = field.name();
-        column_names.push(name.clone());
-        data_types.push(format!("{:?}", field.data_type()));
-        is_nullables.push(if field.is_nullable() { "YES" } else { "NO" }.to_string());
 
         // Determine type, dimension, size, and chunks based on Zarr metadata
         if let Some(coord) = coord_map.get(name.as_str()) {
@@ -164,7 +196,7 @@ fn build_describe_batch(schema: &SchemaRef, meta: Option<&ZarrStoreMeta>) -> Res
                 )
             }));
         } else {
-            // No Zarr metadata or unknown
+            // No Zarr metadata or unknown column
             types.push(None);
             dimensions.push(None);
             sizes.push(None);
@@ -172,16 +204,13 @@ fn build_describe_batch(schema: &SchemaRef, meta: Option<&ZarrStoreMeta>) -> Res
         }
     }
 
-    // Create Arrow arrays
-    let column_name_array = Arc::new(StringArray::from(column_names));
-    let data_type_array = Arc::new(StringArray::from(data_types));
-    let is_nullable_array = Arc::new(StringArray::from(is_nullables));
+    // Create Zarr-specific Arrow arrays
     let type_array = Arc::new(StringArray::from(types));
     let dimension_array = Arc::new(StringArray::from(dimensions));
     let size_array = Arc::new(StringArray::from(sizes));
     let chunks_array = Arc::new(StringArray::from(chunks_col));
 
-    // Create schema for output
+    // Create full schema for Zarr tables
     let output_schema = Arc::new(Schema::new(vec![
         Field::new("column_name", DataType::Utf8, false),
         Field::new("data_type", DataType::Utf8, false),

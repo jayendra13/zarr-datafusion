@@ -1,6 +1,5 @@
 mod highlight;
 
-use std::collections::HashMap;
 use std::io::{self, IsTerminal, Write};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -56,10 +55,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let state = SessionStateBuilder::new()
         .with_default_features()
         .with_config(config)
-        .with_table_factories(HashMap::from([(
-            "ZARR".to_string(),
-            Arc::new(ZarrTableFactory) as _,
-        )]))
+        .with_table_factory("ZARR".to_string(), Arc::new(ZarrTableFactory) as _)
         .with_optimizer_rule(Arc::new(CountStatisticsRule::new()))
         .with_optimizer_rule(Arc::new(MinMaxStatisticsRule::new()))
         .build();
