@@ -68,6 +68,9 @@ jobs:
     container:
       image: xd009642/tarpaulin:develop-nightly
       options: --security-opt seccomp=unconfined
+    env:
+      # Limit parallel jobs to reduce memory usage during linking
+      CARGO_BUILD_JOBS: 2
     steps:
       - uses: actions/checkout@v4
 
@@ -78,7 +81,7 @@ jobs:
         run: ./scripts/generate_data.sh
 
       - name: Run coverage
-        run: cargo +nightly tarpaulin --verbose --workspace --timeout 300 --out xml
+        run: cargo +nightly tarpaulin --verbose --workspace --timeout 300 --out xml --skip-clean
 
       - name: Upload to Codecov
         uses: codecov/codecov-action@v5
