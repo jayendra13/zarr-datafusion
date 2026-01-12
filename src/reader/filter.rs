@@ -1333,7 +1333,8 @@ mod tests {
             "longitude".to_string(),
         ]);
 
-        let result = get_variable_coords(&var_shape, var_dims.as_deref(), &coord_names, &coord_sizes);
+        let result =
+            get_variable_coords(&var_shape, var_dims.as_deref(), &coord_names, &coord_sizes);
 
         // Should return indices for time, latitude, longitude (skipping level)
         assert_eq!(result, vec![0, 2, 3]);
