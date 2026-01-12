@@ -29,11 +29,12 @@
 //! └── humidity/    shape: [7, 10, 10]  → data variable (time × lat × lon)
 //! ```
 
-use arrow::datatypes::{Field, Schema};
+use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
 use std::fs;
 use std::path::Path;
 use tracing::{debug, info, instrument};
 
+use super::cf_time::CFTimeAttrs;
 use super::dtype::{parse_v2_dtype, zarr_dtype_to_arrow, zarr_dtype_to_arrow_dictionary};
 
 /// Zarr format version
@@ -86,6 +87,9 @@ pub struct ZarrArrayMeta {
     /// Min/max bounds for coordinate arrays (None for data variables)
     /// Stored as (min, max) in f64 for simplicity
     pub coord_min_max: Option<(f64, f64)>,
+    /// CF (Climate and Forecast) time attributes for time coordinates
+    /// Contains units like "hours since 1900-01-01" and optional calendar
+    pub cf_time_attrs: Option<CFTimeAttrs>,
 }
 
 impl ZarrArrayMeta {
@@ -159,12 +163,26 @@ fn discover_arrays_v2(
 
                 let data_type = parse_v2_dtype(dtype_raw);
 
+                // Read .zattrs for CF time attributes
+                let cf_time_attrs = {
+                    let zattrs = path.join(".zattrs");
+                    if zattrs.exists() {
+                        fs::read_to_string(&zattrs)
+                            .ok()
+                            .and_then(|content| serde_json::from_str(&content).ok())
+                            .and_then(|attrs: serde_json::Value| parse_cf_time_from_attrs(&attrs))
+                    } else {
+                        None
+                    }
+                };
+
                 arrays.push(ZarrArrayMeta {
                     name,
                     data_type,
                     shape,
                     chunks,
                     coord_min_max: None, // Will be computed in separate_and_sort_arrays
+                    cf_time_attrs,
                 });
             }
         }
@@ -217,12 +235,16 @@ fn discover_arrays_v3(
                         .unwrap_or("float64")
                         .to_string();
 
+                    // V3 stores attributes in zarr.json under "attributes" key
+                    let cf_time_attrs = meta.get("attributes").and_then(parse_cf_time_from_attrs);
+
                     arrays.push(ZarrArrayMeta {
                         name,
                         data_type,
                         shape,
                         chunks,
                         coord_min_max: None, // Will be computed in separate_and_sort_arrays
+                        cf_time_attrs,
                     });
                 }
             }
@@ -438,12 +460,25 @@ pub fn infer_schema_with_meta(
     let mut fields: Vec<Field> = Vec::new();
 
     // Coordinates use Dictionary encoding for memory efficiency
+    // CF time coordinates use Dictionary with Timestamp values
     for coord in &meta.coords {
-        fields.push(Field::new(
-            &coord.name,
-            zarr_dtype_to_arrow_dictionary(&coord.data_type),
-            false,
-        ));
+        let data_type = if coord
+            .cf_time_attrs
+            .as_ref()
+            .is_some_and(|a| a.is_time_coordinate())
+        {
+            // CF time coordinate: Dictionary with Timestamp(Microsecond, UTC) values
+            DataType::Dictionary(
+                Box::new(DataType::Int16),
+                Box::new(DataType::Timestamp(
+                    TimeUnit::Microsecond,
+                    Some("UTC".into()),
+                )),
+            )
+        } else {
+            zarr_dtype_to_arrow_dictionary(&coord.data_type)
+        };
+        fields.push(Field::new(&coord.name, data_type, false));
     }
 
     // Data variables use regular arrays
@@ -459,6 +494,25 @@ pub fn infer_schema_with_meta(
     // Instead of storing metadata in the schema, we return ZarrStoreMeta which contains
     // all dimension info. The CLI can access this via the ZarrTable struct.
     Ok((Schema::new(fields), meta))
+}
+
+/// Parse CF time attributes from a JSON attributes object
+///
+/// Looks for "units" attribute containing " since " pattern (e.g., "hours since 1900-01-01")
+/// and optional "calendar" attribute.
+fn parse_cf_time_from_attrs(attrs: &serde_json::Value) -> Option<CFTimeAttrs> {
+    let units = attrs.get("units")?.as_str()?;
+    // Only treat as CF time if it contains " since " pattern
+    if !units.contains(" since ") {
+        return None;
+    }
+    Some(CFTimeAttrs::new(
+        units.to_string(),
+        attrs
+            .get("calendar")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string()),
+    ))
 }
 
 // =============================================================================
@@ -659,6 +713,10 @@ async fn discover_arrays_from_zmetadata_async(
             let dtype_raw = value.get("dtype").and_then(|v| v.as_str()).unwrap_or("<f8");
             let data_type = parse_v2_dtype(dtype_raw);
 
+            // Look for corresponding .zattrs in consolidated metadata
+            let zattrs_key = format!("{}/.zattrs", name);
+            let cf_time_attrs = metadata.get(&zattrs_key).and_then(parse_cf_time_from_attrs);
+
             debug!(name = %name, shape = ?shape, chunks = ?chunks, dtype = %data_type, "Found array in .zmetadata");
 
             arrays.push(ZarrArrayMeta {
@@ -667,6 +725,7 @@ async fn discover_arrays_from_zmetadata_async(
                 shape,
                 chunks,
                 coord_min_max: None,
+                cf_time_attrs,
             });
         }
     }
@@ -734,12 +793,24 @@ async fn discover_arrays_v2_async(
             let dtype_raw = meta.get("dtype").and_then(|v| v.as_str()).unwrap_or("<f8");
             let data_type = parse_v2_dtype(dtype_raw);
 
+            // Read .zattrs for CF time attributes
+            let zattrs_path = format!("{}/.zattrs", subdir_str);
+            let cf_time_attrs =
+                if let Ok(attrs_content) = store_get_string(store, &zattrs_path).await {
+                    serde_json::from_str(&attrs_content)
+                        .ok()
+                        .and_then(|attrs: serde_json::Value| parse_cf_time_from_attrs(&attrs))
+                } else {
+                    None
+                };
+
             arrays.push(ZarrArrayMeta {
                 name,
                 data_type,
                 shape,
                 chunks,
                 coord_min_max: None, // Not computed for async/remote stores yet
+                cf_time_attrs,
             });
         }
     }
@@ -806,12 +877,16 @@ async fn discover_arrays_v3_async(
                     .unwrap_or("float64")
                     .to_string();
 
+                // V3 stores attributes in zarr.json under "attributes" key
+                let cf_time_attrs = meta.get("attributes").and_then(parse_cf_time_from_attrs);
+
                 arrays.push(ZarrArrayMeta {
                     name,
                     data_type,
                     shape,
                     chunks,
                     coord_min_max: None, // Not computed for async/remote stores yet
+                    cf_time_attrs,
                 });
             }
         }
@@ -890,12 +965,25 @@ pub async fn infer_schema_with_meta_async(
     let mut fields: Vec<Field> = Vec::new();
 
     // Coordinates use Dictionary encoding for memory efficiency
+    // CF time coordinates use Dictionary with Timestamp values
     for coord in &meta.coords {
-        fields.push(Field::new(
-            &coord.name,
-            zarr_dtype_to_arrow_dictionary(&coord.data_type),
-            false,
-        ));
+        let data_type = if coord
+            .cf_time_attrs
+            .as_ref()
+            .is_some_and(|a| a.is_time_coordinate())
+        {
+            // CF time coordinate: Dictionary with Timestamp(Microsecond, UTC) values
+            DataType::Dictionary(
+                Box::new(DataType::Int16),
+                Box::new(DataType::Timestamp(
+                    TimeUnit::Microsecond,
+                    Some("UTC".into()),
+                )),
+            )
+        } else {
+            zarr_dtype_to_arrow_dictionary(&coord.data_type)
+        };
+        fields.push(Field::new(&coord.name, data_type, false));
     }
 
     // Data variables use regular arrays
@@ -961,6 +1049,7 @@ mod tests {
             shape: vec![10],
             chunks: Some(vec![10]),
             coord_min_max: Some((0.0, 90.0)),
+            cf_time_attrs: None,
         };
         assert!(coord.is_coordinate());
 
@@ -971,6 +1060,7 @@ mod tests {
             shape: vec![10, 10],
             chunks: Some(vec![5, 5]),
             coord_min_max: None,
+            cf_time_attrs: None,
         };
         assert!(!data_2d.is_coordinate());
 
@@ -980,6 +1070,7 @@ mod tests {
             shape: vec![7, 10, 10],
             chunks: Some(vec![7, 5, 5]),
             coord_min_max: None,
+            cf_time_attrs: None,
         };
         assert!(!data_3d.is_coordinate());
     }

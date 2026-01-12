@@ -3,17 +3,23 @@
 //! Provides utilities for building DictionaryArrays from coordinate values,
 //! calculating subset ranges for limit optimization, and building coordinate keys.
 
-use arrow::array::{ArrayRef, DictionaryArray, Float32Array, Float64Array, Int16Array, Int64Array};
+use arrow::array::{
+    ArrayRef, DictionaryArray, Float32Array, Float64Array, Int16Array, Int64Array,
+    TimestampMicrosecondArray,
+};
 use arrow::datatypes::Int16Type;
 use std::sync::Arc;
 use tracing::debug;
 
-/// Coordinate values that can be either i64 or f32/f64
+/// Coordinate values that can be either i64, f32/f64, or timestamps
 #[derive(Debug)]
 pub enum CoordValues {
     Int64(Vec<i64>),
     Float32(Vec<f32>),
     Float64(Vec<f64>),
+    /// Timestamps as microseconds since Unix epoch (1970-01-01 00:00:00 UTC)
+    /// Used for CF time coordinates decoded from "hours/days/seconds since <date>"
+    TimestampMicros(Vec<i64>),
 }
 
 impl CoordValues {
@@ -22,6 +28,7 @@ impl CoordValues {
             CoordValues::Int64(v) => v.len(),
             CoordValues::Float32(v) => v.len(),
             CoordValues::Float64(v) => v.len(),
+            CoordValues::TimestampMicros(v) => v.len(),
         }
     }
 
@@ -52,6 +59,14 @@ impl CoordValues {
             CoordValues::Float64(v) if v.len() > 2 => {
                 format!(
                     "[{}, ..., {}] (len={})",
+                    v.first().unwrap(),
+                    v.last().unwrap(),
+                    v.len()
+                )
+            }
+            CoordValues::TimestampMicros(v) if v.len() > 2 => {
+                format!(
+                    "[{}, ..., {}] (len={}, timestamps)",
                     v.first().unwrap(),
                     v.last().unwrap(),
                     v.len()
@@ -97,6 +112,15 @@ pub fn create_coord_dictionary_typed(
         }
         CoordValues::Float64(vals) => {
             let values_array = Float64Array::from(vals.clone());
+            Arc::new(DictionaryArray::<Int16Type>::new(
+                keys_array,
+                Arc::new(values_array),
+            ))
+        }
+        CoordValues::TimestampMicros(vals) => {
+            // Create TimestampMicrosecondArray with UTC timezone
+            let values_array =
+                TimestampMicrosecondArray::from(vals.clone()).with_timezone("UTC".to_string());
             Arc::new(DictionaryArray::<Int16Type>::new(
                 keys_array,
                 Arc::new(values_array),

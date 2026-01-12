@@ -242,6 +242,10 @@ pub enum CoordValuesRef<'a> {
     Int64(&'a [i64]),
     Float32(&'a [f32]),
     Float64(&'a [f64]),
+    /// Timestamps as microseconds since Unix epoch
+    /// Note: Filter pushdown for timestamps is limited - we compare raw microsecond values.
+    /// Full timestamp string parsing (e.g., `time = '2020-01-01'`) is not yet supported.
+    TimestampMicros(&'a [i64]),
 }
 
 impl<'a> CoordValuesRef<'a> {
@@ -250,6 +254,7 @@ impl<'a> CoordValuesRef<'a> {
             CoordValuesRef::Int64(v) => v.len(),
             CoordValuesRef::Float32(v) => v.len(),
             CoordValuesRef::Float64(v) => v.len(),
+            CoordValuesRef::TimestampMicros(v) => v.len(),
         }
     }
 
@@ -290,6 +295,14 @@ fn find_value_index(values: &CoordValuesRef<'_>, target: &ScalarValue) -> Option
         (CoordValuesRef::Float64(vals), ScalarValue::Int64(Some(v))) => {
             let vf = *v as f64;
             vals.iter().position(|x| (x - vf).abs() < f64::EPSILON)
+        }
+        // Timestamp comparisons (microseconds since Unix epoch)
+        (CoordValuesRef::TimestampMicros(vals), ScalarValue::TimestampMicrosecond(Some(v), _)) => {
+            vals.iter().position(|x| x == v)
+        }
+        (CoordValuesRef::TimestampMicros(vals), ScalarValue::Int64(Some(v))) => {
+            // Allow comparing timestamps with raw i64 microsecond values
+            vals.iter().position(|x| x == v)
         }
         _ => {
             debug!(
