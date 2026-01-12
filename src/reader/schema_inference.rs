@@ -90,6 +90,10 @@ pub struct ZarrArrayMeta {
     /// CF (Climate and Forecast) time attributes for time coordinates
     /// Contains units like "hours since 1900-01-01" and optional calendar
     pub cf_time_attrs: Option<CFTimeAttrs>,
+    /// Dimension names for this variable (e.g., ["time", "latitude", "longitude"])
+    /// Parsed from `_ARRAY_DIMENSIONS` (xarray/CF convention) or inferred from shape.
+    /// None means dimension names are unknown/not yet inferred.
+    pub dimensions: Option<Vec<String>>,
 }
 
 impl ZarrArrayMeta {
@@ -163,16 +167,23 @@ fn discover_arrays_v2(
 
                 let data_type = parse_v2_dtype(dtype_raw);
 
-                // Read .zattrs for CF time attributes
-                let cf_time_attrs = {
+                // Read .zattrs for CF time attributes and _ARRAY_DIMENSIONS
+                let (cf_time_attrs, dimensions) = {
                     let zattrs = path.join(".zattrs");
                     if zattrs.exists() {
-                        fs::read_to_string(&zattrs)
-                            .ok()
-                            .and_then(|content| serde_json::from_str(&content).ok())
-                            .and_then(|attrs: serde_json::Value| parse_cf_time_from_attrs(&attrs))
+                        if let Ok(content) = fs::read_to_string(&zattrs) {
+                            if let Ok(attrs) = serde_json::from_str::<serde_json::Value>(&content) {
+                                let cf = parse_cf_time_from_attrs(&attrs);
+                                let dims = parse_array_dimensions(&attrs);
+                                (cf, dims)
+                            } else {
+                                (None, None)
+                            }
+                        } else {
+                            (None, None)
+                        }
                     } else {
-                        None
+                        (None, None)
                     }
                 };
 
@@ -183,6 +194,7 @@ fn discover_arrays_v2(
                     chunks,
                     coord_min_max: None, // Will be computed in separate_and_sort_arrays
                     cf_time_attrs,
+                    dimensions,
                 });
             }
         }
@@ -237,6 +249,7 @@ fn discover_arrays_v3(
 
                     // V3 stores attributes in zarr.json under "attributes" key
                     let cf_time_attrs = meta.get("attributes").and_then(parse_cf_time_from_attrs);
+                    let dimensions = meta.get("attributes").and_then(parse_array_dimensions);
 
                     arrays.push(ZarrArrayMeta {
                         name,
@@ -245,6 +258,7 @@ fn discover_arrays_v3(
                         chunks,
                         coord_min_max: None, // Will be computed in separate_and_sort_arrays
                         cf_time_attrs,
+                        dimensions,
                     });
                 }
             }
@@ -515,6 +529,21 @@ fn parse_cf_time_from_attrs(attrs: &serde_json::Value) -> Option<CFTimeAttrs> {
     ))
 }
 
+/// Parse `_ARRAY_DIMENSIONS` from attributes (xarray/CF convention)
+///
+/// This is the standard way xarray encodes dimension names in Zarr stores.
+/// Example: `{"_ARRAY_DIMENSIONS": ["time", "latitude", "longitude"]}`
+fn parse_array_dimensions(attrs: &serde_json::Value) -> Option<Vec<String>> {
+    attrs
+        .get("_ARRAY_DIMENSIONS")
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                .collect()
+        })
+}
+
 // =============================================================================
 // Async versions for remote object stores
 // =============================================================================
@@ -715,9 +744,11 @@ async fn discover_arrays_from_zmetadata_async(
 
             // Look for corresponding .zattrs in consolidated metadata
             let zattrs_key = format!("{}/.zattrs", name);
-            let cf_time_attrs = metadata.get(&zattrs_key).and_then(parse_cf_time_from_attrs);
+            let zattrs = metadata.get(&zattrs_key);
+            let cf_time_attrs = zattrs.and_then(parse_cf_time_from_attrs);
+            let dimensions = zattrs.and_then(parse_array_dimensions);
 
-            debug!(name = %name, shape = ?shape, chunks = ?chunks, dtype = %data_type, "Found array in .zmetadata");
+            debug!(name = %name, shape = ?shape, chunks = ?chunks, dtype = %data_type, dims = ?dimensions, "Found array in .zmetadata");
 
             arrays.push(ZarrArrayMeta {
                 name,
@@ -726,6 +757,7 @@ async fn discover_arrays_from_zmetadata_async(
                 chunks,
                 coord_min_max: None,
                 cf_time_attrs,
+                dimensions,
             });
         }
     }
@@ -793,15 +825,20 @@ async fn discover_arrays_v2_async(
             let dtype_raw = meta.get("dtype").and_then(|v| v.as_str()).unwrap_or("<f8");
             let data_type = parse_v2_dtype(dtype_raw);
 
-            // Read .zattrs for CF time attributes
+            // Read .zattrs for CF time attributes and _ARRAY_DIMENSIONS
             let zattrs_path = format!("{}/.zattrs", subdir_str);
-            let cf_time_attrs =
+            let (cf_time_attrs, dimensions) =
                 if let Ok(attrs_content) = store_get_string(store, &zattrs_path).await {
-                    serde_json::from_str(&attrs_content)
-                        .ok()
-                        .and_then(|attrs: serde_json::Value| parse_cf_time_from_attrs(&attrs))
+                    if let Ok(attrs) = serde_json::from_str::<serde_json::Value>(&attrs_content) {
+                        (
+                            parse_cf_time_from_attrs(&attrs),
+                            parse_array_dimensions(&attrs),
+                        )
+                    } else {
+                        (None, None)
+                    }
                 } else {
-                    None
+                    (None, None)
                 };
 
             arrays.push(ZarrArrayMeta {
@@ -811,6 +848,7 @@ async fn discover_arrays_v2_async(
                 chunks,
                 coord_min_max: None, // Not computed for async/remote stores yet
                 cf_time_attrs,
+                dimensions,
             });
         }
     }
@@ -879,6 +917,7 @@ async fn discover_arrays_v3_async(
 
                 // V3 stores attributes in zarr.json under "attributes" key
                 let cf_time_attrs = meta.get("attributes").and_then(parse_cf_time_from_attrs);
+                let dimensions = meta.get("attributes").and_then(parse_array_dimensions);
 
                 arrays.push(ZarrArrayMeta {
                     name,
@@ -887,6 +926,7 @@ async fn discover_arrays_v3_async(
                     chunks,
                     coord_min_max: None, // Not computed for async/remote stores yet
                     cf_time_attrs,
+                    dimensions,
                 });
             }
         }
@@ -1050,6 +1090,7 @@ mod tests {
             chunks: Some(vec![10]),
             coord_min_max: Some((0.0, 90.0)),
             cf_time_attrs: None,
+            dimensions: None,
         };
         assert!(coord.is_coordinate());
 
@@ -1061,6 +1102,7 @@ mod tests {
             chunks: Some(vec![5, 5]),
             coord_min_max: None,
             cf_time_attrs: None,
+            dimensions: Some(vec!["lat".to_string(), "lon".to_string()]),
         };
         assert!(!data_2d.is_coordinate());
 
@@ -1071,6 +1113,11 @@ mod tests {
             chunks: Some(vec![7, 5, 5]),
             coord_min_max: None,
             cf_time_attrs: None,
+            dimensions: Some(vec![
+                "time".to_string(),
+                "lat".to_string(),
+                "lon".to_string(),
+            ]),
         };
         assert!(!data_3d.is_coordinate());
     }

@@ -23,8 +23,8 @@ use super::coord::{
     calculate_coord_limits, calculate_limited_subset, create_coord_dictionary_typed, CoordValues,
 };
 use super::filter::{
-    calculate_coord_ranges, calculate_filtered_rows, coord_ranges_to_array_ranges, CoordFilters,
-    CoordValuesRef,
+    calculate_coord_ranges, calculate_filtered_rows, determine_effective_coords,
+    match_ranges_to_data_var, CoordFilters, CoordValuesRef,
 };
 use super::schema_inference::discover_arrays;
 use super::stats::SharedIoStats;
@@ -374,15 +374,58 @@ pub fn read_zarr(
         );
     }
 
-    // Apply limit (after filter reduction)
-    let final_rows = limit
-        .map(|l| l.min(effective_rows))
-        .unwrap_or(effective_rows);
-    if let Some(limit) = limit {
-        if limit < effective_rows {
-            let reduction_pct = 100.0 * (1.0 - (final_rows as f64 / effective_rows as f64));
+    // ==========================================================================
+    // Mixed-dimensionality handling: determine which coordinates are actually
+    // needed for the projected data variables
+    // ==========================================================================
+    let projected_var_names: Vec<&str> = projected_indices
+        .iter()
+        .filter_map(|&i| {
+            let name = schema.field(i).name().as_str();
+            if coord_names.contains(&name.to_string()) {
+                None // Skip coordinates
+            } else {
+                Some(name)
+            }
+        })
+        .collect();
+
+    // Determine effective coordinates for the projected variables
+    let effective_coord_indices = determine_effective_coords(
+        &projected_var_names,
+        &store_meta.data_vars,
+        &coord_names,
+        &coord_sizes,
+    )
+    .map_err(DataFusionError::Plan)?;
+
+    // Recalculate effective sizes and rows for the relevant coordinates only
+    let (query_coord_sizes, query_rows): (Vec<usize>, usize) =
+        if effective_coord_indices.len() < coord_sizes.len() {
+            let sizes: Vec<usize> = effective_coord_indices
+                .iter()
+                .map(|&i| effective_coord_sizes[i])
+                .collect();
+            let rows: usize = sizes.iter().product();
             info!(
-                effective_rows,
+                all_coords = coord_sizes.len(),
+                effective_coords = effective_coord_indices.len(),
+                query_rows = rows,
+                original_rows = effective_rows,
+                "Using reduced coordinate set for variable dimensionality"
+            );
+            (sizes, rows)
+        } else {
+            (effective_coord_sizes.clone(), effective_rows)
+        };
+
+    // Apply limit (after filter and dimensionality reduction)
+    let final_rows = limit.map(|l| l.min(query_rows)).unwrap_or(query_rows);
+    if let Some(limit) = limit {
+        if limit < query_rows {
+            let reduction_pct = 100.0 * (1.0 - (final_rows as f64 / query_rows as f64));
+            info!(
+                query_rows,
                 final_rows,
                 reduction_pct = format!("{:.2}%", reduction_pct),
                 "Limit optimization"
@@ -398,22 +441,37 @@ pub fn read_zarr(
 
         // Check if this is a coordinate
         if let Some(coord_idx) = coord_names.iter().position(|n| n == field_name) {
+            // Skip coordinates not relevant to the projected variables
+            if !effective_coord_indices.contains(&coord_idx) {
+                debug!(field = %field_name, "Skipping coordinate not used by projected variables");
+                continue;
+            }
+
+            // Find position of this coordinate in the effective set
+            let query_coord_idx = effective_coord_indices
+                .iter()
+                .position(|&i| i == coord_idx)
+                .unwrap();
+
             // Create DictionaryArray for coordinate (memory efficient)
             let dict_array = create_coord_dictionary_typed(
                 &filtered_coord_values[coord_idx],
-                coord_idx,
-                &effective_coord_sizes,
-                effective_rows,
+                query_coord_idx,
+                &query_coord_sizes,
+                final_rows,
             );
             result_arrays.push(dict_array);
         } else {
             // Data variable - read filtered subset
             let read_start = Instant::now();
             let arr = Array::open(store.clone(), &format!("/{}", field_name)).map_err(zarr_err)?;
+            let data_var_shape = arr.shape();
 
             // Calculate the subset to read based on coordinate filters
             let subset = if let Some(ref ranges) = coord_ranges {
-                let array_ranges = coord_ranges_to_array_ranges(ranges);
+                // Match coordinate ranges to this data variable's actual dimensions
+                let array_ranges = match_ranges_to_data_var(&coord_sizes, ranges, data_var_shape)
+                    .unwrap_or_else(|| data_var_shape.iter().map(|&s| 0..s).collect());
                 ArraySubset::new_with_ranges(&array_ranges)
             } else {
                 ArraySubset::new_with_shape(arr.shape().to_vec())
@@ -430,16 +488,26 @@ pub fn read_zarr(
         }
     }
 
-    let projected_schema = Arc::new(Schema::new(
-        projected_indices
-            .iter()
-            .map(|&i| schema.field(i).clone())
-            .collect::<Vec<_>>(),
-    ));
+    // Build projected schema, excluding coordinates that were skipped
+    let projected_fields: Vec<_> = projected_indices
+        .iter()
+        .filter_map(|&i| {
+            let field = schema.field(i);
+            let field_name = field.name();
+            // Check if this is a coordinate that was skipped
+            if let Some(coord_idx) = coord_names.iter().position(|n| n == field_name) {
+                if !effective_coord_indices.contains(&coord_idx) {
+                    return None; // Skip coordinates not in effective set
+                }
+            }
+            Some(field.clone())
+        })
+        .collect();
+    let projected_schema = Arc::new(Schema::new(projected_fields));
 
     // Apply limit if specified (slice the already-filtered arrays)
     let result_arrays = if let Some(limit) = limit {
-        let limit = limit.min(effective_rows);
+        let limit = limit.min(query_rows);
         result_arrays
             .into_iter()
             .map(|arr| arr.slice(0, limit))
@@ -712,6 +780,54 @@ pub async fn read_zarr_async(
         )
     }
 
+    // ==========================================================================
+    // Mixed-dimensionality handling: determine which coordinates are actually
+    // needed for the projected data variables
+    // ==========================================================================
+    let projected_var_names: Vec<&str> = projected_indices
+        .iter()
+        .filter_map(|&i| {
+            let name = schema.field(i).name().as_str();
+            if coord_names.contains(&name.to_string()) {
+                None // Skip coordinates
+            } else {
+                Some(name)
+            }
+        })
+        .collect();
+
+    // Determine effective coordinates for the projected variables
+    let effective_coord_indices = determine_effective_coords(
+        &projected_var_names,
+        &store_meta.data_vars,
+        &coord_names,
+        &coord_sizes,
+    )
+    .map_err(DataFusionError::Plan)?;
+
+    // Recalculate effective sizes and rows for the relevant coordinates only
+    let (query_coord_sizes, query_rows): (Vec<usize>, usize) =
+        if effective_coord_indices.len() < coord_sizes.len() {
+            let sizes: Vec<usize> = effective_coord_indices
+                .iter()
+                .map(|&i| effective_coord_sizes[i])
+                .collect();
+            let rows: usize = sizes.iter().product();
+            info!(
+                all_coords = coord_sizes.len(),
+                effective_coords = effective_coord_indices.len(),
+                query_rows = rows,
+                original_rows = rows_after_filter,
+                "Using reduced coordinate set for variable dimensionality"
+            );
+            (sizes, rows)
+        } else {
+            (effective_coord_sizes.clone(), rows_after_filter)
+        };
+
+    // Recalculate effective_rows with limit applied to query_rows
+    let effective_rows = limit.map(|l| l.min(query_rows)).unwrap_or(query_rows);
+
     let mut result_arrays: Vec<ArrayRef> = Vec::new();
 
     for idx in &projected_indices {
@@ -720,12 +836,25 @@ pub async fn read_zarr_async(
 
         // Check if this is a coordinate
         if let Some(coord_idx) = coord_names.iter().position(|n| n == field_name) {
-            debug!(field = %field_name, "Building dictionary array for coordinate");
+            // Skip coordinates not relevant to the projected variables
+            if !effective_coord_indices.contains(&coord_idx) {
+                debug!(field = %field_name, "Skipping coordinate not used by projected variables");
+                continue;
+            }
+
+            // Find position of this coordinate in the effective set
+            let query_coord_idx = effective_coord_indices
+                .iter()
+                .position(|&i| i == coord_idx)
+                .unwrap();
+
+            debug!(field = %field_name, coord_idx, query_coord_idx, "Building dictionary array for coordinate");
             // Create DictionaryArray for coordinate (memory efficient)
+            // Use query_coord_idx for position within the effective coordinate set
             let dict_array = create_coord_dictionary_typed(
                 &filtered_coord_values[coord_idx],
-                coord_idx,
-                &effective_coord_sizes,
+                query_coord_idx,
+                &query_coord_sizes,
                 effective_rows,
             );
             result_arrays.push(dict_array);
@@ -743,8 +872,20 @@ pub async fn read_zarr_async(
 
             // Calculate the subset to read based on coordinate filters
             let full_elements: u64 = arr.shape().iter().product();
+            let data_var_shape = arr.shape();
             let subset = if let Some(ref ranges) = coord_ranges {
-                let array_ranges = coord_ranges_to_array_ranges(ranges);
+                // Match coordinate ranges to this data variable's actual dimensions
+                // (handles variables with fewer dimensions than total coordinates)
+                let array_ranges = match_ranges_to_data_var(&coord_sizes, ranges, data_var_shape)
+                    .unwrap_or_else(|| {
+                        debug!(
+                            field = %field_name,
+                            coord_dims = ranges.len(),
+                            var_dims = data_var_shape.len(),
+                            "Dimension mismatch, falling back to full array"
+                        );
+                        data_var_shape.iter().map(|&s| 0..s).collect()
+                    });
                 let filtered_subset = ArraySubset::new_with_ranges(&array_ranges);
                 let subset_elements = filtered_subset.num_elements();
                 let reduction_pct = 100.0 * (1.0 - (subset_elements as f64 / full_elements as f64));
@@ -752,6 +893,7 @@ pub async fn read_zarr_async(
                     field = %field_name,
                     subset_elements,
                     full_elements,
+                    var_dims = data_var_shape.len(),
                     reduction_pct = format!("{:.2}%", reduction_pct),
                     "Filter-based data subset optimization"
                 );
@@ -786,20 +928,28 @@ pub async fn read_zarr_async(
         }
     }
 
+    // Build projected schema, excluding coordinates that were skipped
     debug!("Building projected schema");
-    let projected_schema = Arc::new(Schema::new(
-        projected_indices
-            .iter()
-            .map(|&i| schema.field(i).clone())
-            .collect::<Vec<_>>(),
-    ));
+    let projected_fields: Vec<_> = projected_indices
+        .iter()
+        .filter_map(|&i| {
+            let field = schema.field(i);
+            let field_name = field.name();
+            // Check if this is a coordinate that was skipped
+            if let Some(coord_idx) = coord_names.iter().position(|n| n == field_name) {
+                if !effective_coord_indices.contains(&coord_idx) {
+                    return None; // Skip coordinates not in effective set
+                }
+            }
+            Some(field.clone())
+        })
+        .collect();
+    let projected_schema = Arc::new(Schema::new(projected_fields));
 
-    // Apply final limit slice if needed
-    let final_rows = limit
-        .map(|l| l.min(rows_after_filter))
-        .unwrap_or(rows_after_filter);
+    // Apply final limit slice if needed (use query_rows, not rows_after_filter)
+    let final_rows = limit.map(|l| l.min(query_rows)).unwrap_or(query_rows);
     let result_arrays = if let Some(limit) = limit {
-        let limit = limit.min(rows_after_filter);
+        let limit = limit.min(query_rows);
         debug!(limit, "Applying final limit slice");
         result_arrays
             .into_iter()

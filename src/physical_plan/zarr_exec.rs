@@ -65,7 +65,7 @@ impl DisplayAs for ZarrExec {
                 let filter_strs: Vec<_> = filters
                     .filters
                     .iter()
-                    .map(|(k, v)| format!("{}={}", k, v))
+                    .map(|(k, v)| format!("{}{}", k, v))
                     .collect();
                 parts.push(format!("filters=[{}]", filter_strs.join(", ")));
             }
