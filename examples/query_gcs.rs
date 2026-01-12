@@ -28,7 +28,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     info!("Starting GCS example");
 
     // Register ERA5 dataset from GCS (public bucket, no credentials needed)
-    let gcs_url = "gs://gcp-public-data-arco-era5/ar/model-level-1h-0p25deg.zarr-v1";
+    // let gcs_url = "gs://gcp-public-data-arco-era5/ar/model-level-1h-0p25deg.zarr-v1";
+    let gcs_url = "gs://gcp-public-data-arco-era5/ar/full_37-1h-0p25deg-chunk-1.zarr-v3";
     println!("Registering ERA5 dataset from GCS...");
     println!("URL: {}\n", gcs_url);
 
@@ -49,7 +50,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     df.show().await?;
 
     // Sample query with LIMIT
-    let query = "SELECT * FROM era5 LIMIT 10;";
+    let query = "SELECT time, latitude, longitude, '2m_temperature' FROM era5 WHERE latitude BETWEEN 24.0 AND 54.75 LIMIT 5;";
     println!("\nExecuting query (optimized - uses statistics, no data scan):");
     println!("{}", query);
     println!("------------------------------------------------------------------------");

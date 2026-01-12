@@ -18,6 +18,7 @@ use std::sync::Arc;
 use std::time::Instant;
 use zarrs::{array::Array, array_subset::ArraySubset, filesystem::FilesystemStore};
 
+use super::cf_time::{decode_cf_time, decode_cf_time_f64};
 use super::coord::{
     calculate_coord_limits, calculate_limited_subset, create_coord_dictionary_typed, CoordValues,
 };
@@ -227,7 +228,37 @@ pub fn read_zarr(
 
         let subset = ArraySubset::new_with_shape(arr.shape().to_vec());
         let element_bytes = dtype_to_bytes(dtype);
-        let values = read_coord_values!(sync, arr, &subset, dtype.as_str());
+        let raw_values = read_coord_values!(sync, arr, &subset, dtype.as_str());
+
+        // Apply CF time conversion if this coordinate has CF time attributes
+        let values = if let Some(ref cf_attrs) = coord.cf_time_attrs {
+            if cf_attrs.is_time_coordinate() {
+                match cf_attrs.parse() {
+                    Ok(unit) => match raw_values {
+                        CoordValues::Int64(v) => {
+                            CoordValues::TimestampMicros(decode_cf_time(&v, &unit))
+                        }
+                        CoordValues::Float64(v) => {
+                            CoordValues::TimestampMicros(decode_cf_time_f64(&v, &unit))
+                        }
+                        CoordValues::Float32(v) => {
+                            // Convert f32 to f64 first
+                            let v64: Vec<f64> = v.iter().map(|x| *x as f64).collect();
+                            CoordValues::TimestampMicros(decode_cf_time_f64(&v64, &unit))
+                        }
+                        CoordValues::TimestampMicros(_) => raw_values, // Already timestamp
+                    },
+                    Err(e) => {
+                        warn!(coord = %coord.name, error = %e, "Failed to parse CF time units, keeping raw values");
+                        raw_values
+                    }
+                }
+            } else {
+                raw_values
+            }
+        } else {
+            raw_values
+        };
 
         if let Some(ref s) = stats {
             let bytes = size as u64 * element_bytes;
@@ -248,6 +279,7 @@ pub fn read_zarr(
                 CoordValues::Int64(vals) => CoordValuesRef::Int64(vals),
                 CoordValues::Float32(vals) => CoordValuesRef::Float32(vals),
                 CoordValues::Float64(vals) => CoordValuesRef::Float64(vals),
+                CoordValues::TimestampMicros(vals) => CoordValuesRef::TimestampMicros(vals),
             })
             .collect();
 
@@ -310,6 +342,9 @@ pub fn read_zarr(
                 CoordValues::Int64(vals) => CoordValues::Int64(vals[*start..*end].to_vec()),
                 CoordValues::Float32(vals) => CoordValues::Float32(vals[*start..*end].to_vec()),
                 CoordValues::Float64(vals) => CoordValues::Float64(vals[*start..*end].to_vec()),
+                CoordValues::TimestampMicros(vals) => {
+                    CoordValues::TimestampMicros(vals[*start..*end].to_vec())
+                }
             })
             .collect()
     } else {
@@ -507,7 +542,38 @@ pub async fn read_zarr_async(
 
         let subset = ArraySubset::new_with_shape(arr.shape().to_vec());
         let element_bytes = dtype_to_bytes(dtype);
-        let values = read_coord_values!(async, arr, &subset, dtype.as_str());
+        let raw_values = read_coord_values!(async, arr, &subset, dtype.as_str());
+
+        // Apply CF time conversion if this coordinate has CF time attributes
+        let values = if let Some(ref cf_attrs) = coord.cf_time_attrs {
+            if cf_attrs.is_time_coordinate() {
+                match cf_attrs.parse() {
+                    Ok(unit) => match raw_values {
+                        CoordValues::Int64(v) => {
+                            CoordValues::TimestampMicros(decode_cf_time(&v, &unit))
+                        }
+                        CoordValues::Float64(v) => {
+                            CoordValues::TimestampMicros(decode_cf_time_f64(&v, &unit))
+                        }
+                        CoordValues::Float32(v) => {
+                            // Convert f32 to f64 first
+                            let v64: Vec<f64> = v.iter().map(|x| *x as f64).collect();
+                            CoordValues::TimestampMicros(decode_cf_time_f64(&v64, &unit))
+                        }
+                        CoordValues::TimestampMicros(_) => raw_values, // Already timestamp
+                    },
+                    Err(e) => {
+                        warn!(coord = %coord.name, error = %e, "Failed to parse CF time units, keeping raw values");
+                        raw_values
+                    }
+                }
+            } else {
+                raw_values
+            }
+        } else {
+            raw_values
+        };
+
         debug!(path = %array_path, "Coordinate values loaded");
         if let Some(ref s) = stats {
             let bytes = coord.shape[0] * element_bytes;
@@ -524,6 +590,7 @@ pub async fn read_zarr_async(
                 CoordValues::Int64(vals) => CoordValuesRef::Int64(vals),
                 CoordValues::Float32(vals) => CoordValuesRef::Float32(vals),
                 CoordValues::Float64(vals) => CoordValuesRef::Float64(vals),
+                CoordValues::TimestampMicros(vals) => CoordValuesRef::TimestampMicros(vals),
             })
             .collect();
 
@@ -587,6 +654,9 @@ pub async fn read_zarr_async(
                 CoordValues::Int64(vals) => CoordValues::Int64(vals[*start..*end].to_vec()),
                 CoordValues::Float32(vals) => CoordValues::Float32(vals[*start..*end].to_vec()),
                 CoordValues::Float64(vals) => CoordValues::Float64(vals[*start..*end].to_vec()),
+                CoordValues::TimestampMicros(vals) => {
+                    CoordValues::TimestampMicros(vals[*start..*end].to_vec())
+                }
             })
             .collect()
     } else {
