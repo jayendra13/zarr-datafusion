@@ -50,7 +50,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     df.show().await?;
 
     // Sample query with LIMIT
-    let query = "SELECT time, latitude, longitude, '2m_temperature' FROM era5 WHERE latitude BETWEEN 24.0 AND 54.75 LIMIT 5;";
+    let query = r#"
+        SELECT time, latitude, longitude, "2m_temperature"
+        FROM era5
+        WHERE time BETWEEN '2021-02-10 12:00:00' AND '2021-02-22 00:00:00'
+            AND latitude BETWEEN 24.0 AND 54.75
+            AND longitude BETWEEN 250.0 AND 278.75
+        LIMIT 10"#;
+
     println!("\nExecuting query (optimized - uses statistics, no data scan):");
     println!("{}", query);
     println!("------------------------------------------------------------------------");
