@@ -494,3 +494,100 @@ async fn test_pushdown_filter_range_with_projection() {
     assert_eq!(batch.num_columns(), 2, "Should project 2 columns");
     assert_eq!(batch.num_rows(), 300, "Should return 300 rows");
 }
+
+// =============================================================================
+// Coordinate-only query optimization tests
+// =============================================================================
+// When selecting only coordinate columns with LIMIT, the query should avoid
+// Cartesian product expansion of non-selected coordinates.
+
+#[tokio::test]
+async fn test_coord_only_single_coord_with_limit() {
+    let ctx = create_test_context();
+    register_zarr_table(&ctx, "data", SYNTHETIC_V3);
+
+    // Synthetic data has time = [0, 1, 2, 3, 4, 5, 6] (7 values)
+    // With optimization: SELECT time LIMIT 10 should return 7 rows (all unique times)
+    // Without optimization: would return 10 of 700 rows (with repeated time values)
+    let batch = execute_query_single(&ctx, "SELECT time FROM data LIMIT 10").await;
+
+    assert_eq!(batch.num_columns(), 1, "Should have 1 column");
+    assert_eq!(
+        batch.num_rows(),
+        7,
+        "Coord-only with LIMIT should return unique time values (7 rows), not Cartesian product"
+    );
+}
+
+#[tokio::test]
+async fn test_coord_only_two_coords_with_limit() {
+    let ctx = create_test_context();
+    register_zarr_table(&ctx, "data", SYNTHETIC_V3);
+
+    // Synthetic data has lat = [0..9] (10 values), lon = [0..9] (10 values)
+    // With optimization: SELECT lat, lon LIMIT 50 should return 50 of lat×lon = 100 combinations
+    // Without optimization: would return 50 of 700 rows
+    let batch = execute_query_single(&ctx, "SELECT lat, lon FROM data LIMIT 50").await;
+
+    assert_eq!(batch.num_columns(), 2, "Should have 2 columns");
+    assert_eq!(
+        batch.num_rows(),
+        50,
+        "Coord-only with LIMIT should return lat×lon combinations"
+    );
+}
+
+#[tokio::test]
+async fn test_coord_only_three_coords_with_limit() {
+    let ctx = create_test_context();
+    register_zarr_table(&ctx, "data", SYNTHETIC_V3);
+
+    // Selecting all 3 coordinates with LIMIT
+    // time×lat×lon = 7×10×10 = 700 total combinations
+    // LIMIT 100 should return 100 rows
+    let batch = execute_query_single(&ctx, "SELECT time, lat, lon FROM data LIMIT 100").await;
+
+    assert_eq!(batch.num_columns(), 3, "Should have 3 columns");
+    assert_eq!(batch.num_rows(), 100, "Should return 100 rows");
+}
+
+#[tokio::test]
+async fn test_coord_only_without_limit_full_cartesian() {
+    let ctx = create_test_context();
+    register_zarr_table(&ctx, "data", SYNTHETIC_V3);
+
+    // Without LIMIT, should return full Cartesian product (700 rows)
+    // This ensures aggregate queries like SELECT COUNT(*), MIN(lat) work correctly
+    let batch = execute_query_single(&ctx, "SELECT time FROM data").await;
+
+    assert_eq!(batch.num_columns(), 1, "Should have 1 column");
+    assert_eq!(
+        batch.num_rows(),
+        700,
+        "Coord-only WITHOUT LIMIT should return full Cartesian (700 rows)"
+    );
+}
+
+#[tokio::test]
+async fn test_coord_only_aggregate_preserves_count() {
+    let ctx = create_test_context();
+    register_zarr_table(&ctx, "data", SYNTHETIC_V3);
+
+    // Aggregate queries should still return correct COUNT even though they project coordinates
+    let batch = execute_query_single(&ctx, "SELECT COUNT(*), MIN(lat), MAX(lon) FROM data").await;
+
+    assert_eq!(batch.num_rows(), 1, "Aggregate should return 1 row");
+    assert_eq!(batch.num_columns(), 3, "Should have 3 columns");
+
+    // COUNT(*) should be 700 (full Cartesian product)
+    let count_col = batch
+        .column(0)
+        .as_any()
+        .downcast_ref::<arrow::array::Int64Array>()
+        .expect("COUNT should be Int64");
+    assert_eq!(
+        count_col.value(0),
+        700,
+        "COUNT(*) should be 700 (full Cartesian product)"
+    );
+}
