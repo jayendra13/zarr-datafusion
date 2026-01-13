@@ -992,23 +992,58 @@ fn match_shape_to_coords(var_shape: &[u64], coord_sizes: &[usize]) -> Vec<usize>
     matched_indices
 }
 
-/// Determine the effective coordinates for a set of projected data variables
+/// Determine the effective coordinates for a set of projected columns
 ///
 /// For a query that projects only 3D variables, this returns only the 3 coordinate
-/// indices used by those variables. If the projection is empty (e.g., COUNT(*)),
-/// returns all coordinates.
+/// indices used by those variables. For coordinate-only queries with LIMIT (no data
+/// variables), returns only the indices of selected coordinates to avoid unnecessary
+/// Cartesian expansion. If the projection is empty (e.g., COUNT(*)), returns all
+/// coordinates.
+///
+/// The `limit` parameter enables the coordinate-only optimization. Without a LIMIT,
+/// coordinate-only queries return all coordinates to preserve correct semantics for
+/// aggregate queries like `SELECT COUNT(*), MIN(lat) FROM data`.
 ///
 /// Returns `Err` with a helpful message if the projected variables have mixed
 /// dimensionality (e.g., both 3D and 4D variables in the same query).
 pub fn determine_effective_coords(
     projected_var_names: &[&str],
+    projected_coord_names: &[&str],
     all_data_vars: &[ZarrArrayMeta],
     coord_names: &[String],
     coord_sizes: &[usize],
+    limit: Option<usize>,
 ) -> Result<Vec<usize>, String> {
-    if projected_var_names.is_empty() {
-        // No data variables projected (e.g., COUNT(*) or only coordinates)
-        // Use all coordinates for maximum row count
+    // Case 1: Data variables projected - determine coordinates from data variable shapes
+    if !projected_var_names.is_empty() {
+        // Fall through to existing logic below
+    } else if !projected_coord_names.is_empty() && limit.is_some() {
+        // Case 2: Only coordinates projected with LIMIT (e.g., SELECT time LIMIT 10)
+        // Return indices of only the selected coordinates, preserving alphabetical order
+        // This optimization avoids Cartesian expansion when user only wants coordinate values
+        let mut indices: Vec<usize> = projected_coord_names
+            .iter()
+            .filter_map(|&name| coord_names.iter().position(|c| c == name))
+            .collect();
+        indices.sort();
+        indices.dedup();
+
+        if indices.is_empty() {
+            // No valid coordinates found - this shouldn't happen
+            return Ok((0..coord_sizes.len()).collect());
+        }
+
+        debug!(
+            projected_coords = ?projected_coord_names,
+            indices = ?indices,
+            limit = ?limit,
+            "Coordinate-only query with LIMIT: using selected coordinates only"
+        );
+
+        return Ok(indices);
+    } else {
+        // Case 3: Empty projection (e.g., COUNT(*)) or coord-only without LIMIT
+        // Use all coordinates to preserve correct row count for aggregates
         return Ok((0..coord_sizes.len()).collect());
     }
 
@@ -1420,9 +1455,16 @@ mod tests {
         ];
 
         let projected_vars = vec!["temperature", "humidity"];
+        let projected_coords: Vec<&str> = vec![]; // No coordinates directly projected
 
-        let result =
-            determine_effective_coords(&projected_vars, &data_vars, &coord_names, &coord_sizes);
+        let result = determine_effective_coords(
+            &projected_vars,
+            &projected_coords,
+            &data_vars,
+            &coord_names,
+            &coord_sizes,
+            None,
+        );
 
         // Both variables use the same 3 coordinates
         assert!(result.is_ok());
@@ -1472,9 +1514,16 @@ mod tests {
         ];
 
         let projected_vars = vec!["temperature", "surface_temp"];
+        let projected_coords: Vec<&str> = vec![]; // No coordinates directly projected
 
-        let result =
-            determine_effective_coords(&projected_vars, &data_vars, &coord_names, &coord_sizes);
+        let result = determine_effective_coords(
+            &projected_vars,
+            &projected_coords,
+            &data_vars,
+            &coord_names,
+            &coord_sizes,
+            None,
+        );
 
         // Should error because variables have different dimensionality
         assert!(result.is_err());
@@ -1491,12 +1540,102 @@ mod tests {
         let coord_sizes = vec![100, 721];
         let data_vars: Vec<ZarrArrayMeta> = vec![];
         let projected_vars: Vec<&str> = vec![]; // e.g., COUNT(*)
+        let projected_coords: Vec<&str> = vec![]; // No coordinates directly projected
 
-        let result =
-            determine_effective_coords(&projected_vars, &data_vars, &coord_names, &coord_sizes);
+        let result = determine_effective_coords(
+            &projected_vars,
+            &projected_coords,
+            &data_vars,
+            &coord_names,
+            &coord_sizes,
+            None,
+        );
 
-        // Empty projection should return all coordinates
+        // Empty projection (e.g. COUNT(*)) should return all coordinates
         assert!(result.is_ok());
         assert_eq!(result.unwrap(), vec![0, 1]);
+    }
+
+    #[test]
+    fn test_determine_effective_coords_coord_only_with_limit() {
+        // Test coordinate-only queries with LIMIT like SELECT time, latitude LIMIT 10
+        let coord_names = vec![
+            "time".to_string(),
+            "latitude".to_string(),
+            "longitude".to_string(),
+        ];
+        let coord_sizes = vec![100, 721, 1440];
+        let data_vars: Vec<super::super::schema_inference::ZarrArrayMeta> = vec![];
+        let projected_vars: Vec<&str> = vec![]; // No data variables
+        let projected_coords = vec!["time", "latitude"]; // Only coordinates projected
+
+        let result = determine_effective_coords(
+            &projected_vars,
+            &projected_coords,
+            &data_vars,
+            &coord_names,
+            &coord_sizes,
+            Some(10),
+        );
+
+        // Coordinate-only projection WITH LIMIT should return only the selected coordinates
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), vec![0, 1]); // time=0, latitude=1
+    }
+
+    #[test]
+    fn test_determine_effective_coords_coord_only_no_limit() {
+        // Test coordinate-only queries WITHOUT LIMIT like SELECT time, latitude
+        // Should return all coordinates (no optimization) to preserve aggregate semantics
+        let coord_names = vec![
+            "time".to_string(),
+            "latitude".to_string(),
+            "longitude".to_string(),
+        ];
+        let coord_sizes = vec![100, 721, 1440];
+        let data_vars: Vec<super::super::schema_inference::ZarrArrayMeta> = vec![];
+        let projected_vars: Vec<&str> = vec![]; // No data variables
+        let projected_coords = vec!["time", "latitude"]; // Only coordinates projected
+
+        let result = determine_effective_coords(
+            &projected_vars,
+            &projected_coords,
+            &data_vars,
+            &coord_names,
+            &coord_sizes,
+            None,
+        );
+
+        // Coordinate-only projection WITHOUT LIMIT should return ALL coordinates
+        // This preserves correct behavior for aggregate queries like SELECT COUNT(*), MIN(lat)
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), vec![0, 1, 2]); // All coordinates
+    }
+
+    #[test]
+    fn test_determine_effective_coords_single_coord_with_limit() {
+        // Test single coordinate query with LIMIT like SELECT time LIMIT 10
+        let coord_names = vec![
+            "time".to_string(),
+            "latitude".to_string(),
+            "longitude".to_string(),
+        ];
+        let coord_sizes = vec![100, 721, 1440];
+        let data_vars: Vec<super::super::schema_inference::ZarrArrayMeta> = vec![];
+        let projected_vars: Vec<&str> = vec![]; // No data variables
+        let projected_coords = vec!["time"]; // Only time projected
+
+        let result = determine_effective_coords(
+            &projected_vars,
+            &projected_coords,
+            &data_vars,
+            &coord_names,
+            &coord_sizes,
+            Some(10),
+        );
+
+        // Single coordinate projection should return only that coordinate
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), vec![0]); // time=0
     }
 }

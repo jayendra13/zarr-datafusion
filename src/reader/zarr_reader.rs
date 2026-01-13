@@ -423,26 +423,23 @@ pub fn read_zarr(
 
     // ==========================================================================
     // Mixed-dimensionality handling: determine which coordinates are actually
-    // needed for the projected data variables
+    // needed for the projected columns (data variables or coordinates only)
     // ==========================================================================
-    let projected_var_names: Vec<&str> = projected_indices
+    // Separate projected columns into coordinates and data variables
+    let (projected_coord_names, projected_var_names): (Vec<&str>, Vec<&str>) = projected_indices
         .iter()
-        .filter_map(|&i| {
-            let name = schema.field(i).name().as_str();
-            if coord_names.contains(&name.to_string()) {
-                None // Skip coordinates
-            } else {
-                Some(name)
-            }
-        })
-        .collect();
+        .map(|&i| schema.field(i).name().as_str())
+        .partition(|name| coord_names.contains(&name.to_string()));
 
-    // Determine effective coordinates for the projected variables
+    // Determine effective coordinates for the projected columns
+    // Pass limit to enable coordinate-only optimization when LIMIT is present
     let effective_coord_indices = determine_effective_coords(
         &projected_var_names,
+        &projected_coord_names,
         &store_meta.data_vars,
         &coord_names,
         &coord_sizes,
+        limit,
     )
     .map_err(DataFusionError::Plan)?;
 
@@ -833,26 +830,23 @@ pub async fn read_zarr_async(
 
     // ==========================================================================
     // Mixed-dimensionality handling: determine which coordinates are actually
-    // needed for the projected data variables
+    // needed for the projected columns (data variables or coordinates only)
     // ==========================================================================
-    let projected_var_names: Vec<&str> = projected_indices
+    // Separate projected columns into coordinates and data variables
+    let (projected_coord_names, projected_var_names): (Vec<&str>, Vec<&str>) = projected_indices
         .iter()
-        .filter_map(|&i| {
-            let name = schema.field(i).name().as_str();
-            if coord_names.contains(&name.to_string()) {
-                None // Skip coordinates
-            } else {
-                Some(name)
-            }
-        })
-        .collect();
+        .map(|&i| schema.field(i).name().as_str())
+        .partition(|name| coord_names.contains(&name.to_string()));
 
-    // Determine effective coordinates for the projected variables
+    // Determine effective coordinates for the projected columns
+    // Pass limit to enable coordinate-only optimization when LIMIT is present
     let effective_coord_indices = determine_effective_coords(
         &projected_var_names,
+        &projected_coord_names,
         &store_meta.data_vars,
         &coord_names,
         &coord_sizes,
+        limit,
     )
     .map_err(DataFusionError::Plan)?;
 
