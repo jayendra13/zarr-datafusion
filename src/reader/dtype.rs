@@ -5,11 +5,17 @@
 use arrow::datatypes::DataType;
 
 /// Parse Zarr v2 numpy dtype string to normalized type name
-/// Examples: "<i8" -> "int64", "<f4" -> "float32", "|b1" -> "bool"
+/// Examples: "<i8" -> "int64", "<f4" -> "float32", "|b1" -> "bool", "<M8[ns]" -> "int64"
 pub fn parse_v2_dtype(dtype: &str) -> String {
-    // V2 dtype format: [<>|][type_char][byte_size]
+    // V2 dtype format: [<>|][type_char][byte_size] or [<>|]M8[unit] for datetime
     // < = little-endian, > = big-endian, | = not applicable
-    // Type chars: i=int, u=uint, f=float, b=bool, S=string, U=unicode
+    // Type chars: i=int, u=uint, f=float, b=bool, S=string, U=unicode, M=datetime64, m=timedelta64
+
+    // Handle datetime64 and timedelta64 (stored as int64 nanoseconds)
+    // Format: <M8[ns], <M8[us], <m8[ns], etc.
+    if dtype.contains("M8") || dtype.contains("m8") {
+        return "int64".to_string();
+    }
 
     let chars: Vec<char> = dtype.chars().collect();
     if chars.len() < 2 {
@@ -26,7 +32,9 @@ pub fn parse_v2_dtype(dtype: &str) -> String {
         (chars[0], &dtype[1..])
     };
 
-    let size: u32 = size_str.parse().unwrap_or(8);
+    // Handle size string (might have [unit] suffix for datetime types)
+    let size_only = size_str.split('[').next().unwrap_or("8");
+    let size: u32 = size_only.parse().unwrap_or(8);
 
     match type_char {
         'i' => match size {
