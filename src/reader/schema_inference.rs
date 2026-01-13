@@ -120,11 +120,114 @@ pub struct ZarrStoreMeta {
 pub fn discover_arrays(
     store_path: &str,
 ) -> Result<ZarrStoreMeta, Box<dyn std::error::Error + Send + Sync>> {
+    // First try consolidated metadata (.zmetadata) - works for VirtualiZarr stores
+    if let Some(meta) = discover_arrays_from_zmetadata(store_path)? {
+        info!(
+            coords = meta.coords.len(),
+            data_vars = meta.data_vars.len(),
+            "Arrays discovered from consolidated metadata"
+        );
+        return Ok(meta);
+    }
+
+    // Fall back to directory scanning
     let version = detect_zarr_version(store_path)?;
 
     match version {
         ZarrVersion::V2 => discover_arrays_v2(store_path),
         ZarrVersion::V3 => discover_arrays_v3(store_path),
+    }
+}
+
+/// Try to discover arrays from consolidated .zmetadata file (Zarr v2)
+///
+/// This handles both regular Zarr stores with consolidated metadata
+/// and VirtualiZarr Parquet reference stores.
+fn discover_arrays_from_zmetadata(
+    store_path: &str,
+) -> Result<Option<ZarrStoreMeta>, Box<dyn std::error::Error + Send + Sync>> {
+    let root = Path::new(store_path);
+    let zmetadata_path = root.join(".zmetadata");
+
+    if !zmetadata_path.exists() {
+        return Ok(None);
+    }
+
+    let content = fs::read_to_string(&zmetadata_path)?;
+
+    // Handle non-standard JSON values (NaN, Infinity) that VirtualiZarr/Zarr can emit
+    let content = content
+        .replace(":NaN", ":null")
+        .replace(": NaN", ": null")
+        .replace(":Infinity", ":null")
+        .replace(": Infinity", ": null")
+        .replace(":-Infinity", ":null")
+        .replace(": -Infinity", ": null");
+
+    let meta: serde_json::Value = serde_json::from_str(&content)?;
+
+    let metadata = meta
+        .get("metadata")
+        .ok_or("Missing 'metadata' key in .zmetadata")?;
+
+    let mut arrays: Vec<ZarrArrayMeta> = Vec::new();
+
+    // Parse each array from consolidated metadata
+    // Keys are like "temperature_2m/.zarray" or "time/.zattrs"
+    for (key, value) in metadata.as_object().ok_or("'metadata' is not an object")? {
+        if key.ends_with("/.zarray") {
+            let name = key.trim_end_matches("/.zarray").to_string();
+
+            let shape: Vec<u64> = value
+                .get("shape")
+                .and_then(|v| v.as_array())
+                .map(|arr| arr.iter().filter_map(|v| v.as_u64()).collect())
+                .unwrap_or_default();
+
+            let chunks: Option<Vec<u64>> = value
+                .get("chunks")
+                .and_then(|v| v.as_array())
+                .map(|arr| arr.iter().filter_map(|v| v.as_u64()).collect());
+
+            let dtype_raw = value.get("dtype").and_then(|v| v.as_str()).unwrap_or("<f8");
+            let data_type = parse_v2_dtype(dtype_raw);
+
+            // Look for corresponding .zattrs in consolidated metadata
+            let zattrs_key = format!("{}/.zattrs", name);
+            let zattrs = metadata.get(&zattrs_key);
+            let cf_time_attrs = zattrs.and_then(parse_cf_time_from_attrs);
+            let dimensions = zattrs.and_then(parse_array_dimensions);
+
+            debug!(name = %name, shape = ?shape, chunks = ?chunks, dtype = %data_type, dims = ?dimensions, "Found array in .zmetadata");
+
+            arrays.push(ZarrArrayMeta {
+                name,
+                data_type,
+                shape,
+                chunks,
+                coord_min_max: None, // Skip min/max for VirtualiZarr (would require S3 access)
+                cf_time_attrs,
+                dimensions,
+            });
+        }
+    }
+
+    if arrays.is_empty() {
+        return Ok(None);
+    }
+
+    info!(count = arrays.len(), "Discovered arrays from .zmetadata");
+
+    // For VirtualiZarr stores, skip min/max computation since coordinates
+    // are stored as references to remote files
+    let is_virtualizarr = super::virtual_store::is_virtualizarr_store(store_path);
+
+    if is_virtualizarr {
+        // VirtualiZarr: skip min/max computation (requires S3 access)
+        Ok(Some(separate_and_sort_arrays_no_stats(arrays)?))
+    } else {
+        // Regular consolidated metadata: compute min/max normally
+        Ok(Some(separate_and_sort_arrays(arrays, store_path)?))
     }
 }
 
@@ -446,6 +549,37 @@ fn separate_and_sort_arrays(
             coord.coord_min_max = Some(min_max);
         }
     }
+
+    // Compute total_rows = product of all coordinate sizes
+    let total_rows: usize = coords.iter().map(|c| c.shape[0] as usize).product();
+
+    Ok(ZarrStoreMeta {
+        coords,
+        data_vars,
+        total_rows,
+    })
+}
+
+/// Separate arrays into coordinates and data variables without computing statistics
+/// Used for VirtualiZarr stores where coordinates are stored remotely
+fn separate_and_sort_arrays_no_stats(
+    arrays: Vec<ZarrArrayMeta>,
+) -> Result<ZarrStoreMeta, Box<dyn std::error::Error + Send + Sync>> {
+    // Filter out scalar arrays (shape=[]) - they don't fit the Cartesian product model
+    let arrays: Vec<_> = arrays.into_iter().filter(|a| !a.is_scalar()).collect();
+
+    // Use into_iter + partition for single-pass, zero-clone separation
+    let (mut coords, mut data_vars): (Vec<_>, Vec<_>) =
+        arrays.into_iter().partition(|a| a.is_coordinate());
+
+    // Keep data variables in stable alphabetical order for determinism
+    data_vars.sort_by(|a, b| a.name.cmp(&b.name));
+
+    // Try to reorder coordinates to match Zarr arrays' native dimension order
+    coords = infer_coord_order_from_data_vars(coords, &data_vars);
+
+    // Skip min/max computation for VirtualiZarr stores (requires remote access)
+    debug!("Skipping min/max computation for VirtualiZarr store");
 
     // Compute total_rows = product of all coordinate sizes
     let total_rows: usize = coords.iter().map(|c| c.shape[0] as usize).product();

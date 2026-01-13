@@ -2,6 +2,7 @@ use crate::reader::filter::CoordFilters;
 use crate::reader::schema_inference::ZarrStoreMeta;
 use crate::reader::stats::{SharedIoStats, ZarrIoStats};
 use crate::reader::storage::is_remote_url;
+use crate::reader::virtual_store::{is_virtualizarr_store, VirtualStoreAdapter};
 use crate::reader::zarr_reader::{read_zarr, read_zarr_async};
 use arrow::datatypes::{Schema, SchemaRef};
 use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType};
@@ -156,7 +157,17 @@ impl ExecutionPlan for ZarrExec {
             "ZarrExec::execute called"
         );
 
-        if is_remote_url(&self.path) {
+        if is_virtualizarr_store(&self.path) {
+            info!("Using VirtualiZarr (async) execution path");
+            execute_virtualizarr(
+                self.path.clone(),
+                self.schema.clone(),
+                self.projection.clone(),
+                self.limit,
+                self.io_stats.clone(),
+                self.coord_filters.clone(),
+            )
+        } else if is_remote_url(&self.path) {
             info!("Using remote (async) execution path");
             execute_remote(
                 self.path.clone(),
@@ -245,6 +256,82 @@ fn execute_remote(
         debug!("Collecting batches");
         let batches: Vec<RecordBatch> = result_stream.try_collect().await?;
         info!(num_batches = batches.len(), "Remote read complete");
+
+        Ok::<_, DataFusionError>(stream::iter(batches.into_iter().map(Ok)))
+    })
+    .try_flatten();
+
+    Ok(Box::pin(RecordBatchStreamAdapter::new(
+        projected_schema,
+        stream,
+    )))
+}
+
+/// Execute read from VirtualiZarr Parquet reference store
+fn execute_virtualizarr(
+    path: String,
+    schema: SchemaRef,
+    projection: Option<Vec<usize>>,
+    limit: Option<usize>,
+    stats: SharedIoStats,
+    coord_filters: Option<CoordFilters>,
+) -> datafusion::error::Result<datafusion::execution::SendableRecordBatchStream> {
+    use crate::reader::schema_inference::discover_arrays;
+    use arrow::record_batch::RecordBatch;
+    use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
+    use futures::stream::{self, TryStreamExt};
+    use zarrs::storage::AsyncReadableListableStorage;
+
+    debug!(path = %path, "Setting up VirtualiZarr execution stream");
+
+    // Pre-discover metadata from local .zmetadata (avoids async discovery issues)
+    let cached_meta = discover_arrays(&path)
+        .map_err(DataFusionError::External)?;
+
+    // Create projected schema
+    let projected_schema = if let Some(ref indices) = projection {
+        Arc::new(Schema::new(
+            indices
+                .iter()
+                .map(|&i| schema.field(i).clone())
+                .collect::<Vec<_>>(),
+        ))
+    } else {
+        schema.clone()
+    };
+
+    // Create the stream that performs async read when polled
+    let stream = stream::once(async move {
+        debug!("VirtualiZarr stream polled - starting async execution");
+
+        // Create VirtualStoreAdapter
+        let adapter = VirtualStoreAdapter::new(&path)
+            .map_err(DataFusionError::External)?;
+
+        // Wrap in Arc for zarrs
+        let store: AsyncReadableListableStorage = Arc::new(adapter);
+
+        // Empty prefix - VirtualiZarr stores use relative paths internally
+        let prefix = ObjectPath::from("");
+
+        // Read the data with cached metadata (avoids async discovery)
+        debug!("Starting read_zarr_async for VirtualiZarr");
+        let result_stream = read_zarr_async(
+            store,
+            &prefix,
+            schema,
+            projection,
+            limit,
+            Some(stats),
+            Some(cached_meta), // Use pre-loaded metadata
+            coord_filters,
+        )
+        .await?;
+
+        // Collect into batches and return as stream
+        debug!("Collecting batches from VirtualiZarr");
+        let batches: Vec<RecordBatch> = result_stream.try_collect().await?;
+        info!(num_batches = batches.len(), "VirtualiZarr read complete");
 
         Ok::<_, DataFusionError>(stream::iter(batches.into_iter().map(Ok)))
     })
