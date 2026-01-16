@@ -4381,10 +4381,13 @@ version = "0.1.0"
 dependencies = [
  "arrow",
  "async-trait",
+ "bytes",
  "chrono",
  "datafusion",
  "futures",
+ "glob",
  "nu-ansi-term",
+ "parquet",
  "rustyline",
  "serde_json",
  "sqlparser 0.53.0",

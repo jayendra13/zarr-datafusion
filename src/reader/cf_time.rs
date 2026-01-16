@@ -32,15 +32,28 @@ pub struct CFTimeAttrs {
 #[derive(Debug, Clone)]
 pub struct CFTimeUnit {
     /// Microseconds per time unit (e.g., 3_600_000_000 for hours)
+    /// For nanoseconds, this is 1 and is_nanoseconds is true
     pub multiplier_us: i64,
     /// Reference date as microseconds since Unix epoch (1970-01-01 00:00:00 UTC)
     pub epoch_offset_us: i64,
+    /// True if the source unit is nanoseconds (requires division by 1000)
+    pub is_nanoseconds: bool,
 }
 
 impl CFTimeAttrs {
     /// Create new CF time attributes
     pub fn new(units: String, calendar: Option<String>) -> Self {
         Self { units, calendar }
+    }
+
+    /// Create CF time attributes for nanosecond epoch values
+    ///
+    /// Used when heuristically detecting nanosecond timestamps from column names
+    pub fn nanoseconds_since_epoch() -> Self {
+        Self {
+            units: "nanoseconds since 1970-01-01".to_string(),
+            calendar: None,
+        }
     }
 
     /// Check if this looks like CF time encoding
@@ -74,14 +87,17 @@ impl CFTimeAttrs {
         let reference_date = parts[1].trim();
 
         // Parse time unit to microseconds multiplier
-        let multiplier_us = match time_unit.as_str() {
-            "second" | "seconds" | "s" => 1_000_000i64,
-            "minute" | "minutes" | "min" => 60_000_000i64,
-            "hour" | "hours" | "h" | "hr" => 3_600_000_000i64,
-            "day" | "days" | "d" => 86_400_000_000i64,
+        let (multiplier_us, is_nanoseconds) = match time_unit.as_str() {
+            "nanosecond" | "nanoseconds" | "ns" => (1i64, true), // Special: divide by 1000
+            "microsecond" | "microseconds" | "us" => (1i64, false),
+            "millisecond" | "milliseconds" | "ms" => (1_000i64, false),
+            "second" | "seconds" | "s" => (1_000_000i64, false),
+            "minute" | "minutes" | "min" => (60_000_000i64, false),
+            "hour" | "hours" | "h" | "hr" => (3_600_000_000i64, false),
+            "day" | "days" | "d" => (86_400_000_000i64, false),
             _ => {
                 return Err(format!(
-                    "Unsupported time unit: '{}'. Supported: seconds, minutes, hours, days",
+                    "Unsupported time unit: '{}'. Supported: nanoseconds, microseconds, milliseconds, seconds, minutes, hours, days",
                     time_unit
                 ))
             }
@@ -93,6 +109,7 @@ impl CFTimeAttrs {
         Ok(CFTimeUnit {
             multiplier_us,
             epoch_offset_us,
+            is_nanoseconds,
         })
     }
 }
@@ -140,20 +157,36 @@ fn parse_reference_date(date_str: &str) -> Result<i64, String> {
 /// # Returns
 /// Vector of microseconds since Unix epoch (suitable for Arrow Timestamp)
 pub fn decode_cf_time(values: &[i64], unit: &CFTimeUnit) -> Vec<i64> {
-    values
-        .iter()
-        .map(|v| unit.epoch_offset_us + v * unit.multiplier_us)
-        .collect()
+    if unit.is_nanoseconds {
+        // Nanoseconds: divide by 1000 to get microseconds
+        values
+            .iter()
+            .map(|v| unit.epoch_offset_us + v / 1000)
+            .collect()
+    } else {
+        values
+            .iter()
+            .map(|v| unit.epoch_offset_us + v * unit.multiplier_us)
+            .collect()
+    }
 }
 
 /// Convert raw float time values to microseconds since Unix epoch
 ///
 /// Handles fractional time values (e.g., 1.5 hours)
 pub fn decode_cf_time_f64(values: &[f64], unit: &CFTimeUnit) -> Vec<i64> {
-    values
-        .iter()
-        .map(|v| unit.epoch_offset_us + (*v * unit.multiplier_us as f64) as i64)
-        .collect()
+    if unit.is_nanoseconds {
+        // Nanoseconds: divide by 1000 to get microseconds
+        values
+            .iter()
+            .map(|v| unit.epoch_offset_us + (*v / 1000.0) as i64)
+            .collect()
+    } else {
+        values
+            .iter()
+            .map(|v| unit.epoch_offset_us + (*v * unit.multiplier_us as f64) as i64)
+            .collect()
+    }
 }
 
 #[cfg(test)]

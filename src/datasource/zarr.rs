@@ -12,9 +12,13 @@ use zarrs_object_store::object_store::path::Path as ObjectPath;
 use crate::physical_plan::zarr_exec::ZarrExec;
 use crate::reader::filter::parse_coord_filters;
 use crate::reader::schema_inference::ZarrStoreMeta;
+use crate::reader::virtual_store::VirtualStoreAdapter;
 
 /// Cached remote store info (store, prefix, metadata)
 pub type CachedRemoteStore = Option<(AsyncReadableListableStorage, ObjectPath, ZarrStoreMeta)>;
+
+/// Cached VirtualiZarr adapter (pre-loaded refs and metadata)
+pub type CachedVirtualiZarrAdapter = Option<Arc<VirtualStoreAdapter>>;
 
 pub struct ZarrTable {
     schema: SchemaRef,
@@ -23,6 +27,8 @@ pub struct ZarrTable {
     cached_remote: CachedRemoteStore,
     /// Store metadata for statistics (used for count optimization)
     store_meta: Option<ZarrStoreMeta>,
+    /// Cached VirtualiZarr adapter for remote VirtualiZarr stores
+    cached_virtualizarr: CachedVirtualiZarrAdapter,
 }
 
 impl std::fmt::Debug for ZarrTable {
@@ -38,6 +44,7 @@ impl std::fmt::Debug for ZarrTable {
                 "total_rows",
                 &self.store_meta.as_ref().map(|m| m.total_rows),
             )
+            .field("has_virtualizarr_adapter", &self.cached_virtualizarr.is_some())
             .finish()
     }
 }
@@ -49,6 +56,7 @@ impl ZarrTable {
             path: path.into(),
             cached_remote: None,
             store_meta: None,
+            cached_virtualizarr: None,
         }
     }
 
@@ -63,6 +71,7 @@ impl ZarrTable {
             path: path.into(),
             cached_remote: None,
             store_meta: Some(metadata),
+            cached_virtualizarr: None,
         }
     }
 
@@ -79,6 +88,23 @@ impl ZarrTable {
             path: path.into(),
             cached_remote: Some((store, prefix, metadata.clone())),
             store_meta: Some(metadata),
+            cached_virtualizarr: None,
+        }
+    }
+
+    /// Create a ZarrTable for a remote VirtualiZarr store with cached adapter
+    pub fn with_remote_virtualizarr(
+        schema: SchemaRef,
+        path: impl Into<String>,
+        adapter: Arc<VirtualStoreAdapter>,
+        metadata: ZarrStoreMeta,
+    ) -> Self {
+        Self {
+            schema,
+            path: path.into(),
+            cached_remote: None,
+            store_meta: Some(metadata),
+            cached_virtualizarr: Some(adapter),
         }
     }
 
@@ -182,6 +208,7 @@ impl TableProvider for ZarrTable {
             limit,
             self.cached_remote.clone(),
             coord_filters,
+            self.cached_virtualizarr.clone(),
         )))
     }
 
