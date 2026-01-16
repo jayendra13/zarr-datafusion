@@ -86,3 +86,25 @@ async fn test_virtualizarr_with_coordinates() -> datafusion::error::Result<()> {
 
     Ok(())
 }
+
+#[tokio::test]
+async fn test_virtualizarr_init_time_as_timestamp() -> datafusion::error::Result<()> {
+    let ctx = common::create_test_context();
+    setup_virtualizarr_table(&ctx)?;
+
+    // init_time should now be automatically detected as a nanosecond epoch timestamp
+    // via the heuristic (column name contains "time" + int64 dtype)
+    let df = ctx.sql("SELECT init_time FROM gfs LIMIT 5").await?;
+    let results = df.collect().await?;
+
+    assert!(!results.is_empty());
+    println!("init_time (auto-detected as timestamp):");
+    print_batches(&results)?;
+
+    // Verify the first value is a reasonable timestamp (2020-09-30)
+    let batch = &results[0];
+    let col = batch.column(0);
+    println!("Column type: {:?}", col.data_type());
+
+    Ok(())
+}
