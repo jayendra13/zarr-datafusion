@@ -120,11 +120,228 @@ pub struct ZarrStoreMeta {
 pub fn discover_arrays(
     store_path: &str,
 ) -> Result<ZarrStoreMeta, Box<dyn std::error::Error + Send + Sync>> {
+    // First try consolidated metadata (.zmetadata) - works for VirtualiZarr stores
+    if let Some(meta) = discover_arrays_from_zmetadata(store_path)? {
+        info!(
+            coords = meta.coords.len(),
+            data_vars = meta.data_vars.len(),
+            "Arrays discovered from consolidated metadata"
+        );
+        return Ok(meta);
+    }
+
+    // Fall back to directory scanning
     let version = detect_zarr_version(store_path)?;
 
     match version {
         ZarrVersion::V2 => discover_arrays_v2(store_path),
         ZarrVersion::V3 => discover_arrays_v3(store_path),
+    }
+}
+
+/// Infer schema from pre-loaded .zmetadata JSON (for VirtualiZarr stores)
+///
+/// This is used when the metadata has already been loaded (e.g., by VirtualStoreAdapter)
+/// to avoid re-reading from remote storage.
+pub fn infer_schema_from_zmetadata_json(
+    metadata: &serde_json::Value,
+) -> Result<(Schema, ZarrStoreMeta), Box<dyn std::error::Error + Send + Sync>> {
+    use arrow::datatypes::{DataType, Field, TimeUnit};
+
+    let meta = discover_arrays_from_json(metadata)?
+        .ok_or("No arrays found in .zmetadata JSON")?;
+
+    // Build schema from meta (same logic as infer_schema_with_meta)
+    let mut fields: Vec<Field> = Vec::new();
+
+    // Coordinates use Dictionary encoding for memory efficiency
+    // CF time coordinates use Dictionary with Timestamp values
+    for coord in &meta.coords {
+        let data_type = if coord
+            .cf_time_attrs
+            .as_ref()
+            .is_some_and(|a| a.is_time_coordinate())
+        {
+            // CF time coordinate: Dictionary with Timestamp(Microsecond, UTC) values
+            DataType::Dictionary(
+                Box::new(DataType::Int16),
+                Box::new(DataType::Timestamp(
+                    TimeUnit::Microsecond,
+                    Some("UTC".into()),
+                )),
+            )
+        } else {
+            zarr_dtype_to_arrow_dictionary(&coord.data_type)
+        };
+        fields.push(Field::new(&coord.name, data_type, false));
+    }
+
+    // Data variables use regular arrays
+    for var in &meta.data_vars {
+        fields.push(Field::new(
+            &var.name,
+            zarr_dtype_to_arrow(&var.data_type),
+            true,
+        ));
+    }
+
+    Ok((Schema::new(fields), meta))
+}
+
+/// Discover arrays from a pre-loaded .zmetadata JSON value
+fn discover_arrays_from_json(
+    meta: &serde_json::Value,
+) -> Result<Option<ZarrStoreMeta>, Box<dyn std::error::Error + Send + Sync>> {
+    let metadata = meta
+        .get("metadata")
+        .ok_or("Missing 'metadata' key in .zmetadata")?;
+
+    let mut arrays: Vec<ZarrArrayMeta> = Vec::new();
+
+    // Parse each array from consolidated metadata
+    // Keys are like "temperature_2m/.zarray" or "time/.zattrs"
+    for (key, value) in metadata.as_object().ok_or("'metadata' is not an object")? {
+        if key.ends_with("/.zarray") {
+            let name = key.trim_end_matches("/.zarray").to_string();
+
+            let shape: Vec<u64> = value
+                .get("shape")
+                .and_then(|v| v.as_array())
+                .map(|arr| arr.iter().filter_map(|v| v.as_u64()).collect())
+                .unwrap_or_default();
+
+            let chunks: Option<Vec<u64>> = value
+                .get("chunks")
+                .and_then(|v| v.as_array())
+                .map(|arr| arr.iter().filter_map(|v| v.as_u64()).collect());
+
+            let dtype_raw = value.get("dtype").and_then(|v| v.as_str()).unwrap_or("<f8");
+            let data_type = parse_v2_dtype(dtype_raw);
+
+            // Look for corresponding .zattrs in consolidated metadata
+            let zattrs_key = format!("{}/.zattrs", name);
+            let zattrs = metadata.get(&zattrs_key);
+            // Try CF attributes first, fallback to heuristic for nanosecond epoch
+            let cf_time_attrs = zattrs
+                .and_then(parse_cf_time_from_attrs)
+                .or_else(|| infer_nanosecond_epoch_from_raw_dtype(dtype_raw));
+            let dimensions = zattrs.and_then(parse_array_dimensions);
+
+            debug!(name = %name, shape = ?shape, chunks = ?chunks, dtype = %data_type, dims = ?dimensions, "Found array in .zmetadata JSON");
+
+            arrays.push(ZarrArrayMeta {
+                name,
+                data_type,
+                shape,
+                chunks,
+                coord_min_max: None, // Skip min/max for VirtualiZarr (would require S3 access)
+                cf_time_attrs,
+                dimensions,
+            });
+        }
+    }
+
+    if arrays.is_empty() {
+        return Ok(None);
+    }
+
+    info!(count = arrays.len(), "Discovered arrays from .zmetadata JSON");
+    // VirtualiZarr: skip min/max computation (requires S3 access)
+    Ok(Some(separate_and_sort_arrays_no_stats(arrays)?))
+}
+
+/// Try to discover arrays from consolidated .zmetadata file (Zarr v2)
+///
+/// This handles both regular Zarr stores with consolidated metadata
+/// and VirtualiZarr Parquet reference stores.
+fn discover_arrays_from_zmetadata(
+    store_path: &str,
+) -> Result<Option<ZarrStoreMeta>, Box<dyn std::error::Error + Send + Sync>> {
+    let root = Path::new(store_path);
+    let zmetadata_path = root.join(".zmetadata");
+
+    if !zmetadata_path.exists() {
+        return Ok(None);
+    }
+
+    let content = fs::read_to_string(&zmetadata_path)?;
+
+    // Handle non-standard JSON values (NaN, Infinity) that VirtualiZarr/Zarr can emit
+    let content = content
+        .replace(":NaN", ":null")
+        .replace(": NaN", ": null")
+        .replace(":Infinity", ":null")
+        .replace(": Infinity", ": null")
+        .replace(":-Infinity", ":null")
+        .replace(": -Infinity", ": null");
+
+    let meta: serde_json::Value = serde_json::from_str(&content)?;
+
+    let metadata = meta
+        .get("metadata")
+        .ok_or("Missing 'metadata' key in .zmetadata")?;
+
+    let mut arrays: Vec<ZarrArrayMeta> = Vec::new();
+
+    // Parse each array from consolidated metadata
+    // Keys are like "temperature_2m/.zarray" or "time/.zattrs"
+    for (key, value) in metadata.as_object().ok_or("'metadata' is not an object")? {
+        if key.ends_with("/.zarray") {
+            let name = key.trim_end_matches("/.zarray").to_string();
+
+            let shape: Vec<u64> = value
+                .get("shape")
+                .and_then(|v| v.as_array())
+                .map(|arr| arr.iter().filter_map(|v| v.as_u64()).collect())
+                .unwrap_or_default();
+
+            let chunks: Option<Vec<u64>> = value
+                .get("chunks")
+                .and_then(|v| v.as_array())
+                .map(|arr| arr.iter().filter_map(|v| v.as_u64()).collect());
+
+            let dtype_raw = value.get("dtype").and_then(|v| v.as_str()).unwrap_or("<f8");
+            let data_type = parse_v2_dtype(dtype_raw);
+
+            // Look for corresponding .zattrs in consolidated metadata
+            let zattrs_key = format!("{}/.zattrs", name);
+            let zattrs = metadata.get(&zattrs_key);
+            // Try CF attributes first, fallback to heuristic for nanosecond epoch
+            let cf_time_attrs = zattrs
+                .and_then(parse_cf_time_from_attrs)
+                .or_else(|| infer_nanosecond_epoch_from_raw_dtype(dtype_raw));
+            let dimensions = zattrs.and_then(parse_array_dimensions);
+
+            debug!(name = %name, shape = ?shape, chunks = ?chunks, dtype = %data_type, dims = ?dimensions, "Found array in .zmetadata");
+
+            arrays.push(ZarrArrayMeta {
+                name,
+                data_type,
+                shape,
+                chunks,
+                coord_min_max: None, // Skip min/max for VirtualiZarr (would require S3 access)
+                cf_time_attrs,
+                dimensions,
+            });
+        }
+    }
+
+    if arrays.is_empty() {
+        return Ok(None);
+    }
+
+    info!(count = arrays.len(), "Discovered arrays from .zmetadata");
+
+    // For VirtualiZarr stores, skip min/max computation since coordinates
+    // are stored as references to remote files
+    let is_virtualizarr = super::virtual_store::is_virtualizarr_store(store_path);
+
+    if is_virtualizarr {
+        // VirtualiZarr: skip min/max computation (requires S3 access)
+        Ok(Some(separate_and_sort_arrays_no_stats(arrays)?))
+    } else {
+        // Regular consolidated metadata: compute min/max normally
+        Ok(Some(separate_and_sort_arrays(arrays, store_path)?))
     }
 }
 
@@ -173,17 +390,19 @@ fn discover_arrays_v2(
                     if zattrs.exists() {
                         if let Ok(content) = fs::read_to_string(&zattrs) {
                             if let Ok(attrs) = serde_json::from_str::<serde_json::Value>(&content) {
-                                let cf = parse_cf_time_from_attrs(&attrs);
+                                // Try CF attributes first, fallback to heuristic
+                                let cf = parse_cf_time_from_attrs(&attrs)
+                                    .or_else(|| infer_nanosecond_epoch_from_raw_dtype(dtype_raw));
                                 let dims = parse_array_dimensions(&attrs);
                                 (cf, dims)
                             } else {
-                                (None, None)
+                                (infer_nanosecond_epoch_from_raw_dtype(dtype_raw), None)
                             }
                         } else {
-                            (None, None)
+                            (infer_nanosecond_epoch_from_raw_dtype(dtype_raw), None)
                         }
                     } else {
-                        (None, None)
+                        (infer_nanosecond_epoch_from_raw_dtype(dtype_raw), None)
                     }
                 };
 
@@ -241,14 +460,19 @@ fn discover_arrays_v3(
                         .and_then(|v| v.as_array())
                         .map(|arr| arr.iter().filter_map(|v| v.as_u64()).collect());
 
-                    let data_type = meta
+                    // V3 data_type is already in a readable format (e.g., "float64", "int64")
+                    let dtype_raw = meta
                         .get("data_type")
                         .and_then(|v| v.as_str())
-                        .unwrap_or("float64")
-                        .to_string();
+                        .unwrap_or("float64");
+                    let data_type = dtype_raw.to_string();
 
                     // V3 stores attributes in zarr.json under "attributes" key
-                    let cf_time_attrs = meta.get("attributes").and_then(parse_cf_time_from_attrs);
+                    // Try CF attributes first, fallback to heuristic for datetime64
+                    let cf_time_attrs = meta
+                        .get("attributes")
+                        .and_then(parse_cf_time_from_attrs)
+                        .or_else(|| infer_nanosecond_epoch_from_raw_dtype(dtype_raw));
                     let dimensions = meta.get("attributes").and_then(parse_array_dimensions);
 
                     arrays.push(ZarrArrayMeta {
@@ -457,6 +681,37 @@ fn separate_and_sort_arrays(
     })
 }
 
+/// Separate arrays into coordinates and data variables without computing statistics
+/// Used for VirtualiZarr stores where coordinates are stored remotely
+fn separate_and_sort_arrays_no_stats(
+    arrays: Vec<ZarrArrayMeta>,
+) -> Result<ZarrStoreMeta, Box<dyn std::error::Error + Send + Sync>> {
+    // Filter out scalar arrays (shape=[]) - they don't fit the Cartesian product model
+    let arrays: Vec<_> = arrays.into_iter().filter(|a| !a.is_scalar()).collect();
+
+    // Use into_iter + partition for single-pass, zero-clone separation
+    let (mut coords, mut data_vars): (Vec<_>, Vec<_>) =
+        arrays.into_iter().partition(|a| a.is_coordinate());
+
+    // Keep data variables in stable alphabetical order for determinism
+    data_vars.sort_by(|a, b| a.name.cmp(&b.name));
+
+    // Try to reorder coordinates to match Zarr arrays' native dimension order
+    coords = infer_coord_order_from_data_vars(coords, &data_vars);
+
+    // Skip min/max computation for VirtualiZarr stores (requires remote access)
+    debug!("Skipping min/max computation for VirtualiZarr store");
+
+    // Compute total_rows = product of all coordinate sizes
+    let total_rows: usize = coords.iter().map(|c| c.shape[0] as usize).product();
+
+    Ok(ZarrStoreMeta {
+        coords,
+        data_vars,
+        total_rows,
+    })
+}
+
 /// Infer Arrow schema from Zarr store metadata (v2 or v3)
 /// Coordinates use DictionaryArray for memory efficiency (stores unique values once)
 pub fn infer_schema(store_path: &str) -> Result<Schema, Box<dyn std::error::Error + Send + Sync>> {
@@ -527,6 +782,29 @@ fn parse_cf_time_from_attrs(attrs: &serde_json::Value) -> Option<CFTimeAttrs> {
             .and_then(|v| v.as_str())
             .map(|s| s.to_string()),
     ))
+}
+
+/// Heuristically infer if a column contains nanosecond epoch timestamps
+///
+/// Returns synthetic CFTimeAttrs if the RAW dtype (before parsing) is datetime64 (M8):
+/// - `<M8[ns]` = little-endian datetime64 with nanosecond resolution
+/// - `>M8[ns]` = big-endian datetime64 with nanosecond resolution
+///
+/// This handles cases where CF metadata is missing but the dtype clearly
+/// indicates a datetime (e.g., VirtualiZarr stores with incomplete metadata).
+///
+/// NOTE: Call this with the RAW dtype string (e.g., "<M8[ns]"), not the parsed type.
+fn infer_nanosecond_epoch_from_raw_dtype(raw_dtype: &str) -> Option<CFTimeAttrs> {
+    // Check if dtype is datetime64[ns] (numpy M8 type)
+    // Zarr uses <M8[ns] for little-endian, >M8[ns] for big-endian
+    // M8 = datetime64, m8 = timedelta64
+    let is_datetime64_ns = raw_dtype.contains("M8[ns]") || raw_dtype.contains("datetime64[ns]");
+    if !is_datetime64_ns {
+        return None;
+    }
+
+    debug!(raw_dtype = %raw_dtype, "Inferred nanosecond epoch from datetime64[ns] dtype");
+    Some(CFTimeAttrs::nanoseconds_since_epoch())
 }
 
 /// Parse `_ARRAY_DIMENSIONS` from attributes (xarray/CF convention)
@@ -745,7 +1023,10 @@ async fn discover_arrays_from_zmetadata_async(
             // Look for corresponding .zattrs in consolidated metadata
             let zattrs_key = format!("{}/.zattrs", name);
             let zattrs = metadata.get(&zattrs_key);
-            let cf_time_attrs = zattrs.and_then(parse_cf_time_from_attrs);
+            // Try CF attributes first, fallback to heuristic for nanosecond epoch
+            let cf_time_attrs = zattrs
+                .and_then(parse_cf_time_from_attrs)
+                .or_else(|| infer_nanosecond_epoch_from_raw_dtype(dtype_raw));
             let dimensions = zattrs.and_then(parse_array_dimensions);
 
             debug!(name = %name, shape = ?shape, chunks = ?chunks, dtype = %data_type, dims = ?dimensions, "Found array in .zmetadata");
@@ -830,15 +1111,17 @@ async fn discover_arrays_v2_async(
             let (cf_time_attrs, dimensions) =
                 if let Ok(attrs_content) = store_get_string(store, &zattrs_path).await {
                     if let Ok(attrs) = serde_json::from_str::<serde_json::Value>(&attrs_content) {
+                        // Try CF attributes first, fallback to heuristic
                         (
-                            parse_cf_time_from_attrs(&attrs),
+                            parse_cf_time_from_attrs(&attrs)
+                                .or_else(|| infer_nanosecond_epoch_from_raw_dtype(dtype_raw)),
                             parse_array_dimensions(&attrs),
                         )
                     } else {
-                        (None, None)
+                        (infer_nanosecond_epoch_from_raw_dtype(dtype_raw), None)
                     }
                 } else {
-                    (None, None)
+                    (infer_nanosecond_epoch_from_raw_dtype(dtype_raw), None)
                 };
 
             arrays.push(ZarrArrayMeta {
@@ -861,9 +1144,8 @@ async fn discover_arrays_v3_async(
     store: &AsyncReadableListableStorage,
     prefix: &ObjectPath,
 ) -> Result<ZarrStoreMeta, Box<dyn std::error::Error + Send + Sync>> {
+    use futures::future::join_all;
     use zarrs::storage::{AsyncListableStorageTraits, StorePrefix};
-
-    let mut arrays: Vec<ZarrArrayMeta> = Vec::new();
 
     // StorePrefix requires trailing slash
     let prefix_str = if prefix.as_ref().is_empty() {
@@ -878,14 +1160,40 @@ async fn discover_arrays_v3_async(
         .await
         .map_err(|e| format!("Failed to list directory: {}", e))?;
 
-    for subdir in entries.prefixes() {
-        let subdir_str = subdir.as_str().trim_end_matches('/');
-        let zarr_json_path = format!("{}/zarr.json", subdir_str);
+    // Collect all subdirectory paths for parallel fetching
+    let subdirs: Vec<String> = entries
+        .prefixes()
+        .iter()
+        .map(|subdir| subdir.as_str().trim_end_matches('/').to_string())
+        .collect();
 
-        // Try to read zarr.json metadata
-        if let Ok(content) = store_get_string(store, &zarr_json_path).await {
-            let meta: serde_json::Value = serde_json::from_str(&content)?;
+    info!(
+        num_subdirs = subdirs.len(),
+        "Fetching zarr.json metadata in parallel"
+    );
 
+    // Fetch all zarr.json files in parallel
+    let fetch_futures: Vec<_> = subdirs
+        .iter()
+        .map(|subdir_str| {
+            let zarr_json_path = format!("{}/zarr.json", subdir_str);
+            let subdir_owned = subdir_str.clone();
+            async move {
+                match store_get_string(store, &zarr_json_path).await {
+                    Ok(content) => Some((subdir_owned, content)),
+                    Err(_) => None,
+                }
+            }
+        })
+        .collect();
+
+    let results = join_all(fetch_futures).await;
+
+    // Process results into arrays
+    let mut arrays: Vec<ZarrArrayMeta> = Vec::new();
+    for result in results.into_iter().flatten() {
+        let (subdir_str, content) = result;
+        if let Ok(meta) = serde_json::from_str::<serde_json::Value>(&content) {
             // Only process arrays (not groups)
             if meta.get("node_type").and_then(|v| v.as_str()) == Some("array") {
                 let name = subdir_str
@@ -909,14 +1217,19 @@ async fn discover_arrays_v3_async(
                     .and_then(|v| v.as_array())
                     .map(|arr| arr.iter().filter_map(|v| v.as_u64()).collect());
 
-                let data_type = meta
+                // V3 data_type is already in a readable format
+                let dtype_raw = meta
                     .get("data_type")
                     .and_then(|v| v.as_str())
-                    .unwrap_or("float64")
-                    .to_string();
+                    .unwrap_or("float64");
+                let data_type = dtype_raw.to_string();
 
                 // V3 stores attributes in zarr.json under "attributes" key
-                let cf_time_attrs = meta.get("attributes").and_then(parse_cf_time_from_attrs);
+                // Try CF attributes first, fallback to heuristic for datetime64
+                let cf_time_attrs = meta
+                    .get("attributes")
+                    .and_then(parse_cf_time_from_attrs)
+                    .or_else(|| infer_nanosecond_epoch_from_raw_dtype(dtype_raw));
                 let dimensions = meta.get("attributes").and_then(parse_array_dimensions);
 
                 arrays.push(ZarrArrayMeta {

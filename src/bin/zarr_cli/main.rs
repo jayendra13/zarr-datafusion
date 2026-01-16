@@ -18,6 +18,7 @@ use zarr_datafusion::datasource::factory::ZarrTableFactory;
 use zarr_datafusion::optimizer::{CountStatisticsRule, MinMaxStatisticsRule};
 use zarr_datafusion::physical_plan::zarr_exec::ZarrExec;
 use zarr_datafusion::reader::stats::{format_bytes, SharedIoStats};
+use zarr_datafusion::udfs::register_metric_udfs;
 use zarr_datafusion::udtf::register_zarr_functions;
 
 const HISTORY_FILE: &str = ".zarr_cli_history";
@@ -63,6 +64,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
     // Register Zarr-specific table functions
     register_zarr_functions(&ctx);
+
+    // Register metric UDFs for weather evaluation
+    register_metric_udfs(&ctx);
 
     println!("Zarr-DataFusion CLI");
     println!("\nType SQL queries or 'help' for commands.\n");

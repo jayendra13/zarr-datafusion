@@ -84,6 +84,28 @@ macro_rules! read_coord_values {
                     .into_raw_vec_and_offset();
                 CoordValues::Float64(vals)
             }
+            "int32" => {
+                let (vals, _) = $arr
+                    .retrieve_array_subset_ndarray::<i32>($subset)
+                    .map_err(zarr_err)?
+                    .into_raw_vec_and_offset();
+                // Convert to i64 for uniform handling
+                CoordValues::Int64(vals.into_iter().map(|v| v as i64).collect())
+            }
+            "uint32" => {
+                let (vals, _) = $arr
+                    .retrieve_array_subset_ndarray::<u32>($subset)
+                    .map_err(zarr_err)?
+                    .into_raw_vec_and_offset();
+                CoordValues::Int64(vals.into_iter().map(|v| v as i64).collect())
+            }
+            "int16" => {
+                let (vals, _) = $arr
+                    .retrieve_array_subset_ndarray::<i16>($subset)
+                    .map_err(zarr_err)?
+                    .into_raw_vec_and_offset();
+                CoordValues::Int64(vals.into_iter().map(|v| v as i64).collect())
+            }
             _ => {
                 let (vals, _) = $arr
                     .retrieve_array_subset_ndarray::<i64>($subset)
@@ -111,6 +133,31 @@ macro_rules! read_coord_values {
                     .map_err(zarr_err)?
                     .into_raw_vec_and_offset();
                 CoordValues::Float64(vals)
+            }
+            "int32" => {
+                let (vals, _) = $arr
+                    .async_retrieve_array_subset_ndarray::<i32>($subset)
+                    .await
+                    .map_err(zarr_err)?
+                    .into_raw_vec_and_offset();
+                // Convert to i64 for uniform handling
+                CoordValues::Int64(vals.into_iter().map(|v| v as i64).collect())
+            }
+            "uint32" => {
+                let (vals, _) = $arr
+                    .async_retrieve_array_subset_ndarray::<u32>($subset)
+                    .await
+                    .map_err(zarr_err)?
+                    .into_raw_vec_and_offset();
+                CoordValues::Int64(vals.into_iter().map(|v| v as i64).collect())
+            }
+            "int16" => {
+                let (vals, _) = $arr
+                    .async_retrieve_array_subset_ndarray::<i16>($subset)
+                    .await
+                    .map_err(zarr_err)?
+                    .into_raw_vec_and_offset();
+                CoordValues::Int64(vals.into_iter().map(|v| v as i64).collect())
             }
             _ => {
                 let (vals, _) = $arr
@@ -599,7 +646,11 @@ pub async fn read_zarr_async(
 
     for (coord, dtype) in store_meta.coords.iter().zip(coord_types.iter()) {
         let read_start = Instant::now();
-        let array_path = format!("/{}/{}", prefix, coord.name);
+        let array_path = if prefix.as_ref().is_empty() {
+            format!("/{}", coord.name)
+        } else {
+            format!("/{}/{}", prefix, coord.name)
+        };
 
         let arr = Array::async_open(store.clone(), &array_path)
             .await
@@ -856,7 +907,11 @@ pub async fn read_zarr_async(
             // Data variable - read filtered subset
             debug!(field_name = %field_name, "Reading data variable");
             let read_start = Instant::now();
-            let array_path = format!("/{}/{}", prefix, field_name);
+            let array_path = if prefix.as_ref().is_empty() {
+                format!("/{}", field_name)
+            } else {
+                format!("/{}/{}", prefix, field_name)
+            };
             debug!(path = %array_path, "Opening data variable array");
 
             let arr = Array::async_open(store.clone(), &array_path)
