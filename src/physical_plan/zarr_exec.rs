@@ -19,6 +19,9 @@ use zarrs_object_store::object_store::path::Path as ObjectPath;
 /// Cached remote store info (store, prefix, metadata)
 pub type CachedRemoteStore = Option<(AsyncReadableListableStorage, ObjectPath, ZarrStoreMeta)>;
 
+/// Cached VirtualiZarr adapter (pre-loaded refs and metadata)
+pub type CachedVirtualiZarrAdapter = Option<Arc<VirtualStoreAdapter>>;
+
 pub struct ZarrExec {
     schema: SchemaRef,
     path: String,
@@ -30,6 +33,8 @@ pub struct ZarrExec {
     cached_remote: CachedRemoteStore,
     /// Coordinate filters for filter pushdown (e.g., time = X, hybrid = Y)
     coord_filters: Option<CoordFilters>,
+    /// Cached VirtualiZarr adapter for remote VirtualiZarr stores
+    cached_virtualizarr: CachedVirtualiZarrAdapter,
 }
 
 impl std::fmt::Debug for ZarrExec {
@@ -40,6 +45,7 @@ impl std::fmt::Debug for ZarrExec {
             .field("projection", &self.projection)
             .field("limit", &self.limit)
             .field("has_cached_remote", &self.cached_remote.is_some())
+            .field("has_cached_virtualizarr", &self.cached_virtualizarr.is_some())
             .field(
                 "coord_filters",
                 &self
@@ -83,6 +89,7 @@ impl ZarrExec {
         limit: Option<usize>,
         cached_remote: CachedRemoteStore,
         coord_filters: Option<CoordFilters>,
+        cached_virtualizarr: CachedVirtualiZarrAdapter,
     ) -> Self {
         // Compute projected schema for plan properties
         let projected_schema = if let Some(ref indices) = projection {
@@ -111,6 +118,7 @@ impl ZarrExec {
             io_stats: Arc::new(ZarrIoStats::new()),
             cached_remote,
             coord_filters,
+            cached_virtualizarr,
         }
     }
 
@@ -153,12 +161,26 @@ impl ExecutionPlan for ZarrExec {
             limit = ?self.limit,
             projection = ?self.projection,
             has_cached_remote = self.cached_remote.is_some(),
+            has_cached_virtualizarr = self.cached_virtualizarr.is_some(),
             has_coord_filters = self.coord_filters.is_some(),
             "ZarrExec::execute called"
         );
 
+        // Check for cached VirtualiZarr adapter first (remote VirtualiZarr)
+        if let Some(adapter) = &self.cached_virtualizarr {
+            info!("Using cached VirtualiZarr adapter (remote) execution path");
+            return execute_virtualizarr_with_adapter(
+                adapter.clone(),
+                self.schema.clone(),
+                self.projection.clone(),
+                self.limit,
+                self.io_stats.clone(),
+                self.coord_filters.clone(),
+            );
+        }
+
         if is_virtualizarr_store(&self.path) {
-            info!("Using VirtualiZarr (async) execution path");
+            info!("Using VirtualiZarr (local) execution path");
             execute_virtualizarr(
                 self.path.clone(),
                 self.schema.clone(),
@@ -332,6 +354,72 @@ fn execute_virtualizarr(
         debug!("Collecting batches from VirtualiZarr");
         let batches: Vec<RecordBatch> = result_stream.try_collect().await?;
         info!(num_batches = batches.len(), "VirtualiZarr read complete");
+
+        Ok::<_, DataFusionError>(stream::iter(batches.into_iter().map(Ok)))
+    })
+    .try_flatten();
+
+    Ok(Box::pin(RecordBatchStreamAdapter::new(
+        projected_schema,
+        stream,
+    )))
+}
+
+/// Execute read from a cached VirtualiZarr adapter (for remote VirtualiZarr stores)
+fn execute_virtualizarr_with_adapter(
+    adapter: Arc<VirtualStoreAdapter>,
+    schema: SchemaRef,
+    projection: Option<Vec<usize>>,
+    limit: Option<usize>,
+    stats: SharedIoStats,
+    coord_filters: Option<CoordFilters>,
+) -> datafusion::error::Result<datafusion::execution::SendableRecordBatchStream> {
+    use arrow::record_batch::RecordBatch;
+    use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
+    use futures::stream::{self, TryStreamExt};
+
+    debug!("Setting up remote VirtualiZarr execution with cached adapter");
+
+    // Create projected schema
+    let projected_schema = if let Some(ref indices) = projection {
+        Arc::new(Schema::new(
+            indices
+                .iter()
+                .map(|&i| schema.field(i).clone())
+                .collect::<Vec<_>>(),
+        ))
+    } else {
+        schema.clone()
+    };
+
+    // Create the stream that performs async read when polled
+    let stream = stream::once(async move {
+        debug!("Remote VirtualiZarr stream polled - starting async execution");
+
+        // Use the pre-loaded adapter directly
+        let store: AsyncReadableListableStorage = adapter;
+
+        // Empty prefix - VirtualiZarr stores use relative paths internally
+        let prefix = ObjectPath::from("");
+
+        // Read the data (metadata will be discovered from the adapter)
+        debug!("Starting read_zarr_async for remote VirtualiZarr");
+        let result_stream = read_zarr_async(
+            store,
+            &prefix,
+            schema,
+            projection,
+            limit,
+            Some(stats),
+            None, // Let it discover metadata from the adapter
+            coord_filters,
+        )
+        .await?;
+
+        // Collect into batches and return as stream
+        debug!("Collecting batches from remote VirtualiZarr");
+        let batches: Vec<RecordBatch> = result_stream.try_collect().await?;
+        info!(num_batches = batches.len(), "Remote VirtualiZarr read complete");
 
         Ok::<_, DataFusionError>(stream::iter(batches.into_iter().map(Ok)))
     })

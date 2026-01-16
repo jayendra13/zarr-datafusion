@@ -96,6 +96,120 @@ impl VirtualStoreAdapter {
         })
     }
 
+    /// Create a new VirtualStoreAdapter from a remote store asynchronously.
+    ///
+    /// # Arguments
+    /// * `store` - The async storage backend (GCS, S3, etc.)
+    /// * `prefix` - Path prefix to the VirtualiZarr store root
+    /// * `location` - Original location string (for debugging/logging)
+    pub async fn new_async<S>(
+        store: &S,
+        prefix: &ObjectPath,
+        location: &str,
+    ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>>
+    where
+        S: AsyncReadableStorageTraits + AsyncListableStorageTraits,
+    {
+        debug!(location = %location, prefix = %prefix, "Creating async VirtualStoreAdapter");
+
+        // Read .zmetadata from remote store
+        let zmetadata_key = zarrs::storage::StoreKey::new(format!("{}/.zmetadata", prefix))
+            .map_err(|e| format!("Invalid store key: {}", e))?;
+
+        let content_bytes = store
+            .get(&zmetadata_key)
+            .await?
+            .ok_or_else(|| format!("Missing .zmetadata at {}", prefix))?;
+
+        let content = String::from_utf8(content_bytes.to_vec())
+            .map_err(|e| format!("Invalid UTF-8 in .zmetadata: {}", e))?;
+
+        // Handle non-standard JSON values (NaN, Infinity) that Zarr uses
+        let content = content
+            .replace(":NaN", ":null")
+            .replace(": NaN", ": null")
+            .replace(":Infinity", ":null")
+            .replace(": Infinity", ": null")
+            .replace(":-Infinity", ":null")
+            .replace(": -Infinity", ": null");
+
+        let metadata: serde_json::Value = serde_json::from_str(&content)
+            .map_err(|e| format!("Failed to parse .zmetadata: {}", e))?;
+
+        // Pre-parse array metadata for chunk calculations
+        let array_meta = Self::parse_array_metadata(&metadata)?;
+
+        // Load refs for all arrays asynchronously
+        let refs = Self::load_all_refs_async(store, prefix, &array_meta).await?;
+
+        // Create S3 client if any refs point to S3
+        let s3_client = Self::create_s3_client_if_needed(&refs)?;
+
+        debug!(
+            location = %location,
+            arrays = refs.len(),
+            "Created async VirtualStoreAdapter"
+        );
+
+        Ok(Self {
+            store_path: location.to_string(),
+            metadata,
+            refs,
+            s3_client,
+            array_meta,
+        })
+    }
+
+    /// Load parquet refs for all arrays from a remote store asynchronously.
+    /// Uses parallel fetching to minimize total latency.
+    async fn load_all_refs_async<S>(
+        store: &S,
+        prefix: &ObjectPath,
+        array_meta: &HashMap<String, ArrayMetaCache>,
+    ) -> Result<HashMap<String, ParquetRefs>, Box<dyn std::error::Error + Send + Sync>>
+    where
+        S: AsyncReadableStorageTraits + AsyncListableStorageTraits,
+    {
+        use futures::future::join_all;
+        use tracing::{debug, info};
+
+        let array_names: Vec<String> = array_meta.keys().cloned().collect();
+
+        info!(
+            num_arrays = array_names.len(),
+            "Loading parquet refs in parallel"
+        );
+
+        // Create futures for all arrays
+        let fetch_futures: Vec<_> = array_names
+            .iter()
+            .map(|array_name| {
+                let name = array_name.clone();
+                async move {
+                    match ParquetRefs::load_async(store, prefix, &name).await {
+                        Ok(r) => {
+                            debug!(array = %name, count = r.len(), "Loaded refs");
+                            Some((name, r))
+                        }
+                        Err(e) => {
+                            debug!(array = %name, error = %e, "No refs found (may be inline)");
+                            None
+                        }
+                    }
+                }
+            })
+            .collect();
+
+        // Execute all in parallel
+        let results = join_all(fetch_futures).await;
+
+        // Collect successful results
+        let refs: HashMap<String, ParquetRefs> = results.into_iter().flatten().collect();
+
+        info!(loaded = refs.len(), "Loaded parquet refs");
+        Ok(refs)
+    }
+
     /// Parse array metadata from .zmetadata for all arrays
     fn parse_array_metadata(
         metadata: &serde_json::Value,
@@ -203,9 +317,21 @@ impl VirtualStoreAdapter {
         Ok(None)
     }
 
+    /// Get the raw .zmetadata JSON for schema inference
+    pub fn raw_metadata(&self) -> &serde_json::Value {
+        &self.metadata
+    }
+
     /// Get metadata value for a key from .zmetadata
     fn get_metadata(&self, key: &str) -> Result<MaybeBytes, StorageError> {
         let key = key.trim_start_matches('/');
+
+        // Handle .zmetadata - return the full consolidated metadata
+        if key == ".zmetadata" {
+            let json = serde_json::to_vec(&self.metadata)
+                .map_err(|e| StorageError::Other(format!("JSON error: {}", e)))?;
+            return Ok(Some(json.into()));
+        }
 
         // Handle root-level keys
         if key == ".zgroup" {
@@ -335,6 +461,7 @@ impl AsyncReadableStorageTraits for VirtualStoreAdapter {
             || key_str.ends_with(".zattrs")
             || key_str == ".zgroup"
             || key_str.ends_with(".zgroup")
+            || key_str == ".zmetadata"
         {
             debug!(key = %key_str, "Returning metadata");
             return self.get_metadata(key_str);
@@ -537,6 +664,111 @@ pub fn is_virtualizarr_store(path: &str) -> bool {
         return matches.next().is_some();
     }
 
+    false
+}
+
+/// Asynchronously check if a remote path is a VirtualiZarr Parquet reference store.
+///
+/// # Arguments
+/// * `store` - The async storage backend (GCS, S3, etc.)
+/// * `prefix` - Path prefix to check (e.g., "bucket/path/to/store")
+///
+/// Note: This function first tries to check via file existence (works for buckets
+/// without list permissions), then falls back to listing if needed.
+pub async fn is_virtualizarr_store_async<S>(store: &S, prefix: &ObjectPath) -> bool
+where
+    S: AsyncReadableStorageTraits + AsyncListableStorageTraits,
+{
+    // Check for .zmetadata - this is required for VirtualiZarr
+    let zmetadata_key = zarrs::storage::StoreKey::new(format!("{}/.zmetadata", prefix))
+        .expect("Invalid store key");
+
+    // Try to get the .zmetadata file
+    let zmetadata_content = match store.get(&zmetadata_key).await {
+        Ok(Some(content)) => content,
+        _ => {
+            debug!(prefix = %prefix, "No .zmetadata found - not a VirtualiZarr store");
+            return false;
+        }
+    };
+
+    // Parse .zmetadata to find array names, then check for refs.0.parq
+    let content_str = match String::from_utf8(zmetadata_content.to_vec()) {
+        Ok(s) => s,
+        Err(_) => {
+            debug!(prefix = %prefix, "Invalid UTF-8 in .zmetadata");
+            return false;
+        }
+    };
+
+    // Sanitize JSON (handle NaN, Infinity)
+    let content_str = content_str
+        .replace(":NaN", ":null")
+        .replace(": NaN", ": null")
+        .replace(":Infinity", ":null")
+        .replace(": Infinity", ": null")
+        .replace(":-Infinity", ":null")
+        .replace(": -Infinity", ": null");
+
+    let metadata: serde_json::Value = match serde_json::from_str(&content_str) {
+        Ok(v) => v,
+        Err(_) => {
+            debug!(prefix = %prefix, "Failed to parse .zmetadata JSON");
+            return false;
+        }
+    };
+
+    // Extract array names from .zmetadata
+    let meta_obj = match metadata.get("metadata").and_then(|m| m.as_object()) {
+        Some(obj) => obj,
+        None => {
+            debug!(prefix = %prefix, "No 'metadata' object in .zmetadata");
+            return false;
+        }
+    };
+
+    // Find array names (keys ending with /.zarray)
+    let array_names: Vec<String> = meta_obj
+        .keys()
+        .filter_map(|k| {
+            if k.ends_with("/.zarray") {
+                Some(k.trim_end_matches("/.zarray").to_string())
+            } else {
+                None
+            }
+        })
+        .collect();
+
+    // Check if any array has refs.0.parq (the first refs file)
+    // Only check the first few arrays to avoid slow sequential HTTP requests
+    // for large stores (ERA5 has 277 arrays). If it's truly a VirtualiZarr store,
+    // the first few arrays should have refs.
+    let arrays_to_check: Vec<_> = array_names.into_iter().take(5).collect();
+
+    debug!(
+        prefix = %prefix,
+        num_arrays = arrays_to_check.len(),
+        "Checking for VirtualiZarr refs"
+    );
+
+    for array_name in arrays_to_check {
+        let refs_key = zarrs::storage::StoreKey::new(format!(
+            "{}/{}/refs.0.parq",
+            prefix, array_name
+        ));
+        if let Ok(refs_key) = refs_key {
+            if store.size_key(&refs_key).await.ok().flatten().is_some() {
+                debug!(
+                    prefix = %prefix,
+                    array = %array_name,
+                    "Found refs.0.parq - is a VirtualiZarr store"
+                );
+                return true;
+            }
+        }
+    }
+
+    debug!(prefix = %prefix, "No refs.*.parq found - not a VirtualiZarr store");
     false
 }
 

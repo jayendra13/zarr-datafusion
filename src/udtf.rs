@@ -141,18 +141,9 @@ fn build_describe_batch(
         .map(|m| m.data_vars.iter().map(|v| (v.name.as_str(), v)).collect())
         .unwrap_or_default();
 
-    // Build dimension string with sizes for data variables: "(time: 82920, latitude: 721, longitude: 1440)"
-    let dims_str = meta
-        .map(|m| {
-            format!(
-                "({})",
-                m.coords
-                    .iter()
-                    .map(|c| format!("{}: {}", c.name, c.shape[0]))
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            )
-        })
+    // Build coordinate size lookup for dimension strings
+    let coord_sizes: HashMap<&str, u64> = meta
+        .map(|m| m.coords.iter().map(|c| (c.name.as_str(), c.shape[0])).collect())
         .unwrap_or_default();
 
     // Build Zarr-specific arrays
@@ -181,7 +172,43 @@ fn build_describe_batch(
             }));
         } else if let Some(data_var) = data_var_map.get(name.as_str()) {
             types.push(Some("data_var".to_string()));
-            dimensions.push(Some(dims_str.clone()));
+            // Use the variable's actual dimensions, not all coordinates
+            let dims_str = if let Some(dims) = &data_var.dimensions {
+                // Variable has explicit dimension names - use them with sizes
+                format!(
+                    "({})",
+                    dims.iter()
+                        .map(|d| {
+                            let size = coord_sizes.get(d.as_str()).copied().unwrap_or(0);
+                            format!("{}: {}", d, size)
+                        })
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                )
+            } else {
+                // Fallback: infer from shape length matching coordinate count
+                // This is less accurate but handles legacy data
+                let all_coords: Vec<_> = meta
+                    .map(|m| m.coords.iter().collect())
+                    .unwrap_or_default();
+                if data_var.shape.len() == all_coords.len() {
+                    format!(
+                        "({})",
+                        all_coords
+                            .iter()
+                            .map(|c| format!("{}: {}", c.name, c.shape[0]))
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    )
+                } else {
+                    // Shape doesn't match all coords - just show shape
+                    format!(
+                        "(shape: {:?})",
+                        data_var.shape
+                    )
+                }
+            };
+            dimensions.push(Some(dims_str));
             // Size is total elements (product of shape)
             let total: u64 = data_var.shape.iter().product();
             sizes.push(Some(total.to_string()));
