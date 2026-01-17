@@ -1,0 +1,12 @@
+# Copy this file to terraform.tfvars and fill in your values
+# terraform.tfvars should be in .gitignore
+
+project_id = "your-existing-gcp-project-id"
+region     = "us-central1"
+
+github_owner = "jayendra13"
+github_repo  = "zarr-datafusion"
+
+# Name of the GitHub connection you created in Cloud Build Console
+# (Cloud Build > Repositories > Host connections)
+github_connection_name = "github-connection"

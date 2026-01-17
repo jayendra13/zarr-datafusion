@@ -1,0 +1,114 @@
+options:
+  logging: CLOUD_LOGGING_ONLY
+  substitutionOption: ALLOW_LOOSE
+  # Uses default e2-standard-2 (free tier: 2,500 min/month)
+
+substitutions:
+  _ARTIFACT_REGISTRY_URL: ''
+  _RELEASES_BUCKET: ''
+  _CACHE_BUCKET: ''
+  _RUST_VERSION: '1.83'
+
+steps:
+  - name: 'gcr.io/cloud-builders/git'
+    id: 'get-version'
+    entrypoint: 'bash'
+    args:
+      - '-c'
+      - |
+        VERSION=${TAG_NAME#v}
+        echo ${VERSION} > /workspace/VERSION
+        echo ${TAG_NAME} > /workspace/TAG_NAME
+
+  - name: 'rust:${_RUST_VERSION}-bookworm'
+    id: 'verify-version'
+    entrypoint: 'bash'
+    args:
+      - '-c'
+      - |
+        TAG_VERSION=$(cat /workspace/VERSION)
+        CARGO_VERSION=$(grep '^version = ' Cargo.toml | head -1 | sed 's/version = "\(.*\)"/\1/')
+        if [ "${TAG_VERSION}" != "${CARGO_VERSION}" ]; then
+          echo "ERROR: Tag version (${TAG_VERSION}) != Cargo.toml (${CARGO_VERSION})"
+          exit 1
+        fi
+    waitFor: ['get-version']
+
+  - name: 'gcr.io/cloud-builders/gsutil'
+    id: 'restore-cache'
+    entrypoint: 'bash'
+    args:
+      - '-c'
+      - |
+        gsutil -q cp gs://${_CACHE_BUCKET}/cargo-cache.tar.gz /workspace/cargo-cache.tar.gz 2>/dev/null || echo "No cache found"
+        if [ -f /workspace/cargo-cache.tar.gz ]; then
+          tar -xzf /workspace/cargo-cache.tar.gz -C /root 2>/dev/null || true
+        fi
+    volumes:
+      - name: 'cargo'
+        path: '/root/.cargo'
+    waitFor: ['-']
+
+  - name: 'python:3.12-bookworm'
+    id: 'generate-test-data'
+    entrypoint: 'bash'
+    args:
+      - '-c'
+      - |
+        pip install uv
+        uv run --with zarr --with numpy --with xarray --with gcsfs --with dask --with numcodecs scripts/data_gen.py
+    waitFor: ['-']
+
+  - name: 'rust:${_RUST_VERSION}-bookworm'
+    id: 'test'
+    entrypoint: 'cargo'
+    args: ['test', '--verbose']
+    volumes:
+      - name: 'cargo'
+        path: '/root/.cargo'
+    waitFor: ['verify-version', 'restore-cache', 'generate-test-data']
+
+  - name: 'rust:${_RUST_VERSION}-bookworm'
+    id: 'build-linux'
+    entrypoint: 'bash'
+    args:
+      - '-c'
+      - |
+        apt-get update && apt-get install -y musl-tools
+        rustup target add x86_64-unknown-linux-musl
+        cargo build --release --bin zarr-cli --target x86_64-unknown-linux-gnu
+        cargo build --release --bin zarr-cli --target x86_64-unknown-linux-musl
+        cd target/x86_64-unknown-linux-gnu/release && tar czvf /workspace/zarr-cli-x86_64-linux-gnu.tar.gz zarr-cli
+        cd /workspace && cd target/x86_64-unknown-linux-musl/release && tar czvf /workspace/zarr-cli-x86_64-linux-musl.tar.gz zarr-cli
+    volumes:
+      - name: 'cargo'
+        path: '/root/.cargo'
+    waitFor: ['test']
+
+  - name: 'gcr.io/cloud-builders/docker'
+    id: 'docker-push'
+    entrypoint: 'bash'
+    args:
+      - '-c'
+      - |
+        VERSION=$(cat /workspace/VERSION)
+        TAG_NAME=$(cat /workspace/TAG_NAME)
+        docker build -t ${_ARTIFACT_REGISTRY_URL}/zarr-cli:${TAG_NAME} \
+                     -t ${_ARTIFACT_REGISTRY_URL}/zarr-cli:${VERSION} \
+                     -t ${_ARTIFACT_REGISTRY_URL}/zarr-cli:latest .
+        docker push ${_ARTIFACT_REGISTRY_URL}/zarr-cli --all-tags
+    waitFor: ['build-linux']
+
+  - name: 'gcr.io/cloud-builders/gsutil'
+    id: 'upload-binaries'
+    entrypoint: 'bash'
+    args:
+      - '-c'
+      - |
+        TAG_NAME=$(cat /workspace/TAG_NAME)
+        gsutil cp /workspace/zarr-cli-*.tar.gz gs://${_RELEASES_BUCKET}/releases/${TAG_NAME}/
+        sha256sum /workspace/zarr-cli-*.tar.gz > /workspace/checksums.sha256
+        gsutil cp /workspace/checksums.sha256 gs://${_RELEASES_BUCKET}/releases/${TAG_NAME}/
+    waitFor: ['build-linux']
+
+timeout: '2700s'

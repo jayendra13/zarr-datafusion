@@ -1,2 +1,10 @@
 /target
 data/era5_*.zarr
+plans/
+
+# Terraform
+terraform/.terraform/
+terraform/terraform.tfstate
+terraform/terraform.tfstate.backup
+terraform/terraform.tfvars
+*.tfplan

@@ -1,0 +1,118 @@
+options:
+  logging: CLOUD_LOGGING_ONLY
+  substitutionOption: ALLOW_LOOSE
+  # Uses default e2-standard-2 (free tier: 2,500 min/month)
+
+substitutions:
+  _ARTIFACT_REGISTRY_URL: ''
+  _RELEASES_BUCKET: ''
+  _CACHE_BUCKET: ''
+  _BUILD_TYPE: 'pr'
+  _RUST_VERSION: '1.83'
+
+steps:
+  - name: 'gcr.io/cloud-builders/gsutil'
+    id: 'restore-cache'
+    entrypoint: 'bash'
+    args:
+      - '-c'
+      - |
+        gsutil -q cp gs://${_CACHE_BUCKET}/cargo-cache.tar.gz /workspace/cargo-cache.tar.gz 2>/dev/null || echo "No cache found"
+        if [ -f /workspace/cargo-cache.tar.gz ]; then
+          tar -xzf /workspace/cargo-cache.tar.gz -C /root 2>/dev/null || true
+        fi
+    volumes:
+      - name: 'cargo'
+        path: '/root/.cargo'
+
+  - name: 'rust:${_RUST_VERSION}-bookworm'
+    id: 'install-toolchain'
+    entrypoint: 'bash'
+    args:
+      - '-c'
+      - |
+        rustup component add clippy rustfmt
+        rustc --version
+    volumes:
+      - name: 'cargo'
+        path: '/root/.cargo'
+    waitFor: ['restore-cache']
+
+  - name: 'python:3.12-bookworm'
+    id: 'generate-test-data'
+    entrypoint: 'bash'
+    args:
+      - '-c'
+      - |
+        pip install uv
+        uv run --with zarr --with numpy --with xarray --with gcsfs --with dask --with numcodecs scripts/data_gen.py
+    waitFor: ['-']
+
+  - name: 'rust:${_RUST_VERSION}-bookworm'
+    id: 'check-fmt'
+    entrypoint: 'cargo'
+    args: ['fmt', '--', '--check']
+    volumes:
+      - name: 'cargo'
+        path: '/root/.cargo'
+    waitFor: ['install-toolchain']
+
+  - name: 'rust:${_RUST_VERSION}-bookworm'
+    id: 'clippy'
+    entrypoint: 'cargo'
+    args: ['clippy', '--', '-D', 'warnings']
+    volumes:
+      - name: 'cargo'
+        path: '/root/.cargo'
+    waitFor: ['install-toolchain']
+
+  - name: 'rust:${_RUST_VERSION}-bookworm'
+    id: 'build'
+    entrypoint: 'cargo'
+    args: ['build', '--release']
+    volumes:
+      - name: 'cargo'
+        path: '/root/.cargo'
+    waitFor: ['clippy', 'check-fmt']
+
+  - name: 'rust:${_RUST_VERSION}-bookworm'
+    id: 'test'
+    entrypoint: 'cargo'
+    args: ['test', '--verbose']
+    volumes:
+      - name: 'cargo'
+        path: '/root/.cargo'
+    waitFor: ['build', 'generate-test-data']
+
+  - name: 'gcr.io/cloud-builders/gsutil'
+    id: 'save-cache'
+    entrypoint: 'bash'
+    args:
+      - '-c'
+      - |
+        if [ "${_BUILD_TYPE}" = "main" ]; then
+          tar -czf /workspace/cargo-cache.tar.gz -C /root .cargo/registry .cargo/git 2>/dev/null || true
+          gsutil -q cp /workspace/cargo-cache.tar.gz gs://${_CACHE_BUCKET}/cargo-cache.tar.gz || true
+        fi
+    volumes:
+      - name: 'cargo'
+        path: '/root/.cargo'
+    waitFor: ['test']
+
+  - name: 'gcr.io/cloud-builders/docker'
+    id: 'docker-build-push'
+    entrypoint: 'bash'
+    args:
+      - '-c'
+      - |
+        if [ "${_BUILD_TYPE}" = "main" ]; then
+          docker build -t ${_ARTIFACT_REGISTRY_URL}/zarr-cli:${SHORT_SHA} \
+                       -t ${_ARTIFACT_REGISTRY_URL}/zarr-cli:latest .
+          docker push ${_ARTIFACT_REGISTRY_URL}/zarr-cli:${SHORT_SHA}
+          docker push ${_ARTIFACT_REGISTRY_URL}/zarr-cli:latest
+        else
+          docker build -t zarr-cli:test .
+        fi
+    waitFor: ['test']
+
+timeout: '1800s'
