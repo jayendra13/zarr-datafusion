@@ -339,7 +339,7 @@ pub fn read_zarr(
                     encoding,
                     is_timestamp,
                 } => CoordValuesRef::Compact {
-                    encoding: encoding.clone(),
+                    encoding: *encoding,
                     is_timestamp: *is_timestamp,
                 },
             })
@@ -727,7 +727,7 @@ pub async fn read_zarr_async(
                     encoding,
                     is_timestamp,
                 } => CoordValuesRef::Compact {
-                    encoding: encoding.clone(),
+                    encoding: *encoding,
                     is_timestamp: *is_timestamp,
                 },
             })

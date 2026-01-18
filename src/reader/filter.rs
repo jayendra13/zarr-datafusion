@@ -1490,6 +1490,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::identity_op)]
     fn test_calculate_filtered_rows() {
         // time: 1 value, hybrid: 1 value, lat: 721, lon: 1440
         let ranges = vec![(5, 6), (10, 11), (0, 721), (0, 1440)];
