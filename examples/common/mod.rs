@@ -26,7 +26,9 @@ use datafusion::execution::session_state::SessionStateBuilder;
 use datafusion::prelude::SessionContext;
 use tracing_subscriber::EnvFilter;
 use zarr_datafusion::datasource::factory::ZarrTableFactory;
-use zarr_datafusion::optimizer::{CountStatisticsRule, MinMaxStatisticsRule};
+use zarr_datafusion::optimizer::{
+    CountStatisticsRule, MinMaxStatisticsRule, ZarrLimitPushdownRule,
+};
 use zarr_datafusion::udtf::register_zarr_functions;
 
 /// Initialize the tracing subscriber with environment-based filtering.
@@ -47,12 +49,14 @@ pub fn init_tracing() {
 ///
 /// Includes the CountStatisticsRule and MinMaxStatisticsRule optimizers
 /// for efficient count(*) and min/max queries on coordinates.
+/// Also includes ZarrLimitPushdownRule to push LIMIT past filters into ZarrExec.
 /// Also registers zarr_describe() table function for extended DESCRIBE output.
 pub fn create_local_context() -> SessionContext {
     let state = SessionStateBuilder::new()
         .with_default_features()
         .with_optimizer_rule(Arc::new(CountStatisticsRule::new()))
         .with_optimizer_rule(Arc::new(MinMaxStatisticsRule::new()))
+        .with_physical_optimizer_rule(Arc::new(ZarrLimitPushdownRule::new()))
         .build();
     let ctx = SessionContext::new_with_state(state);
     register_zarr_functions(&ctx);
@@ -63,6 +67,7 @@ pub fn create_local_context() -> SessionContext {
 ///
 /// Includes ZarrTableFactory for `CREATE EXTERNAL TABLE ... STORED AS ZARR`,
 /// plus CountStatisticsRule and MinMaxStatisticsRule optimizers.
+/// Also includes ZarrLimitPushdownRule to push LIMIT past filters into ZarrExec.
 /// Also registers zarr_describe() table function for extended DESCRIBE output.
 pub fn create_remote_context() -> SessionContext {
     let state = SessionStateBuilder::new()
@@ -70,6 +75,7 @@ pub fn create_remote_context() -> SessionContext {
         .with_table_factory("ZARR".to_string(), Arc::new(ZarrTableFactory) as _)
         .with_optimizer_rule(Arc::new(CountStatisticsRule::new()))
         .with_optimizer_rule(Arc::new(MinMaxStatisticsRule::new()))
+        .with_physical_optimizer_rule(Arc::new(ZarrLimitPushdownRule::new()))
         .build();
     let ctx = SessionContext::new_with_state(state);
     register_zarr_functions(&ctx);

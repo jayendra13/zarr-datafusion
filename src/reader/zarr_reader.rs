@@ -294,6 +294,14 @@ pub fn read_zarr(
                             CoordValues::TimestampMicros(decode_cf_time_f64(&v64, &unit))
                         }
                         CoordValues::TimestampMicros(_) => raw_values, // Already timestamp
+                        CoordValues::Compact {
+                            is_timestamp: true, ..
+                        } => raw_values, // Already timestamp
+                        CoordValues::Compact { encoding, .. } => {
+                            // Expand compact encoding and apply CF time conversion
+                            let v = encoding.to_vec_i64();
+                            CoordValues::TimestampMicros(decode_cf_time(&v, &unit))
+                        }
                     },
                     Err(e) => {
                         warn!(coord = %coord.name, error = %e, "Failed to parse CF time units, keeping raw values");
@@ -327,6 +335,13 @@ pub fn read_zarr(
                 CoordValues::Float32(vals) => CoordValuesRef::Float32(vals),
                 CoordValues::Float64(vals) => CoordValuesRef::Float64(vals),
                 CoordValues::TimestampMicros(vals) => CoordValuesRef::TimestampMicros(vals),
+                CoordValues::Compact {
+                    encoding,
+                    is_timestamp,
+                } => CoordValuesRef::Compact {
+                    encoding: encoding.clone(),
+                    is_timestamp: *is_timestamp,
+                },
             })
             .collect();
 
@@ -385,14 +400,7 @@ pub fn read_zarr(
         coord_values
             .iter()
             .zip(ranges.iter())
-            .map(|(values, (start, end))| match values {
-                CoordValues::Int64(vals) => CoordValues::Int64(vals[*start..*end].to_vec()),
-                CoordValues::Float32(vals) => CoordValues::Float32(vals[*start..*end].to_vec()),
-                CoordValues::Float64(vals) => CoordValues::Float64(vals[*start..*end].to_vec()),
-                CoordValues::TimestampMicros(vals) => {
-                    CoordValues::TimestampMicros(vals[*start..*end].to_vec())
-                }
-            })
+            .map(|(values, (start, end))| values.slice(*start, *end))
             .collect()
     } else {
         coord_values
@@ -677,6 +685,14 @@ pub async fn read_zarr_async(
                             CoordValues::TimestampMicros(decode_cf_time_f64(&v64, &unit))
                         }
                         CoordValues::TimestampMicros(_) => raw_values, // Already timestamp
+                        CoordValues::Compact {
+                            is_timestamp: true, ..
+                        } => raw_values, // Already timestamp
+                        CoordValues::Compact { encoding, .. } => {
+                            // Expand compact encoding and apply CF time conversion
+                            let v = encoding.to_vec_i64();
+                            CoordValues::TimestampMicros(decode_cf_time(&v, &unit))
+                        }
                     },
                     Err(e) => {
                         warn!(coord = %coord.name, error = %e, "Failed to parse CF time units, keeping raw values");
@@ -707,6 +723,13 @@ pub async fn read_zarr_async(
                 CoordValues::Float32(vals) => CoordValuesRef::Float32(vals),
                 CoordValues::Float64(vals) => CoordValuesRef::Float64(vals),
                 CoordValues::TimestampMicros(vals) => CoordValuesRef::TimestampMicros(vals),
+                CoordValues::Compact {
+                    encoding,
+                    is_timestamp,
+                } => CoordValuesRef::Compact {
+                    encoding: encoding.clone(),
+                    is_timestamp: *is_timestamp,
+                },
             })
             .collect();
 
@@ -766,14 +789,7 @@ pub async fn read_zarr_async(
         all_coord_values
             .iter()
             .zip(ranges.iter())
-            .map(|(values, (start, end))| match values {
-                CoordValues::Int64(vals) => CoordValues::Int64(vals[*start..*end].to_vec()),
-                CoordValues::Float32(vals) => CoordValues::Float32(vals[*start..*end].to_vec()),
-                CoordValues::Float64(vals) => CoordValues::Float64(vals[*start..*end].to_vec()),
-                CoordValues::TimestampMicros(vals) => {
-                    CoordValues::TimestampMicros(vals[*start..*end].to_vec())
-                }
-            })
+            .map(|(values, (start, end))| values.slice(*start, *end))
             .collect()
     } else {
         all_coord_values

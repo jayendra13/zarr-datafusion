@@ -13,7 +13,9 @@ use datafusion::execution::session_state::SessionStateBuilder;
 use datafusion::physical_plan::ExecutionPlan;
 use datafusion::prelude::SessionContext;
 use zarr_datafusion::datasource::zarr::ZarrTable;
-use zarr_datafusion::optimizer::{CountStatisticsRule, MinMaxStatisticsRule};
+use zarr_datafusion::optimizer::{
+    CountStatisticsRule, MinMaxStatisticsRule, ZarrLimitPushdownRule,
+};
 use zarr_datafusion::physical_plan::zarr_exec::ZarrExec;
 use zarr_datafusion::reader::schema_inference::{infer_schema_with_meta, ZarrStoreMeta};
 
@@ -38,12 +40,13 @@ pub const ALL_SYNTHETIC: &[&str] = &[
 /// All ERA5 dataset variants
 pub const ALL_ERA5: &[&str] = &[ERA5_V2, ERA5_V2_BLOSC, ERA5_V3, ERA5_V3_BLOSC];
 
-/// Create a SessionContext with custom optimizer rules (CountStatisticsRule, MinMaxStatisticsRule)
+/// Create a SessionContext with custom optimizer rules (CountStatisticsRule, MinMaxStatisticsRule, ZarrLimitPushdownRule)
 pub fn create_test_context() -> SessionContext {
     let state = SessionStateBuilder::new()
         .with_default_features()
         .with_optimizer_rule(Arc::new(CountStatisticsRule::new()))
         .with_optimizer_rule(Arc::new(MinMaxStatisticsRule::new()))
+        .with_physical_optimizer_rule(Arc::new(ZarrLimitPushdownRule::new()))
         .build();
     SessionContext::new_with_state(state)
 }

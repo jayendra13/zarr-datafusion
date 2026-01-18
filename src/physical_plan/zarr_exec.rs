@@ -129,6 +129,29 @@ impl ZarrExec {
     pub fn io_stats(&self) -> SharedIoStats {
         self.io_stats.clone()
     }
+
+    /// Get the current limit
+    pub fn limit(&self) -> Option<usize> {
+        self.limit
+    }
+
+    /// Get the coordinate filters
+    pub fn coord_filters(&self) -> Option<&CoordFilters> {
+        self.coord_filters.as_ref()
+    }
+
+    /// Create a new ZarrExec with the given limit
+    pub fn with_limit(&self, limit: Option<usize>) -> Self {
+        Self::new(
+            self.schema.clone(),
+            self.path.clone(),
+            self.projection.clone(),
+            limit,
+            self.cached_remote.clone(),
+            self.coord_filters.clone(),
+            self.cached_virtualizarr.clone(),
+        )
+    }
 }
 impl ExecutionPlan for ZarrExec {
     fn name(&self) -> &str {
