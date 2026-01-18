@@ -44,7 +44,10 @@ impl std::fmt::Debug for ZarrTable {
                 "total_rows",
                 &self.store_meta.as_ref().map(|m| m.total_rows),
             )
-            .field("has_virtualizarr_adapter", &self.cached_virtualizarr.is_some())
+            .field(
+                "has_virtualizarr_adapter",
+                &self.cached_virtualizarr.is_some(),
+            )
             .finish()
     }
 }

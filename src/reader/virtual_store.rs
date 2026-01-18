@@ -363,11 +363,7 @@ impl VirtualStoreAdapter {
         }
         let meta_key = key.to_string();
 
-        if let Some(value) = self
-            .metadata
-            .get("metadata")
-            .and_then(|m| m.get(&meta_key))
-        {
+        if let Some(value) = self.metadata.get("metadata").and_then(|m| m.get(&meta_key)) {
             // For .zarray metadata, convert unsupported dtypes
             let value = if meta_key.ends_with(".zarray") {
                 Self::transform_zarray_metadata(value)
@@ -489,14 +485,13 @@ impl AsyncReadableStorageTraits for VirtualStoreAdapter {
         let flat_index = indices_to_flat_index(&chunk_indices, &array_meta.chunks_per_dim);
 
         // Look up the chunk reference
-        let refs = self
-            .refs
-            .get(&array_name)
-            .ok_or_else(|| StorageError::Other(format!("No refs loaded for array: {}", array_name)))?;
+        let refs = self.refs.get(&array_name).ok_or_else(|| {
+            StorageError::Other(format!("No refs loaded for array: {}", array_name))
+        })?;
 
-        let chunk_ref = refs
-            .get(flat_index)
-            .ok_or_else(|| StorageError::Other(format!("Chunk {} not found in refs", flat_index)))?;
+        let chunk_ref = refs.get(flat_index).ok_or_else(|| {
+            StorageError::Other(format!("Chunk {} not found in refs", flat_index))
+        })?;
 
         // Fetch the chunk data
         self.fetch_chunk(chunk_ref).await
@@ -680,8 +675,8 @@ where
     S: AsyncReadableStorageTraits + AsyncListableStorageTraits,
 {
     // Check for .zmetadata - this is required for VirtualiZarr
-    let zmetadata_key = zarrs::storage::StoreKey::new(format!("{}/.zmetadata", prefix))
-        .expect("Invalid store key");
+    let zmetadata_key =
+        zarrs::storage::StoreKey::new(format!("{}/.zmetadata", prefix)).expect("Invalid store key");
 
     // Try to get the .zmetadata file
     let zmetadata_content = match store.get(&zmetadata_key).await {
@@ -752,10 +747,8 @@ where
     );
 
     for array_name in arrays_to_check {
-        let refs_key = zarrs::storage::StoreKey::new(format!(
-            "{}/{}/refs.0.parq",
-            prefix, array_name
-        ));
+        let refs_key =
+            zarrs::storage::StoreKey::new(format!("{}/{}/refs.0.parq", prefix, array_name));
         if let Ok(refs_key) = refs_key {
             if store.size_key(&refs_key).await.ok().flatten().is_some() {
                 debug!(
@@ -819,8 +812,7 @@ mod tests {
         let zarray = adapter.get(&zarray_key).await.unwrap();
         assert!(zarray.is_some());
 
-        let zarray_content: serde_json::Value =
-            serde_json::from_slice(&zarray.unwrap()).unwrap();
+        let zarray_content: serde_json::Value = serde_json::from_slice(&zarray.unwrap()).unwrap();
         println!("t2/.zarray: {:?}", zarray_content);
 
         // Verify shape

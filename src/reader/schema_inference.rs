@@ -148,8 +148,7 @@ pub fn infer_schema_from_zmetadata_json(
 ) -> Result<(Schema, ZarrStoreMeta), Box<dyn std::error::Error + Send + Sync>> {
     use arrow::datatypes::{DataType, Field, TimeUnit};
 
-    let meta = discover_arrays_from_json(metadata)?
-        .ok_or("No arrays found in .zmetadata JSON")?;
+    let meta = discover_arrays_from_json(metadata)?.ok_or("No arrays found in .zmetadata JSON")?;
 
     // Build schema from meta (same logic as infer_schema_with_meta)
     let mut fields: Vec<Field> = Vec::new();
@@ -245,7 +244,10 @@ fn discover_arrays_from_json(
         return Ok(None);
     }
 
-    info!(count = arrays.len(), "Discovered arrays from .zmetadata JSON");
+    info!(
+        count = arrays.len(),
+        "Discovered arrays from .zmetadata JSON"
+    );
     // VirtualiZarr: skip min/max computation (requires S3 access)
     Ok(Some(separate_and_sort_arrays_no_stats(arrays)?))
 }

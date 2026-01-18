@@ -22,7 +22,10 @@ struct MaeUdf {
 impl MaeUdf {
     fn new() -> Self {
         Self {
-            signature: Signature::exact(vec![DataType::Float64, DataType::Float64], Volatility::Immutable),
+            signature: Signature::exact(
+                vec![DataType::Float64, DataType::Float64],
+                Volatility::Immutable,
+            ),
         }
     }
 }
@@ -58,7 +61,10 @@ impl ScalarUDFImpl for MaeUdf {
         Ok(DataType::Float64)
     }
 
-    fn invoke_with_args(&self, args: datafusion::logical_expr::ScalarFunctionArgs) -> Result<ColumnarValue> {
+    fn invoke_with_args(
+        &self,
+        args: datafusion::logical_expr::ScalarFunctionArgs,
+    ) -> Result<ColumnarValue> {
         let forecast = args.args[0].clone().into_array(args.number_rows)?;
         let target = args.args[1].clone().into_array(args.number_rows)?;
 
@@ -94,7 +100,10 @@ struct BiasUdf {
 impl BiasUdf {
     fn new() -> Self {
         Self {
-            signature: Signature::exact(vec![DataType::Float64, DataType::Float64], Volatility::Immutable),
+            signature: Signature::exact(
+                vec![DataType::Float64, DataType::Float64],
+                Volatility::Immutable,
+            ),
         }
     }
 }
@@ -130,7 +139,10 @@ impl ScalarUDFImpl for BiasUdf {
         Ok(DataType::Float64)
     }
 
-    fn invoke_with_args(&self, args: datafusion::logical_expr::ScalarFunctionArgs) -> Result<ColumnarValue> {
+    fn invoke_with_args(
+        &self,
+        args: datafusion::logical_expr::ScalarFunctionArgs,
+    ) -> Result<ColumnarValue> {
         let forecast = args.args[0].clone().into_array(args.number_rows)?;
         let target = args.args[1].clone().into_array(args.number_rows)?;
 
@@ -166,7 +178,10 @@ struct SquaredErrorUdf {
 impl SquaredErrorUdf {
     fn new() -> Self {
         Self {
-            signature: Signature::exact(vec![DataType::Float64, DataType::Float64], Volatility::Immutable),
+            signature: Signature::exact(
+                vec![DataType::Float64, DataType::Float64],
+                Volatility::Immutable,
+            ),
         }
     }
 }
@@ -202,7 +217,10 @@ impl ScalarUDFImpl for SquaredErrorUdf {
         Ok(DataType::Float64)
     }
 
-    fn invoke_with_args(&self, args: datafusion::logical_expr::ScalarFunctionArgs) -> Result<ColumnarValue> {
+    fn invoke_with_args(
+        &self,
+        args: datafusion::logical_expr::ScalarFunctionArgs,
+    ) -> Result<ColumnarValue> {
         let forecast = args.args[0].clone().into_array(args.number_rows)?;
         let target = args.args[1].clone().into_array(args.number_rows)?;
 
@@ -238,7 +256,10 @@ struct GridRoundUdf {
 impl GridRoundUdf {
     fn new() -> Self {
         Self {
-            signature: Signature::exact(vec![DataType::Float64, DataType::Float64], Volatility::Immutable),
+            signature: Signature::exact(
+                vec![DataType::Float64, DataType::Float64],
+                Volatility::Immutable,
+            ),
         }
     }
 }
@@ -274,7 +295,10 @@ impl ScalarUDFImpl for GridRoundUdf {
         Ok(DataType::Float64)
     }
 
-    fn invoke_with_args(&self, args: datafusion::logical_expr::ScalarFunctionArgs) -> Result<ColumnarValue> {
+    fn invoke_with_args(
+        &self,
+        args: datafusion::logical_expr::ScalarFunctionArgs,
+    ) -> Result<ColumnarValue> {
         let coord = args.args[0].clone().into_array(args.number_rows)?;
         let resolution = args.args[1].clone().into_array(args.number_rows)?;
 
@@ -345,7 +369,10 @@ impl ScalarUDFImpl for KelvinToCelsiusUdf {
         Ok(DataType::Float64)
     }
 
-    fn invoke_with_args(&self, args: datafusion::logical_expr::ScalarFunctionArgs) -> Result<ColumnarValue> {
+    fn invoke_with_args(
+        &self,
+        args: datafusion::logical_expr::ScalarFunctionArgs,
+    ) -> Result<ColumnarValue> {
         let kelvin = args.args[0].clone().into_array(args.number_rows)?;
         let kelvin = kelvin.as_any().downcast_ref::<Float64Array>().unwrap();
 
@@ -407,7 +434,10 @@ impl ScalarUDFImpl for IsFreezingUdf {
         Ok(DataType::Boolean)
     }
 
-    fn invoke_with_args(&self, args: datafusion::logical_expr::ScalarFunctionArgs) -> Result<ColumnarValue> {
+    fn invoke_with_args(
+        &self,
+        args: datafusion::logical_expr::ScalarFunctionArgs,
+    ) -> Result<ColumnarValue> {
         let temp = args.args[0].clone().into_array(args.number_rows)?;
         let temp = temp.as_any().downcast_ref::<Float64Array>().unwrap();
 
@@ -472,7 +502,10 @@ impl ScalarUDFImpl for WithinWindowUdf {
         Ok(DataType::Boolean)
     }
 
-    fn invoke_with_args(&self, args: datafusion::logical_expr::ScalarFunctionArgs) -> Result<ColumnarValue> {
+    fn invoke_with_args(
+        &self,
+        args: datafusion::logical_expr::ScalarFunctionArgs,
+    ) -> Result<ColumnarValue> {
         let time = args.args[0].clone().into_array(args.number_rows)?;
         let center = args.args[1].clone().into_array(args.number_rows)?;
         let hours = args.args[2].clone().into_array(args.number_rows)?;
@@ -488,9 +521,7 @@ impl ScalarUDFImpl for WithinWindowUdf {
 
         let result: BooleanArray = time
             .iter()
-            .map(|t| {
-                t.map(|t| t >= (center_val - window_ns) && t <= (center_val + window_ns))
-            })
+            .map(|t| t.map(|t| t >= (center_val - window_ns) && t <= (center_val + window_ns)))
             .collect();
 
         Ok(ColumnarValue::Array(Arc::new(result)))
@@ -520,7 +551,11 @@ mod tests {
             ],
             arg_fields: vec![],
             number_rows: 3,
-            return_field: Arc::new(arrow::datatypes::Field::new("result", DataType::Float64, true)),
+            return_field: Arc::new(arrow::datatypes::Field::new(
+                "result",
+                DataType::Float64,
+                true,
+            )),
             config_options: Arc::new(datafusion::config::ConfigOptions::default()),
         };
 
@@ -552,7 +587,11 @@ mod tests {
             ],
             arg_fields: vec![],
             number_rows: 4,
-            return_field: Arc::new(arrow::datatypes::Field::new("result", DataType::Float64, true)),
+            return_field: Arc::new(arrow::datatypes::Field::new(
+                "result",
+                DataType::Float64,
+                true,
+            )),
             config_options: Arc::new(datafusion::config::ConfigOptions::default()),
         };
 
@@ -561,7 +600,7 @@ mod tests {
         if let ColumnarValue::Array(arr) = result {
             let result = arr.as_any().downcast_ref::<Float64Array>().unwrap();
             assert!((result.value(0) - 45.0).abs() < 0.001);
-            assert!((result.value(1) - 45.25).abs() < 0.001);  // 45.13 rounds to 45.25
+            assert!((result.value(1) - 45.25).abs() < 0.001); // 45.13 rounds to 45.25
             assert!((result.value(2) - 45.25).abs() < 0.001);
             assert!((result.value(3) - 45.25).abs() < 0.001);
         }
@@ -577,7 +616,11 @@ mod tests {
             args: vec![ColumnarValue::Array(Arc::new(kelvin))],
             arg_fields: vec![],
             number_rows: 3,
-            return_field: Arc::new(arrow::datatypes::Field::new("result", DataType::Float64, true)),
+            return_field: Arc::new(arrow::datatypes::Field::new(
+                "result",
+                DataType::Float64,
+                true,
+            )),
             config_options: Arc::new(datafusion::config::ConfigOptions::default()),
         };
 
@@ -601,7 +644,11 @@ mod tests {
             args: vec![ColumnarValue::Array(Arc::new(temp))],
             arg_fields: vec![],
             number_rows: 4,
-            return_field: Arc::new(arrow::datatypes::Field::new("result", DataType::Boolean, true)),
+            return_field: Arc::new(arrow::datatypes::Field::new(
+                "result",
+                DataType::Boolean,
+                true,
+            )),
             config_options: Arc::new(datafusion::config::ConfigOptions::default()),
         };
 
@@ -610,9 +657,9 @@ mod tests {
         if let ColumnarValue::Array(arr) = result {
             let result = arr.as_any().downcast_ref::<BooleanArray>().unwrap();
             assert!(!result.value(0)); // 273.15 is not freezing (exactly 0°C)
-            assert!(result.value(1));  // 273.14 is freezing
+            assert!(result.value(1)); // 273.14 is freezing
             assert!(!result.value(2)); // 280 is not freezing
-            assert!(result.value(3));  // 260 is freezing
+            assert!(result.value(3)); // 260 is freezing
         }
     }
 }

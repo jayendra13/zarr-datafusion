@@ -130,11 +130,9 @@ impl ParquetRefs {
 
             // Safety limit to prevent infinite loops
             if file_index > 10000 {
-                return Err(format!(
-                    "Too many refs files for array '{}' (>10000)",
-                    array_name
-                )
-                .into());
+                return Err(
+                    format!("Too many refs files for array '{}' (>10000)", array_name).into(),
+                );
             }
         }
 
