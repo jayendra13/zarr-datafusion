@@ -69,6 +69,10 @@ jobs:
       - name: Run tests
         run: cargo test --verbose
 
+      - name: Run property tests
+        run: cargo test property_ --release -- --test-threads=1
+        timeout-minutes: 5
+
   coverage:
     runs-on: ubuntu-latest
     container:
