@@ -25,19 +25,6 @@ steps:
       - name: 'cargo'
         path: '/root/.cargo'
 
-  - name: 'rust:${_RUST_VERSION}-bookworm'
-    id: 'install-toolchain'
-    entrypoint: 'bash'
-    args:
-      - '-c'
-      - |
-        rustup component add clippy rustfmt
-        rustc --version
-    volumes:
-      - name: 'cargo'
-        path: '/root/.cargo'
-    waitFor: ['restore-cache']
-
   - name: 'python:3.12-bookworm'
     id: 'generate-test-data'
     entrypoint: 'bash'
@@ -50,21 +37,29 @@ steps:
 
   - name: 'rust:${_RUST_VERSION}-bookworm'
     id: 'check-fmt'
-    entrypoint: 'cargo'
-    args: ['fmt', '--', '--check']
+    entrypoint: 'bash'
+    args:
+      - '-c'
+      - |
+        rustup component add rustfmt
+        cargo fmt -- --check
     volumes:
       - name: 'cargo'
         path: '/root/.cargo'
-    waitFor: ['install-toolchain']
+    waitFor: ['restore-cache']
 
   - name: 'rust:${_RUST_VERSION}-bookworm'
     id: 'clippy'
-    entrypoint: 'cargo'
-    args: ['clippy', '--', '-D', 'warnings']
+    entrypoint: 'bash'
+    args:
+      - '-c'
+      - |
+        rustup component add clippy
+        cargo clippy -- -D warnings
     volumes:
       - name: 'cargo'
         path: '/root/.cargo'
-    waitFor: ['install-toolchain']
+    waitFor: ['restore-cache']
 
   - name: 'rust:${_RUST_VERSION}-bookworm'
     id: 'build'
