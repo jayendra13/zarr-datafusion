@@ -143,7 +143,12 @@ fn build_describe_batch(
 
     // Build coordinate size lookup for dimension strings
     let coord_sizes: HashMap<&str, u64> = meta
-        .map(|m| m.coords.iter().map(|c| (c.name.as_str(), c.shape[0])).collect())
+        .map(|m| {
+            m.coords
+                .iter()
+                .map(|c| (c.name.as_str(), c.shape[0]))
+                .collect()
+        })
         .unwrap_or_default();
 
     // Build Zarr-specific arrays
@@ -188,9 +193,8 @@ fn build_describe_batch(
             } else {
                 // Fallback: infer from shape length matching coordinate count
                 // This is less accurate but handles legacy data
-                let all_coords: Vec<_> = meta
-                    .map(|m| m.coords.iter().collect())
-                    .unwrap_or_default();
+                let all_coords: Vec<_> =
+                    meta.map(|m| m.coords.iter().collect()).unwrap_or_default();
                 if data_var.shape.len() == all_coords.len() {
                     format!(
                         "({})",
@@ -202,10 +206,7 @@ fn build_describe_batch(
                     )
                 } else {
                     // Shape doesn't match all coords - just show shape
-                    format!(
-                        "(shape: {:?})",
-                        data_var.shape
-                    )
+                    format!("(shape: {:?})", data_var.shape)
                 }
             };
             dimensions.push(Some(dims_str));

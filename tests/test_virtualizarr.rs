@@ -2,17 +2,17 @@
 
 mod common;
 
-use std::sync::Arc;
 use arrow::util::pretty::print_batches;
 use datafusion::prelude::SessionContext;
+use std::sync::Arc;
 use zarr_datafusion::datasource::zarr::ZarrTable;
 use zarr_datafusion::reader::schema_inference::infer_schema_with_meta;
 
 const VIRTUALIZARR_PATH: &str = "data/FOUR_v200_GFS.parq";
 
 fn setup_virtualizarr_table(ctx: &SessionContext) -> datafusion::error::Result<()> {
-    let (schema, metadata) = infer_schema_with_meta(VIRTUALIZARR_PATH)
-        .expect("Failed to infer schema");
+    let (schema, metadata) =
+        infer_schema_with_meta(VIRTUALIZARR_PATH).expect("Failed to infer schema");
 
     let schema = Arc::new(schema);
     let table = Arc::new(ZarrTable::with_metadata(
@@ -26,8 +26,8 @@ fn setup_virtualizarr_table(ctx: &SessionContext) -> datafusion::error::Result<(
 
 #[tokio::test]
 async fn test_virtualizarr_schema_inference() -> datafusion::error::Result<()> {
-    let (schema, metadata) = infer_schema_with_meta(VIRTUALIZARR_PATH)
-        .expect("Failed to infer schema");
+    let (schema, metadata) =
+        infer_schema_with_meta(VIRTUALIZARR_PATH).expect("Failed to infer schema");
 
     // Verify we detected the expected coordinates and data variables
     let coord_names: Vec<_> = metadata.coords.iter().map(|c| c.name.as_str()).collect();
@@ -74,7 +74,9 @@ async fn test_virtualizarr_with_coordinates() -> datafusion::error::Result<()> {
     setup_virtualizarr_table(&ctx)?;
 
     // Query with coordinates
-    let df = ctx.sql("SELECT init_time, time, latitude, longitude, t2 FROM gfs LIMIT 10").await?;
+    let df = ctx
+        .sql("SELECT init_time, time, latitude, longitude, t2 FROM gfs LIMIT 10")
+        .await?;
     let results = df.collect().await?;
 
     assert!(!results.is_empty());

@@ -45,7 +45,10 @@ impl std::fmt::Debug for ZarrExec {
             .field("projection", &self.projection)
             .field("limit", &self.limit)
             .field("has_cached_remote", &self.cached_remote.is_some())
-            .field("has_cached_virtualizarr", &self.cached_virtualizarr.is_some())
+            .field(
+                "has_cached_virtualizarr",
+                &self.cached_virtualizarr.is_some(),
+            )
             .field(
                 "coord_filters",
                 &self
@@ -307,8 +310,7 @@ fn execute_virtualizarr(
     debug!(path = %path, "Setting up VirtualiZarr execution stream");
 
     // Pre-discover metadata from local .zmetadata (avoids async discovery issues)
-    let cached_meta = discover_arrays(&path)
-        .map_err(DataFusionError::External)?;
+    let cached_meta = discover_arrays(&path).map_err(DataFusionError::External)?;
 
     // Create projected schema
     let projected_schema = if let Some(ref indices) = projection {
@@ -327,8 +329,7 @@ fn execute_virtualizarr(
         debug!("VirtualiZarr stream polled - starting async execution");
 
         // Create VirtualStoreAdapter
-        let adapter = VirtualStoreAdapter::new(&path)
-            .map_err(DataFusionError::External)?;
+        let adapter = VirtualStoreAdapter::new(&path).map_err(DataFusionError::External)?;
 
         // Wrap in Arc for zarrs
         let store: AsyncReadableListableStorage = Arc::new(adapter);
@@ -419,7 +420,10 @@ fn execute_virtualizarr_with_adapter(
         // Collect into batches and return as stream
         debug!("Collecting batches from remote VirtualiZarr");
         let batches: Vec<RecordBatch> = result_stream.try_collect().await?;
-        info!(num_batches = batches.len(), "Remote VirtualiZarr read complete");
+        info!(
+            num_batches = batches.len(),
+            "Remote VirtualiZarr read complete"
+        );
 
         Ok::<_, DataFusionError>(stream::iter(batches.into_iter().map(Ok)))
     })

@@ -66,11 +66,17 @@ impl AggregateUDFImpl for RmseUdaf {
         Ok(DataType::Float64)
     }
 
-    fn accumulator(&self, _acc_args: datafusion::logical_expr::function::AccumulatorArgs) -> Result<Box<dyn Accumulator>> {
+    fn accumulator(
+        &self,
+        _acc_args: datafusion::logical_expr::function::AccumulatorArgs,
+    ) -> Result<Box<dyn Accumulator>> {
         Ok(Box::new(RmseAccumulator::new()))
     }
 
-    fn state_fields(&self, _args: datafusion::logical_expr::function::StateFieldsArgs) -> Result<Vec<Arc<Field>>> {
+    fn state_fields(
+        &self,
+        _args: datafusion::logical_expr::function::StateFieldsArgs,
+    ) -> Result<Vec<Arc<Field>>> {
         Ok(vec![
             Arc::new(Field::new("sum_squared_error", DataType::Float64, true)),
             Arc::new(Field::new("count", DataType::Int64, true)),
@@ -194,11 +200,17 @@ impl AggregateUDFImpl for MeanMaeUdaf {
         Ok(DataType::Float64)
     }
 
-    fn accumulator(&self, _acc_args: datafusion::logical_expr::function::AccumulatorArgs) -> Result<Box<dyn Accumulator>> {
+    fn accumulator(
+        &self,
+        _acc_args: datafusion::logical_expr::function::AccumulatorArgs,
+    ) -> Result<Box<dyn Accumulator>> {
         Ok(Box::new(MeanMaeAccumulator::new()))
     }
 
-    fn state_fields(&self, _args: datafusion::logical_expr::function::StateFieldsArgs) -> Result<Vec<Arc<Field>>> {
+    fn state_fields(
+        &self,
+        _args: datafusion::logical_expr::function::StateFieldsArgs,
+    ) -> Result<Vec<Arc<Field>>> {
         Ok(vec![
             Arc::new(Field::new("sum_abs_error", DataType::Float64, true)),
             Arc::new(Field::new("count", DataType::Int64, true)),
@@ -237,7 +249,9 @@ impl Accumulator for MeanMaeAccumulator {
         if self.count == 0 {
             Ok(ScalarValue::Float64(None))
         } else {
-            Ok(ScalarValue::Float64(Some(self.sum_abs_error / self.count as f64)))
+            Ok(ScalarValue::Float64(Some(
+                self.sum_abs_error / self.count as f64,
+            )))
         }
     }
 
@@ -321,11 +335,17 @@ impl AggregateUDFImpl for SpatialMeanUdaf {
         Ok(DataType::Float64)
     }
 
-    fn accumulator(&self, _acc_args: datafusion::logical_expr::function::AccumulatorArgs) -> Result<Box<dyn Accumulator>> {
+    fn accumulator(
+        &self,
+        _acc_args: datafusion::logical_expr::function::AccumulatorArgs,
+    ) -> Result<Box<dyn Accumulator>> {
         Ok(Box::new(SpatialMeanAccumulator::new()))
     }
 
-    fn state_fields(&self, _args: datafusion::logical_expr::function::StateFieldsArgs) -> Result<Vec<Arc<Field>>> {
+    fn state_fields(
+        &self,
+        _args: datafusion::logical_expr::function::StateFieldsArgs,
+    ) -> Result<Vec<Arc<Field>>> {
         Ok(vec![
             Arc::new(Field::new("weighted_sum", DataType::Float64, true)),
             Arc::new(Field::new("weight_sum", DataType::Float64, true)),
@@ -367,7 +387,9 @@ impl Accumulator for SpatialMeanAccumulator {
         if self.weight_sum == 0.0 {
             Ok(ScalarValue::Float64(None))
         } else {
-            Ok(ScalarValue::Float64(Some(self.weighted_sum / self.weight_sum)))
+            Ok(ScalarValue::Float64(Some(
+                self.weighted_sum / self.weight_sum,
+            )))
         }
     }
 
@@ -475,7 +497,11 @@ mod tests {
         let result = acc.evaluate().unwrap();
         if let ScalarValue::Float64(Some(mean)) = result {
             // Equator weight >> pole weight, so mean should be close to 300
-            assert!(mean > 290.0, "Mean {} should be closer to equator value 300", mean);
+            assert!(
+                mean > 290.0,
+                "Mean {} should be closer to equator value 300",
+                mean
+            );
         } else {
             panic!("Expected Float64 result");
         }

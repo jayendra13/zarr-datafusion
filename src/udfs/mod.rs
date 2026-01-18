@@ -117,8 +117,7 @@ mod tests {
         let ctx = create_test_context().await;
 
         let coords = Float64Array::from(vec![45.12, 45.13, 45.24, 45.26]);
-        let batch =
-            RecordBatch::try_from_iter(vec![("lat", Arc::new(coords) as _)]).unwrap();
+        let batch = RecordBatch::try_from_iter(vec![("lat", Arc::new(coords) as _)]).unwrap();
 
         ctx.register_batch("coords", batch).unwrap();
 
@@ -137,7 +136,7 @@ mod tests {
             .unwrap();
 
         assert!((rounded.value(0) - 45.0).abs() < 0.001);
-        assert!((rounded.value(1) - 45.25).abs() < 0.001);  // 45.13 rounds to 45.25
+        assert!((rounded.value(1) - 45.25).abs() < 0.001); // 45.13 rounds to 45.25
         assert!((rounded.value(2) - 45.25).abs() < 0.001);
         assert!((rounded.value(3) - 45.25).abs() < 0.001);
     }
@@ -149,13 +148,12 @@ mod tests {
         // Times in nanoseconds: center at 100, check ±12 hours
         let hour_ns: i64 = 3600 * 1_000_000_000;
         let times = Int64Array::from(vec![
-            100 * hour_ns,        // center
+            100 * hour_ns,                // center
             100 * hour_ns + 6 * hour_ns,  // +6h (in window)
             100 * hour_ns - 12 * hour_ns, // -12h (edge, in window)
             100 * hour_ns + 13 * hour_ns, // +13h (out of window)
         ]);
-        let batch =
-            RecordBatch::try_from_iter(vec![("time_ns", Arc::new(times) as _)]).unwrap();
+        let batch = RecordBatch::try_from_iter(vec![("time_ns", Arc::new(times) as _)]).unwrap();
 
         ctx.register_batch("times", batch).unwrap();
 
@@ -176,9 +174,9 @@ mod tests {
             .downcast_ref::<arrow::array::BooleanArray>()
             .unwrap();
 
-        assert!(in_window.value(0));  // center
-        assert!(in_window.value(1));  // +6h
-        assert!(in_window.value(2));  // -12h
+        assert!(in_window.value(0)); // center
+        assert!(in_window.value(1)); // +6h
+        assert!(in_window.value(2)); // -12h
         assert!(!in_window.value(3)); // +13h
     }
 }
