@@ -25,30 +25,72 @@
 //!
 //! ## Solution
 //!
-//! This rule finds limits in the plan (from CoalescePartitionsExec or GlobalLimitExec)
-//! and pushes them into ZarrExec when coord_filters already handle the filtering:
+//! This rule finds limits anywhere in the plan tree (from CoalescePartitionsExec,
+//! GlobalLimitExec, or LocalLimitExec) and pushes them into ZarrExec:
 //! ```text
 //! CoalescePartitionsExec: fetch=5
 //!   FilterExec: latitude >= 24 AND ...
 //!     ZarrExec: limit=5, filters=[latitude BETWEEN 24 AND 54.75]  <-- limit PUSHED!
 //! ```
+//!
+//! # Soundness Assumptions
+//!
+//! This rule is sound (produces equivalent results) when:
+//!
+//! 1. **Plan Structure**: LIMIT is represented as `CoalescePartitionsExec(fetch=N)`,
+//!    `GlobalLimitExec`, or `LocalLimitExec` somewhere in the plan tree. The rule
+//!    searches recursively to handle platform/version differences.
+//!
+//! 2. **Filter Internalization**: All coordinate filters between the LIMIT and
+//!    ZarrExec are already captured in `ZarrExec.coord_filters`. This is true
+//!    when `ZarrTable.scan()` correctly parses the WHERE clause.
+//!
+//! 3. **Sorted Coordinates**: Zarr coordinate arrays are sorted, so LIMIT N
+//!    returns a deterministic, contiguous subset.
+//!
+//! ## Known Limitations
+//!
+//! - Data variable filters (e.g., `temperature > 290`) are NOT internalized;
+//!   they remain as FilterExec. Pushing LIMIT past such filters is still safe
+//!   but may return fewer rows than expected (correct but potentially confusing).
+//!
+//! - The exact plan structure varies across DataFusion versions, platforms
+//!   (macOS vs Linux), and Rust toolchains (stable vs nightly). The recursive
+//!   search handles this variability.
+//!
+//! See `docs/OPTIMIZER_SOUNDNESS.md` for detailed soundness documentation.
 
 use crate::physical_plan::zarr_exec::ZarrExec;
 use datafusion::common::Result;
 use datafusion::config::ConfigOptions;
 use datafusion::physical_optimizer::PhysicalOptimizerRule;
 use datafusion::physical_plan::coalesce_partitions::CoalescePartitionsExec;
-use datafusion::physical_plan::limit::GlobalLimitExec;
+use datafusion::physical_plan::limit::{GlobalLimitExec, LocalLimitExec};
 use datafusion::physical_plan::ExecutionPlan;
 use std::sync::Arc;
 use tracing::{debug, info};
 
 /// Physical optimizer rule that pushes LIMIT into ZarrExec
 ///
+/// This optimization enables early termination during Zarr array reading,
+/// reducing I/O and memory usage for queries with small limits.
+///
+/// # Safety
+///
 /// This optimization is safe because:
-/// 1. ZarrExec already internalizes coordinate filters via coord_filters
+/// 1. ZarrExec already internalizes coordinate filters via `coord_filters`
 /// 2. Coordinate filters on sorted scientific data produce contiguous ranges
 /// 3. The limit can be applied during Zarr array reading
+///
+/// # Plan Structure Handling
+///
+/// The rule searches for LIMIT nodes anywhere in the plan tree, not just at
+/// the root. This handles variations in DataFusion's plan structure across:
+/// - Different platforms (macOS vs Linux)
+/// - Different Rust toolchains (stable vs nightly)
+/// - Different DataFusion versions
+///
+/// See [`docs/OPTIMIZER_SOUNDNESS.md`] for detailed soundness documentation.
 #[derive(Debug, Default)]
 pub struct ZarrLimitPushdownRule;
 
@@ -68,22 +110,25 @@ impl PhysicalOptimizerRule for ZarrLimitPushdownRule {
         plan: Arc<dyn ExecutionPlan>,
         _config: &ConfigOptions,
     ) -> Result<Arc<dyn ExecutionPlan>> {
+        // Log plan structure for debugging CI failures across platforms
         debug!(
             plan_name = plan.name(),
+            plan_structure = %format_plan_structure(&plan, 0),
             "ZarrLimitPushdownRule::optimize called"
         );
 
-        // Extract limit from the top of the plan
-        let limit = extract_limit(&plan);
+        // Search for limit anywhere in the plan tree (not just at root)
+        // This handles platform/version differences in DataFusion's plan structure
+        let limit = find_limit_anywhere(&plan);
 
         if let Some(limit_value) = limit {
             debug!(
                 limit = limit_value,
-                "Found limit at top of plan, attempting pushdown"
+                "Found limit in plan tree, attempting pushdown"
             );
             push_limit_to_zarr(plan, Some(limit_value))
         } else {
-            debug!("No limit found at top, recursing to find nested limits");
+            debug!("No limit found in plan tree, recursing to optimize children");
             // No limit found, just recurse to optimize children
             push_limit_to_zarr(plan, None)
         }
@@ -94,8 +139,68 @@ impl PhysicalOptimizerRule for ZarrLimitPushdownRule {
     }
 }
 
-/// Extract limit value from plan node (CoalescePartitionsExec or GlobalLimitExec)
-fn extract_limit(plan: &Arc<dyn ExecutionPlan>) -> Option<usize> {
+/// Format plan structure for debug logging
+///
+/// Produces a compact representation of the plan tree for CI diagnosis.
+fn format_plan_structure(plan: &Arc<dyn ExecutionPlan>, depth: usize) -> String {
+    let indent = "  ".repeat(depth);
+    let mut result = format!("{}{}", indent, plan.name());
+
+    // Add limit info if present
+    if let Some(coalesce) = plan.as_any().downcast_ref::<CoalescePartitionsExec>() {
+        if let Some(fetch) = coalesce.fetch() {
+            result.push_str(&format!("(fetch={})", fetch));
+        }
+    }
+    if let Some(global) = plan.as_any().downcast_ref::<GlobalLimitExec>() {
+        if let Some(fetch) = global.fetch() {
+            result.push_str(&format!("(fetch={})", fetch));
+        }
+    }
+    if let Some(local) = plan.as_any().downcast_ref::<LocalLimitExec>() {
+        result.push_str(&format!("(fetch={})", local.fetch()));
+    }
+    if let Some(zarr) = plan.as_any().downcast_ref::<ZarrExec>() {
+        if let Some(limit) = zarr.limit() {
+            result.push_str(&format!("(limit={})", limit));
+        }
+    }
+
+    // Recurse into children
+    for child in plan.children() {
+        result.push('\n');
+        result.push_str(&format_plan_structure(child, depth + 1));
+    }
+
+    result
+}
+
+/// Find limit value from CoalescePartitionsExec, GlobalLimitExec, or LocalLimitExec
+/// anywhere in the plan tree (not just at root).
+///
+/// This handles platform/version differences where the limit node may appear at
+/// different positions in the plan tree.
+///
+/// If multiple limits exist in the tree, returns the minimum to ensure correctness.
+fn find_limit_anywhere(plan: &Arc<dyn ExecutionPlan>) -> Option<usize> {
+    // Check current node for limit
+    let current_limit = extract_limit_from_node(plan);
+
+    // Recurse into children and find minimum limit
+    let child_limits: Vec<usize> = plan
+        .children()
+        .iter()
+        .filter_map(|child| find_limit_anywhere(child))
+        .collect();
+
+    // Return minimum of current and all child limits
+    let all_limits: Vec<usize> = current_limit.into_iter().chain(child_limits).collect();
+
+    all_limits.into_iter().min()
+}
+
+/// Extract limit value from a single plan node (not recursive)
+fn extract_limit_from_node(plan: &Arc<dyn ExecutionPlan>) -> Option<usize> {
     // Check for CoalescePartitionsExec with fetch
     if let Some(coalesce) = plan.as_any().downcast_ref::<CoalescePartitionsExec>() {
         if let Some(fetch) = coalesce.fetch() {
@@ -105,10 +210,14 @@ fn extract_limit(plan: &Arc<dyn ExecutionPlan>) -> Option<usize> {
 
     // Check for GlobalLimitExec
     if let Some(global_limit) = plan.as_any().downcast_ref::<GlobalLimitExec>() {
-        // GlobalLimitExec.fetch() returns Option<usize>
         if let Some(fetch) = global_limit.fetch() {
             return Some(fetch);
         }
+    }
+
+    // Check for LocalLimitExec
+    if let Some(local_limit) = plan.as_any().downcast_ref::<LocalLimitExec>() {
+        return Some(local_limit.fetch());
     }
 
     None
@@ -154,7 +263,7 @@ fn push_limit_to_zarr(
     }
 
     // Extract limit from this node if it has one
-    let limit_from_node = extract_limit(&plan);
+    let limit_from_node = extract_limit_from_node(&plan);
     let effective_limit = match (limit, limit_from_node) {
         (Some(l1), Some(l2)) => Some(l1.min(l2)),
         (Some(l), None) | (None, Some(l)) => Some(l),

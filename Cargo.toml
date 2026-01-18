@@ -52,3 +52,6 @@ version = "0.53"
 
 [dependencies.nu-ansi-term]
 version = "0.50"
+
+[dev-dependencies]
+proptest = "1.0"
