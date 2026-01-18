@@ -8,7 +8,7 @@ substitutions:
   _RELEASES_BUCKET: ''
   _CACHE_BUCKET: ''
   _BUILD_TYPE: 'pr'
-  _RUST_VERSION: '1.83'
+  _RUST_VERSION: 'bookworm'  # Uses latest stable Rust on Debian Bookworm
 
 steps:
   - name: 'gcr.io/cloud-builders/gsutil'
@@ -35,7 +35,7 @@ steps:
         uv run --with zarr --with numpy --with xarray --with gcsfs --with dask --with numcodecs scripts/data_gen.py
     waitFor: ['-']
 
-  - name: 'rust:${_RUST_VERSION}-bookworm'
+  - name: 'rust:${_RUST_VERSION}'
     id: 'check-fmt'
     entrypoint: 'bash'
     args:
@@ -48,7 +48,7 @@ steps:
         path: '/root/.cargo'
     waitFor: ['restore-cache']
 
-  - name: 'rust:${_RUST_VERSION}-bookworm'
+  - name: 'rust:${_RUST_VERSION}'
     id: 'clippy'
     entrypoint: 'bash'
     args:
@@ -61,7 +61,7 @@ steps:
         path: '/root/.cargo'
     waitFor: ['restore-cache']
 
-  - name: 'rust:${_RUST_VERSION}-bookworm'
+  - name: 'rust:${_RUST_VERSION}'
     id: 'build'
     entrypoint: 'cargo'
     args: ['build', '--release']
@@ -70,7 +70,7 @@ steps:
         path: '/root/.cargo'
     waitFor: ['clippy', 'check-fmt']
 
-  - name: 'rust:${_RUST_VERSION}-bookworm'
+  - name: 'rust:${_RUST_VERSION}'
     id: 'test'
     entrypoint: 'cargo'
     args: ['test', '--verbose']

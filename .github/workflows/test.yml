@@ -15,19 +15,8 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  build:
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - os: ubuntu-latest
-            target: x86_64-unknown-linux-gnu
-          # - os: windows-latest
-          #   target: x86_64-pc-windows-msvc
-          - os: macos-latest
-            target: aarch64-apple-darwin
-    runs-on: ${{ matrix.os }}
-
+  lint:
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
 
@@ -35,7 +24,6 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy, rustfmt
-          targets: ${{ matrix.target }}
 
       - name: Cache cargo registry
         uses: actions/cache@v4
@@ -43,22 +31,40 @@ jobs:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
-          key: ${{ runner.os }}-${{ matrix.target }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          key: ${{ runner.os }}-cargo-lint-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Check formatting
+        run: cargo fmt -- --check
+
+      - name: Run clippy
+        run: cargo clippy -- -D warnings
+
+  test-macos:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin
+
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: macos-cargo-${{ hashFiles('**/Cargo.lock') }}
 
       - name: Install uv
         uses: astral-sh/setup-uv@v4
 
       - name: Generate test data
-        shell: bash
         run: ./scripts/generate_data.sh
 
-      - name: Run clippy
-        if: matrix.os == 'ubuntu-latest'
-        run: cargo clippy -- -D warnings
-
-      - name: Check formatting
-        if: matrix.os == 'ubuntu-latest'
-        run: cargo fmt -- --check
+      - name: Build
+        run: cargo build --verbose
 
       - name: Run tests
         run: cargo test --verbose
@@ -69,7 +75,6 @@ jobs:
       image: xd009642/tarpaulin:develop-nightly
       options: --security-opt seccomp=unconfined
     env:
-      # Limit parallel jobs to reduce memory usage during linking
       CARGO_BUILD_JOBS: 2
     steps:
       - uses: actions/checkout@v4
@@ -80,7 +85,7 @@ jobs:
       - name: Generate test data
         run: ./scripts/generate_data.sh
 
-      - name: Run coverage
+      - name: Run coverage (includes tests)
         run: cargo +nightly tarpaulin --verbose --workspace --timeout 300 --out xml --skip-clean
 
       - name: Upload to Codecov
