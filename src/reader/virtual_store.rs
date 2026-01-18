@@ -784,7 +784,6 @@ mod tests {
 
         // Should have loaded refs for multiple arrays
         assert!(!adapter.refs.is_empty());
-        println!("Loaded refs for {} arrays", adapter.refs.len());
 
         // Should have array metadata
         assert!(!adapter.array_meta.is_empty());
@@ -813,7 +812,6 @@ mod tests {
         assert!(zarray.is_some());
 
         let zarray_content: serde_json::Value = serde_json::from_slice(&zarray.unwrap()).unwrap();
-        println!("t2/.zarray: {:?}", zarray_content);
 
         // Verify shape
         let shape = zarray_content.get("shape").unwrap().as_array().unwrap();

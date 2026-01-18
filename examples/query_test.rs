@@ -1,0 +1,78 @@
+//!
+//! Run with:
+//!   cargo run --example query_test
+//!
+//! Run with tracing enabled:
+//!   RUST_LOG=info cargo run --example query_test
+//!   RUST_LOG=debug cargo run --example query_test
+//!   RUST_LOG=zarr_datafusion=debug cargo run --example query_test
+
+mod common;
+
+use tracing::info;
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    common::init_tracing();
+    let ctx = common::create_remote_context();
+
+    println!("Zarr-DataFusion GCS Example");
+    println!("============================\n");
+    info!("Starting GCS example");
+
+    // Register ERA5 dataset from GCS (public bucket, no credentials needed)
+    // let gcs_url = "gs://gcp-public-data-arco-era5/ar/model-level-1h-0p25deg.zarr-v1";
+    let gcs_url = "gs://gcp-public-data-arco-era5/ar/full_37-1h-0p25deg-chunk-1.zarr-v3";
+    println!("Registering ERA5 dataset from GCS...");
+    println!("URL: {}\n", gcs_url);
+
+    let start = std::time::Instant::now();
+    ctx.sql(&format!(
+        "CREATE EXTERNAL TABLE era5 STORED AS ZARR LOCATION '{}'",
+        gcs_url
+    ))
+    .await?
+    .collect()
+    .await?;
+    println!("Table registered in {:?}\n", start.elapsed());
+
+    // Show schema with extended Zarr metadata
+    // println!("Schema:");
+    // println!("-------");
+    // let df = ctx.sql("SELECT * FROM zarr_describe('era5')").await?;
+    // df.show().await?;
+
+    // Sample query with LIMIT
+    let query = r#"
+        SELECT 
+            time, latitude, longitude, "2m_temperature" 
+        FROM era5 
+        WHERE 
+            time = '2021-02-10 12:00:00' 
+            AND
+            latitude BETWEEN 24.0 AND 54.75
+            AND
+            longitude BETWEEN 250.0 AND 278.75"#;
+
+    println!("\nExecuting query (optimized - uses statistics, no data scan):");
+    println!("{}", query);
+    println!("------------------------------------------------------------------------");
+    let start = std::time::Instant::now();
+    let df = ctx.sql(query).await?;
+
+    // Print the logical and physical plans to debug limit pushdown
+    println!("\nLogical Plan:");
+    println!("{}", df.logical_plan().display_indent());
+
+    let physical_plan = df.clone().create_physical_plan().await?;
+    println!("\nPhysical Plan:");
+    println!(
+        "{}",
+        datafusion::physical_plan::displayable(physical_plan.as_ref()).indent(true)
+    );
+
+    df.show().await?;
+    println!("Query completed in {:?}\n", start.elapsed());
+
+    Ok(())
+}

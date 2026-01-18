@@ -8,6 +8,7 @@
 //! `time = X AND hybrid = Y` allows us to read only the slice of data where
 //! those coordinates match, dramatically reducing memory usage.
 
+use crate::reader::coord::CompactCoord;
 use datafusion::common::ScalarValue;
 use datafusion::logical_expr::{Between, Expr, Operator};
 use std::collections::HashMap;
@@ -98,6 +99,83 @@ impl CoordFilters {
     pub fn len(&self) -> usize {
         self.filters.len()
     }
+}
+
+/// Check if filters can possibly be satisfied based on coordinate min/max bounds
+///
+/// This is an early rejection optimization that avoids loading coordinate data
+/// when filters are clearly outside the coordinate's value range.
+///
+/// Returns `true` if filters could potentially be satisfied (no early rejection),
+/// `false` if filters are definitely unsatisfiable (early rejection).
+///
+/// # Arguments
+/// * `filters` - The parsed coordinate filters from the query
+/// * `coord_meta` - Metadata for coordinate arrays, including min/max bounds
+///
+/// # Example
+/// For a latitude coordinate with bounds (24.0, 54.75), a filter like
+/// `latitude = 100.0` would return `false` (impossible).
+pub fn filter_satisfiable_by_bounds(
+    filters: &CoordFilters,
+    coord_meta: &[super::schema_inference::ZarrArrayMeta],
+) -> bool {
+    for (coord_name, filter_kind) in &filters.filters {
+        // Find the coordinate metadata
+        let coord = match coord_meta.iter().find(|c| &c.name == coord_name) {
+            Some(c) => c,
+            None => continue, // Coordinate not found, skip (shouldn't happen)
+        };
+
+        // Check if coordinate has min/max bounds
+        let (coord_min, coord_max) = match coord.coord_min_max {
+            Some(bounds) => bounds,
+            None => continue, // No bounds available, can't early-reject
+        };
+
+        // Check if filter overlaps with coordinate bounds
+        let satisfiable = match filter_kind {
+            CoordFilterKind::Eq(value) => {
+                // Equality filter: value must be within [min, max]
+                match scalar_to_f64(value) {
+                    Some(v) => v >= coord_min && v <= coord_max,
+                    None => true, // Can't check, assume satisfiable
+                }
+            }
+            CoordFilterKind::Range {
+                low,
+                high,
+                low_inclusive: _,
+                high_inclusive: _,
+            } => {
+                // Range filter: ranges must overlap
+                // Filter range [filter_low, filter_high] overlaps coord range [coord_min, coord_max]
+                // if filter_high >= coord_min AND filter_low <= coord_max
+                let filter_low = low.as_ref().and_then(scalar_to_f64);
+                let filter_high = high.as_ref().and_then(scalar_to_f64);
+
+                match (filter_low, filter_high) {
+                    (Some(fl), Some(fh)) => fh >= coord_min && fl <= coord_max,
+                    (Some(fl), None) => fl <= coord_max, // >= fl, check if fl <= max
+                    (None, Some(fh)) => fh >= coord_min, // <= fh, check if fh >= min
+                    (None, None) => true,                // Unbounded, always satisfiable
+                }
+            }
+        };
+
+        if !satisfiable {
+            info!(
+                coord = %coord_name,
+                filter = %filter_kind,
+                coord_min,
+                coord_max,
+                "Early rejection: filter outside coordinate bounds"
+            );
+            return false;
+        }
+    }
+
+    true
 }
 
 /// Intermediate structure for collecting partial bounds during filter parsing
@@ -464,6 +542,11 @@ pub enum CoordValuesRef<'a> {
     /// Note: Filter pushdown for timestamps is limited - we compare raw microsecond values.
     /// Full timestamp string parsing (e.g., `time = '2020-01-01'`) is not yet supported.
     TimestampMicros(&'a [i64]),
+    /// Compact encoding (arithmetic sequence, etc.) - O(1) lookup
+    Compact {
+        encoding: CompactCoord,
+        is_timestamp: bool,
+    },
 }
 
 impl<'a> CoordValuesRef<'a> {
@@ -473,6 +556,7 @@ impl<'a> CoordValuesRef<'a> {
             CoordValuesRef::Float32(v) => v.len(),
             CoordValuesRef::Float64(v) => v.len(),
             CoordValuesRef::TimestampMicros(v) => v.len(),
+            CoordValuesRef::Compact { encoding, .. } => encoding.len(),
         }
     }
 
@@ -527,11 +611,90 @@ fn find_value_index(values: &CoordValuesRef<'_>, target: &ScalarValue) -> Option
             // Allow comparing timestamps with raw i64 microsecond values
             vals.iter().position(|x| x == v)
         }
+        // Compact coordinate O(1) lookup for arithmetic sequences
+        (
+            CoordValuesRef::Compact {
+                encoding,
+                is_timestamp,
+            },
+            target,
+        ) => find_compact_index(encoding, *is_timestamp, target),
         _ => {
             debug!(
                 target_type = ?std::mem::discriminant(target),
                 "Unsupported filter value type for coordinate lookup"
             );
+            None
+        }
+    }
+}
+
+/// O(1) index lookup for compact (arithmetic) coordinates
+///
+/// For arithmetic sequence `value[i] = first + i * step`, we compute:
+/// `index = (target - first) / step` and verify it's valid.
+fn find_compact_index(
+    encoding: &CompactCoord,
+    is_timestamp: bool,
+    target: &ScalarValue,
+) -> Option<usize> {
+    // Convert target to appropriate numeric type
+    let target_f64 = match target {
+        ScalarValue::Int64(Some(v)) => *v as f64,
+        ScalarValue::Int32(Some(v)) => *v as f64,
+        ScalarValue::Float32(Some(v)) => *v as f64,
+        ScalarValue::Float64(Some(v)) => *v,
+        ScalarValue::TimestampMicrosecond(Some(v), _) if is_timestamp => *v as f64,
+        ScalarValue::TimestampNanosecond(Some(v), _) if is_timestamp => (*v / 1000) as f64,
+        _ => {
+            debug!(
+                target_type = ?std::mem::discriminant(target),
+                "Unsupported target type for compact coordinate lookup"
+            );
+            return None;
+        }
+    };
+
+    match encoding {
+        CompactCoord::ArithmeticInt { first, step, len } => {
+            if *step == 0 {
+                // Constant sequence - only index 0 if target matches
+                return if (target_f64 - *first as f64).abs() < f64::EPSILON {
+                    Some(0)
+                } else {
+                    None
+                };
+            }
+            let target_i64 = target_f64.round() as i64;
+            let diff = target_i64 - first;
+            if diff % step != 0 {
+                return None; // Not evenly divisible
+            }
+            let index = (diff / step) as usize;
+            if index < *len {
+                Some(index)
+            } else {
+                None
+            }
+        }
+        CompactCoord::Arithmetic { first, step, len } => {
+            if step.abs() < f64::EPSILON {
+                // Constant sequence
+                return if (target_f64 - first).abs() < f64::EPSILON {
+                    Some(0)
+                } else {
+                    None
+                };
+            }
+            let index_f64 = (target_f64 - first) / step;
+            let index = index_f64.round() as usize;
+            // Verify this index produces the target value (within tolerance)
+            if index < *len {
+                let computed = first + (index as f64) * step;
+                if (computed - target_f64).abs() < 1e-9 {
+                    return Some(index);
+                }
+            }
             None
         }
     }
@@ -553,6 +716,154 @@ fn scalar_to_f64(value: &ScalarValue) -> Option<f64> {
     }
 }
 
+// ============================================================================
+// Compact coordinate helper functions for O(1) range queries
+// ============================================================================
+
+/// For compact ascending: find first index where value >= target
+fn compact_lower_bound(encoding: &CompactCoord, target_f64: f64) -> usize {
+    match encoding {
+        CompactCoord::ArithmeticInt { first, step, len } => {
+            if *step == 0 {
+                return if (*first as f64) >= target_f64 {
+                    0
+                } else {
+                    *len
+                };
+            }
+            // index = ceil((target - first) / step)
+            let diff = target_f64 - (*first as f64);
+            let idx = (diff / (*step as f64)).ceil() as i64;
+            idx.clamp(0, *len as i64) as usize
+        }
+        CompactCoord::Arithmetic { first, step, len } => {
+            if step.abs() < f64::EPSILON {
+                return if *first >= target_f64 { 0 } else { *len };
+            }
+            let diff = target_f64 - first;
+            let idx = (diff / step).ceil() as i64;
+            idx.clamp(0, *len as i64) as usize
+        }
+    }
+}
+
+/// For compact ascending: find count of values <= target (exclusive end index)
+fn compact_upper_bound(encoding: &CompactCoord, target_f64: f64) -> usize {
+    match encoding {
+        CompactCoord::ArithmeticInt { first, step, len } => {
+            if *step == 0 {
+                return if (*first as f64) <= target_f64 {
+                    *len
+                } else {
+                    0
+                };
+            }
+            // Count of values <= target = floor((target - first) / step) + 1
+            let diff = target_f64 - (*first as f64);
+            let idx = (diff / (*step as f64)).floor() as i64 + 1;
+            idx.clamp(0, *len as i64) as usize
+        }
+        CompactCoord::Arithmetic { first, step, len } => {
+            if step.abs() < f64::EPSILON {
+                return if *first <= target_f64 { *len } else { 0 };
+            }
+            let diff = target_f64 - first;
+            let idx = (diff / step).floor() as i64 + 1;
+            idx.clamp(0, *len as i64) as usize
+        }
+    }
+}
+
+/// For compact descending: find first index where value <= target (or < if not inclusive)
+fn compact_first_leq_descending(
+    encoding: &CompactCoord,
+    target_f64: f64,
+    inclusive: bool,
+) -> usize {
+    // Descending means step < 0, values go from high to low
+    // We want first index where value <= target
+    match encoding {
+        CompactCoord::ArithmeticInt { first, step, len } => {
+            if *step == 0 {
+                let first_f64 = *first as f64;
+                if inclusive {
+                    return if first_f64 <= target_f64 { 0 } else { *len };
+                } else {
+                    return if first_f64 < target_f64 { 0 } else { *len };
+                }
+            }
+            // For descending (step < 0): value[i] = first + i * step
+            // Want first i where first + i*step <= target (or < target)
+            // i >= (first - target) / (-step)
+            let step_f64 = *step as f64;
+            let first_f64 = *first as f64;
+            let idx = if inclusive {
+                ((first_f64 - target_f64) / (-step_f64)).ceil() as i64
+            } else {
+                ((first_f64 - target_f64) / (-step_f64) + f64::EPSILON).ceil() as i64
+            };
+            idx.clamp(0, *len as i64) as usize
+        }
+        CompactCoord::Arithmetic { first, step, len } => {
+            if step.abs() < f64::EPSILON {
+                if inclusive {
+                    return if *first <= target_f64 { 0 } else { *len };
+                } else {
+                    return if *first < target_f64 { 0 } else { *len };
+                }
+            }
+            let idx = if inclusive {
+                ((first - target_f64) / (-step)).ceil() as i64
+            } else {
+                ((first - target_f64) / (-step) + f64::EPSILON).ceil() as i64
+            };
+            idx.clamp(0, *len as i64) as usize
+        }
+    }
+}
+
+/// For compact descending: find first index where value < target (or <= if not inclusive)
+fn compact_first_lt_descending(encoding: &CompactCoord, target_f64: f64, inclusive: bool) -> usize {
+    // For descending, find first index where value < target (exclusive end)
+    match encoding {
+        CompactCoord::ArithmeticInt { first, step, len } => {
+            if *step == 0 {
+                let first_f64 = *first as f64;
+                if inclusive {
+                    return if first_f64 >= target_f64 { *len } else { 0 };
+                } else {
+                    return if first_f64 > target_f64 { *len } else { 0 };
+                }
+            }
+            let step_f64 = *step as f64;
+            let first_f64 = *first as f64;
+            // For descending: want first i where first + i*step < target
+            // i > (first - target) / (-step)
+            let idx = if inclusive {
+                ((first_f64 - target_f64) / (-step_f64)).floor() as i64 + 1
+            } else {
+                ((first_f64 - target_f64) / (-step_f64)).ceil() as i64
+            };
+            idx.clamp(0, *len as i64) as usize
+        }
+        CompactCoord::Arithmetic { first, step, len } => {
+            if step.abs() < f64::EPSILON {
+                if inclusive {
+                    return if *first >= target_f64 { *len } else { 0 };
+                } else {
+                    return if *first > target_f64 { *len } else { 0 };
+                }
+            }
+            let idx = if inclusive {
+                ((first - target_f64) / (-step)).floor() as i64 + 1
+            } else {
+                ((first - target_f64) / (-step)).ceil() as i64
+            };
+            idx.clamp(0, *len as i64) as usize
+        }
+    }
+}
+
 /// Check if coordinate values are sorted in descending order
 fn is_descending(values: &CoordValuesRef<'_>) -> bool {
     if values.len() < 2 {
@@ -563,6 +874,13 @@ fn is_descending(values: &CoordValuesRef<'_>) -> bool {
         CoordValuesRef::Float32(vals) => vals[0] > vals[vals.len() - 1],
         CoordValuesRef::Float64(vals) => vals[0] > vals[vals.len() - 1],
         CoordValuesRef::TimestampMicros(vals) => vals[0] > vals[vals.len() - 1],
+        CoordValuesRef::Compact { encoding, .. } => {
+            // For arithmetic sequences, descending if step < 0
+            match encoding {
+                CompactCoord::Arithmetic { step, .. } => *step < 0.0,
+                CompactCoord::ArithmeticInt { step, .. } => *step < 0,
+            }
+        }
     }
 }
 
@@ -578,6 +896,10 @@ fn binary_search_lower_bound(values: &CoordValuesRef<'_>, target: &ScalarValue) 
         CoordValuesRef::Float32(vals) => vals.partition_point(|&x| (x as f64) < target_f64),
         CoordValuesRef::Float64(vals) => vals.partition_point(|&x| x < target_f64),
         CoordValuesRef::TimestampMicros(vals) => vals.partition_point(|&x| (x as f64) < target_f64),
+        CoordValuesRef::Compact { encoding, .. } => {
+            // For arithmetic: index = ceil((target - first) / step)
+            compact_lower_bound(encoding, target_f64)
+        }
     };
 
     Some(result)
@@ -599,6 +921,10 @@ fn binary_search_upper_bound(values: &CoordValuesRef<'_>, target: &ScalarValue) 
         CoordValuesRef::Float64(vals) => vals.partition_point(|&x| x <= target_f64),
         CoordValuesRef::TimestampMicros(vals) => {
             vals.partition_point(|&x| (x as f64) <= target_f64)
+        }
+        CoordValuesRef::Compact { encoding, .. } => {
+            // For arithmetic: index = floor((target - first) / step) + 1
+            compact_upper_bound(encoding, target_f64)
         }
     };
 
@@ -764,6 +1090,9 @@ fn find_first_leq_descending(
                 vals.partition_point(|&x| (x as f64) >= target_f64)
             }
         }
+        CoordValuesRef::Compact { encoding, .. } => {
+            compact_first_leq_descending(encoding, target_f64, inclusive)
+        }
     };
 
     Some(result)
@@ -809,6 +1138,9 @@ fn find_first_lt_descending(
             } else {
                 vals.partition_point(|&x| (x as f64) > target_f64)
             }
+        }
+        CoordValuesRef::Compact { encoding, .. } => {
+            compact_first_lt_descending(encoding, target_f64, inclusive)
         }
     };
 
@@ -1637,5 +1969,176 @@ mod tests {
         // Single coordinate projection should return only that coordinate
         assert!(result.is_ok());
         assert_eq!(result.unwrap(), vec![0]); // time=0
+    }
+
+    // ==================== filter_satisfiable_by_bounds tests ====================
+
+    #[test]
+    fn test_filter_satisfiable_by_bounds_equality_within() {
+        use super::super::schema_inference::ZarrArrayMeta;
+
+        let coords = vec![ZarrArrayMeta {
+            name: "lat".to_string(),
+            data_type: "float64".to_string(),
+            shape: vec![100],
+            chunks: None,
+            coord_min_max: Some((0.0, 90.0)),
+            cf_time_attrs: None,
+            dimensions: None,
+        }];
+
+        let mut filters = CoordFilters::new();
+        filters.filters.insert(
+            "lat".to_string(),
+            CoordFilterKind::Eq(ScalarValue::Float64(Some(45.0))),
+        );
+
+        assert!(filter_satisfiable_by_bounds(&filters, &coords));
+    }
+
+    #[test]
+    fn test_filter_satisfiable_by_bounds_equality_outside() {
+        use super::super::schema_inference::ZarrArrayMeta;
+
+        let coords = vec![ZarrArrayMeta {
+            name: "lat".to_string(),
+            data_type: "float64".to_string(),
+            shape: vec![100],
+            chunks: None,
+            coord_min_max: Some((0.0, 90.0)),
+            cf_time_attrs: None,
+            dimensions: None,
+        }];
+
+        let mut filters = CoordFilters::new();
+        filters.filters.insert(
+            "lat".to_string(),
+            CoordFilterKind::Eq(ScalarValue::Float64(Some(100.0))),
+        );
+
+        assert!(!filter_satisfiable_by_bounds(&filters, &coords));
+    }
+
+    #[test]
+    fn test_filter_satisfiable_by_bounds_range_overlapping() {
+        use super::super::schema_inference::ZarrArrayMeta;
+
+        let coords = vec![ZarrArrayMeta {
+            name: "time".to_string(),
+            data_type: "int64".to_string(),
+            shape: vec![100],
+            chunks: None,
+            coord_min_max: Some((0.0, 100.0)),
+            cf_time_attrs: None,
+            dimensions: None,
+        }];
+
+        let mut filters = CoordFilters::new();
+        filters.filters.insert(
+            "time".to_string(),
+            CoordFilterKind::Range {
+                low: Some(ScalarValue::Int64(Some(50))),
+                high: Some(ScalarValue::Int64(Some(150))),
+                low_inclusive: true,
+                high_inclusive: true,
+            },
+        );
+
+        // Range [50, 150] overlaps with coord bounds [0, 100]
+        assert!(filter_satisfiable_by_bounds(&filters, &coords));
+    }
+
+    #[test]
+    fn test_filter_satisfiable_by_bounds_range_completely_outside() {
+        use super::super::schema_inference::ZarrArrayMeta;
+
+        let coords = vec![ZarrArrayMeta {
+            name: "time".to_string(),
+            data_type: "int64".to_string(),
+            shape: vec![100],
+            chunks: None,
+            coord_min_max: Some((0.0, 100.0)),
+            cf_time_attrs: None,
+            dimensions: None,
+        }];
+
+        let mut filters = CoordFilters::new();
+        filters.filters.insert(
+            "time".to_string(),
+            CoordFilterKind::Range {
+                low: Some(ScalarValue::Int64(Some(200))),
+                high: Some(ScalarValue::Int64(Some(300))),
+                low_inclusive: true,
+                high_inclusive: true,
+            },
+        );
+
+        // Range [200, 300] is completely outside coord bounds [0, 100]
+        assert!(!filter_satisfiable_by_bounds(&filters, &coords));
+    }
+
+    #[test]
+    fn test_filter_satisfiable_by_bounds_no_bounds() {
+        use super::super::schema_inference::ZarrArrayMeta;
+
+        let coords = vec![ZarrArrayMeta {
+            name: "lat".to_string(),
+            data_type: "float64".to_string(),
+            shape: vec![100],
+            chunks: None,
+            coord_min_max: None, // No bounds available
+            cf_time_attrs: None,
+            dimensions: None,
+        }];
+
+        let mut filters = CoordFilters::new();
+        filters.filters.insert(
+            "lat".to_string(),
+            CoordFilterKind::Eq(ScalarValue::Float64(Some(999.0))),
+        );
+
+        // Without bounds, we can't early-reject, so return true
+        assert!(filter_satisfiable_by_bounds(&filters, &coords));
+    }
+
+    #[test]
+    fn test_filter_satisfiable_by_bounds_half_open_range() {
+        use super::super::schema_inference::ZarrArrayMeta;
+
+        let coords = vec![ZarrArrayMeta {
+            name: "lon".to_string(),
+            data_type: "float64".to_string(),
+            shape: vec![360],
+            chunks: None,
+            coord_min_max: Some((-180.0, 180.0)),
+            cf_time_attrs: None,
+            dimensions: None,
+        }];
+
+        // Test >= 170 (overlaps with coord max 180)
+        let mut filters = CoordFilters::new();
+        filters.filters.insert(
+            "lon".to_string(),
+            CoordFilterKind::Range {
+                low: Some(ScalarValue::Float64(Some(170.0))),
+                high: None,
+                low_inclusive: true,
+                high_inclusive: true,
+            },
+        );
+        assert!(filter_satisfiable_by_bounds(&filters, &coords));
+
+        // Test >= 200 (completely outside)
+        let mut filters = CoordFilters::new();
+        filters.filters.insert(
+            "lon".to_string(),
+            CoordFilterKind::Range {
+                low: Some(ScalarValue::Float64(Some(200.0))),
+                high: None,
+                low_inclusive: true,
+                high_inclusive: true,
+            },
+        );
+        assert!(!filter_satisfiable_by_bounds(&filters, &coords));
     }
 }

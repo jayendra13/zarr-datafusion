@@ -15,7 +15,9 @@ use rustyline::error::ReadlineError;
 use rustyline::Editor;
 use tracing_subscriber::EnvFilter;
 use zarr_datafusion::datasource::factory::ZarrTableFactory;
-use zarr_datafusion::optimizer::{CountStatisticsRule, MinMaxStatisticsRule};
+use zarr_datafusion::optimizer::{
+    CountStatisticsRule, MinMaxStatisticsRule, ZarrLimitPushdownRule,
+};
 use zarr_datafusion::physical_plan::zarr_exec::ZarrExec;
 use zarr_datafusion::reader::stats::{format_bytes, SharedIoStats};
 use zarr_datafusion::udfs::register_metric_udfs;
@@ -59,6 +61,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         .with_table_factory("ZARR".to_string(), Arc::new(ZarrTableFactory) as _)
         .with_optimizer_rule(Arc::new(CountStatisticsRule::new()))
         .with_optimizer_rule(Arc::new(MinMaxStatisticsRule::new()))
+        .with_physical_optimizer_rule(Arc::new(ZarrLimitPushdownRule::new()))
         .build();
     let ctx = SessionContext::new_with_state(state);
 

@@ -346,17 +346,10 @@ mod tests {
 
         // Should have loaded refs (t2 has 160,474 chunks = 3914 * 41)
         assert!(!refs.is_empty());
-        println!("Loaded {} refs for t2", refs.len());
 
         // First ref should point to S3
         let first = refs.get(0).unwrap();
         assert!(first.path.starts_with("s3://"));
         assert!(first.size > 0);
-        println!(
-            "First ref: path={}, offset={}, size={}",
-            &first.path[..80],
-            first.offset,
-            first.size
-        );
     }
 }
