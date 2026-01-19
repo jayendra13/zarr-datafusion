@@ -6,7 +6,6 @@ plans/
 __pycache__/
 *.so
 .hypothesis/
-uv.lock
 .venv/
 
 # Terraform
