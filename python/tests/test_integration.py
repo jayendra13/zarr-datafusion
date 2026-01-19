@@ -126,7 +126,12 @@ def agg_query(draw):
 
 @st.composite
 def limit_query(draw):
-    # Always include a data column to avoid DictionaryArray optimization differences
+    # TODO: Remove this workaround once issue #9 is fixed.
+    # When selecting only coordinate columns (e.g., SELECT lat FROM data LIMIT 11),
+    # the Rust CLI returns only 10 rows (the number of unique lat values in the
+    # DictionaryArray) instead of 11 rows from the expanded Cartesian product.
+    # Workaround: always include a data column to force full row expansion.
+    # See: https://github.com/jayendra13/zarr-datafusion/issues/9
     data_col = draw(st.sampled_from(DATA_COLS))
     extra_cols = draw(st.lists(st.sampled_from(COLS), min_size=0, max_size=3, unique=True))
     cols = [data_col] + [c for c in extra_cols if c != data_col]
