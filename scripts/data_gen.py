@@ -210,23 +210,19 @@ def main() -> None:
             generate_synthetic(version, with_codecs)
     print()
 
-    # Download ERA5 once and create all variations
+    # Download ERA5 once and create all variations (optional - may fail in CI)
     print("=" * 60)
     print("ERA5 DATASETS")
     print("=" * 60)
-    generate_era5_all_variations()
+    try:
+        generate_era5_all_variations()
+    except Exception as e:
+        print(f"  Skipping ERA5 (network unavailable): {e}")
     print()
 
     print("=" * 60)
-    print("DONE - Generated 8 dataset variations")
+    print("DONE")
     print("=" * 60)
-    print()
-    print("Datasets created:")
-    for dataset in ["synthetic", "era5"]:
-        for version in [2, 3]:
-            for with_codecs in [False, True]:
-                path = get_store_path(dataset, version, with_codecs)
-                print(f"  {path}")
 
 
 if __name__ == "__main__":
