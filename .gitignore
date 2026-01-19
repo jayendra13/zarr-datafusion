@@ -2,6 +2,13 @@
 data/era5_*.zarr
 plans/
 
+# Python
+__pycache__/
+*.so
+.hypothesis/
+uv.lock
+.venv/
+
 # Terraform
 terraform/.terraform/
 terraform/terraform.tfstate
