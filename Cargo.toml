@@ -12,8 +12,18 @@ readme = "README.md"
 keywords = ["zarr", "datafusion", "sql", "arrow", "scientific-data"]
 categories = ["database", "science", "data-structures"]
 
+[lib]
+# When python feature is enabled, build as cdylib for Python extension
+# Normal library builds still work via rlib
+crate-type = ["rlib", "cdylib"]
+
+[features]
+default = []
+python = ["dep:pyo3", "dep:datafusion-ffi", "dep:arrow-pyarrow"]
+
 [dependencies]
-arrow = "57.1.0"
+arrow = { version = "57.1.0", features = ["ffi"] }
+arrow-pyarrow = { version = "57.1.0", optional = true }
 async-trait = "0.1"
 bytes = "1.5"
 chrono = "0.4"
@@ -53,5 +63,20 @@ version = "0.53"
 [dependencies.nu-ansi-term]
 version = "0.50"
 
+[dependencies.pyo3]
+version = "0.26"
+features = ["extension-module"]
+optional = true
+
+[dependencies.datafusion-ffi]
+version = "51.0.0"
+optional = true
+
 [dev-dependencies]
 proptest = "1.0"
+
+[build-dependencies]
+pyo3-build-config = { version = "0.26", optional = true }
+
+[target.'cfg(unix)'.build-dependencies]
+pyo3-build-config = { version = "0.26", optional = true }

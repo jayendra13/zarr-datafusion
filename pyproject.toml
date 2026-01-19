@@ -1,0 +1,65 @@
+[build-system]
+requires = ["maturin>=1.0,<2.0"]
+build-backend = "maturin"
+
+[project]
+name = "zarr-datafusion"
+version = "0.1.0"
+description = "Query Zarr and Xarray data with SQL via DataFusion"
+readme = "README.md"
+license = {text = "Apache-2.0"}
+requires-python = ">=3.10"
+authors = [
+    {name = "zarr-datafusion contributors"}
+]
+keywords = ["zarr", "datafusion", "sql", "arrow", "xarray", "scientific-data"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: Apache Software License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Rust",
+    "Topic :: Scientific/Engineering",
+    "Topic :: Database",
+]
+dependencies = [
+    "pyarrow>=14.0.0",
+    "datafusion>=41.0.0",
+]
+
+[project.optional-dependencies]
+xarray = [
+    "xarray>=2024.1.0",
+    "zarr>=2.0.0",
+]
+dev = [
+    "pytest>=7.0.0",
+    "pytest-asyncio>=0.21.0",
+    "hypothesis>=6.0.0",
+    "numpy>=1.24.0",
+]
+all = [
+    "zarr-datafusion[xarray]",
+    "zarr-datafusion[dev]",
+]
+
+[project.urls]
+Homepage = "https://github.com/jayendra13/zarr-datafusion"
+Repository = "https://github.com/jayendra13/zarr-datafusion"
+Documentation = "https://docs.rs/zarr-datafusion"
+
+[tool.maturin]
+features = ["python"]
+python-source = "python"
+module-name = "zarr_datafusion._native"
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["python/tests"]
+markers = [
+    "integration: marks tests as integration tests",
+    "slow: marks tests as slow (deselect with '-m \"not slow\"')",
+]
