@@ -9,7 +9,7 @@
     "name": "regular",
     "configuration": {
       "chunk_shape": [
-        1,
+        7,
         10,
         10
       ]
@@ -28,12 +28,21 @@
       "configuration": {
         "endian": "little"
       }
+    },
+    {
+      "name": "zstd",
+      "configuration": {
+        "level": 0,
+        "checksum": false
+      }
     }
   ],
-  "attributes": {
-    "units": "%",
-    "long_name": "Relative Humidity"
-  },
+  "attributes": {},
+  "dimension_names": [
+    "time",
+    "lat",
+    "lon"
+  ],
   "zarr_format": 3,
   "node_type": "array",
   "storage_transformers": []

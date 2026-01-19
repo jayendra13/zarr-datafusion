@@ -1,4 +1,7 @@
 {
-  "units": "%",
-  "long_name": "Relative Humidity"
+  "_ARRAY_DIMENSIONS": [
+    "time",
+    "lat",
+    "lon"
+  ]
 }

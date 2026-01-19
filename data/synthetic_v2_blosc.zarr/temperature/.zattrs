@@ -1,4 +1,7 @@
 {
-  "units": "K",
-  "long_name": "Air Temperature"
+  "_ARRAY_DIMENSIONS": [
+    "time",
+    "lat",
+    "lon"
+  ]
 }

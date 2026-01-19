@@ -24,9 +24,19 @@
       "configuration": {
         "endian": "little"
       }
+    },
+    {
+      "name": "zstd",
+      "configuration": {
+        "level": 0,
+        "checksum": false
+      }
     }
   ],
   "attributes": {},
+  "dimension_names": [
+    "time"
+  ],
   "zarr_format": 3,
   "node_type": "array",
   "storage_transformers": []

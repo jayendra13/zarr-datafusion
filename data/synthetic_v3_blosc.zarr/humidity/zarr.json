@@ -9,7 +9,7 @@
     "name": "regular",
     "configuration": {
       "chunk_shape": [
-        1,
+        7,
         10,
         10
       ]
@@ -40,10 +40,12 @@
       }
     }
   ],
-  "attributes": {
-    "units": "%",
-    "long_name": "Relative Humidity"
-  },
+  "attributes": {},
+  "dimension_names": [
+    "time",
+    "lat",
+    "lon"
+  ],
   "zarr_format": 3,
   "node_type": "array",
   "storage_transformers": []
