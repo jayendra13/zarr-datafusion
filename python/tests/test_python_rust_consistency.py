@@ -21,6 +21,13 @@ from hypothesis import given, settings, assume, HealthCheck
 from hypothesis import strategies as st
 
 from zarr_datafusion import LazyArrowStreamTable
+from zarr_datafusion.xarray_reader import (
+    XarrayRecordBatchReader,
+    read_xarray_table,
+    xarray_to_arrow_table,
+    parse_schema,
+    block_slices,
+)
 
 # Import test fixtures
 from conftest import (
@@ -42,6 +49,9 @@ ALL_COLUMNS = COORDINATE_COLUMNS + DATA_COLUMNS
 
 # Aggregation functions that work with numeric data
 AGG_FUNCTIONS = ["COUNT", "SUM", "AVG", "MIN", "MAX"]
+
+# Default chunking for efficient streaming
+DEFAULT_CHUNKS = {"time": 3, "lat": 5, "lon": 5}
 
 
 @st.composite
@@ -146,38 +156,23 @@ def load_xarray_dataset(zarr_path: str) -> xr.Dataset:
     return xr.open_zarr(zarr_path)
 
 
-def xarray_to_arrow_table(ds: xr.Dataset) -> pa.Table:
-    """Convert an xarray Dataset to a PyArrow Table.
+def run_query_on_xarray_chunked(
+    zarr_path: str,
+    sql: str,
+    chunks: Optional[dict] = None
+) -> List[pa.RecordBatch]:
+    """Run a SQL query on data loaded via xarray with chunked streaming.
 
-    This flattens the multidimensional data into a 2D table format,
-    matching the behavior of zarr-datafusion's Rust reader.
+    This uses the efficient XarrayRecordBatchReader with block_slices
+    for memory-efficient streaming.
     """
-    # Convert to dataframe (flattens the data)
-    df = ds.to_dataframe().reset_index()
+    if chunks is None:
+        chunks = DEFAULT_CHUNKS
 
-    # Convert to Arrow table
-    return pa.Table.from_pandas(df, preserve_index=False)
+    ds = load_xarray_dataset(zarr_path)
 
-
-def create_xarray_stream_factory(zarr_path: str):
-    """Create a factory function that returns Arrow streams from xarray."""
-    def factory():
-        ds = load_xarray_dataset(zarr_path)
-        table = xarray_to_arrow_table(ds)
-        return table.to_reader()
-
-    return factory
-
-
-def run_query_on_xarray(zarr_path: str, sql: str) -> List[pa.RecordBatch]:
-    """Run a SQL query on data loaded via xarray -> Arrow stream."""
-    # Create factory and get schema
-    factory = create_xarray_stream_factory(zarr_path)
-    sample_reader = factory()
-    schema = sample_reader.schema
-
-    # Create lazy table
-    table = LazyArrowStreamTable(factory, schema)
+    # Use the efficient chunked reader
+    table = read_xarray_table(ds, chunks=chunks)
 
     # Register and query
     ctx = SessionContext()
@@ -187,25 +182,15 @@ def run_query_on_xarray(zarr_path: str, sql: str) -> List[pa.RecordBatch]:
 
 
 def run_query_on_rust_zarr(zarr_path: str, sql: str) -> List[pa.RecordBatch]:
-    """Run a SQL query on data loaded via Rust Zarr reader.
+    """Run a SQL query on data loaded via Rust Zarr reader simulation.
 
-    This uses DataFusion's Python bindings to create a context,
-    then uses the Rust-based Zarr table provider.
+    This uses xarray with chunked conversion to Arrow as the "ground truth"
+    for comparison. In production, this would use the actual Rust ZarrTable.
     """
-    # For now, we'll use a workaround: load via xarray but with
-    # a different table name to simulate the Rust path.
-    # In production, this would use the actual Rust ZarrTable.
-
-    # Since we can't easily call the Rust ZarrTable from Python without
-    # additional bindings, we'll use xarray as the "ground truth" for both
-    # paths but with different processing to catch any transformation issues.
-
-    # Alternative approach: Use subprocess to run a Rust binary that outputs
-    # query results as JSON/Arrow, then compare.
-
-    # For this test, we use the direct Arrow table approach as "Rust simulation"
     ds = load_xarray_dataset(zarr_path)
-    table = xarray_to_arrow_table(ds)
+
+    # Use chunked conversion to match what Rust does
+    table = xarray_to_arrow_table(ds, chunks=DEFAULT_CHUNKS)
 
     ctx = SessionContext()
     ctx.register_record_batches("data", [table.to_batches()])
@@ -297,6 +282,88 @@ def _values_equal(a: Any, b: Any) -> bool:
 
 
 # =============================================================================
+# Tests for XarrayRecordBatchReader chunking
+# =============================================================================
+
+@pytest.mark.integration
+class TestXarrayReaderChunking:
+    """Tests verifying the chunked reader works correctly."""
+
+    @pytest.fixture(autouse=True)
+    def setup(self):
+        """Check that test data exists."""
+        if not SYNTHETIC_V3.exists():
+            pytest.skip(f"Test data not found: {SYNTHETIC_V3}")
+        self.zarr_path = str(SYNTHETIC_V3)
+        self.ds = xr.open_zarr(self.zarr_path)
+
+    def test_block_slices_generates_blocks(self):
+        """Test that block_slices generates correct blocks."""
+        chunks = {"time": 3, "lat": 5, "lon": 5}
+        blocks = list(block_slices(self.ds, chunks))
+
+        # Should generate multiple blocks
+        assert len(blocks) > 1, "Should generate multiple blocks"
+
+        # Each block should have slices for all dimensions
+        for block in blocks:
+            assert set(block.keys()) == set(self.ds.dims.keys())
+            for dim, sl in block.items():
+                assert isinstance(sl, slice)
+
+    def test_chunked_reader_lazy_iteration(self):
+        """Test that XarrayRecordBatchReader iterates lazily."""
+        iterations = []
+
+        def track_iteration(block):
+            iterations.append(block)
+
+        reader = XarrayRecordBatchReader(
+            self.ds,
+            chunks={"time": 3},
+            _iteration_callback=track_iteration
+        )
+
+        # No iterations yet
+        assert len(iterations) == 0, "Should not iterate during creation"
+
+        # Consume the reader
+        pa_reader = pa.RecordBatchReader.from_stream(reader)
+        batches = list(pa_reader)
+
+        # Now we should have iterations
+        assert len(iterations) > 0, "Should iterate when consumed"
+        assert len(batches) == len(iterations), "One batch per block"
+
+    def test_chunked_reader_schema(self):
+        """Test that schema is correctly extracted."""
+        reader = XarrayRecordBatchReader(self.ds, chunks={"time": 3})
+        schema = reader.schema
+
+        # Should have columns for coordinates and data variables
+        expected_cols = set(COORDINATE_COLUMNS + DATA_COLUMNS)
+        actual_cols = set(schema.names)
+        assert expected_cols == actual_cols
+
+    def test_read_xarray_table_multiple_queries(self):
+        """Test that read_xarray_table supports multiple queries."""
+        table = read_xarray_table(self.ds, chunks={"time": 3})
+
+        ctx = SessionContext()
+        ctx.register_table("data", table)
+
+        # First query
+        result1 = ctx.sql("SELECT COUNT(*) FROM data").collect()
+        count1 = result1[0].column(0)[0].as_py()
+
+        # Second query - should work (factory creates fresh stream)
+        result2 = ctx.sql("SELECT COUNT(*) FROM data").collect()
+        count2 = result2[0].column(0)[0].as_py()
+
+        assert count1 == count2, "Multiple queries should return same count"
+
+
+# =============================================================================
 # Property-based tests
 # =============================================================================
 
@@ -321,7 +388,7 @@ class TestPythonRustConsistency:
         zarr_path = str(SYNTHETIC_V3)
 
         try:
-            xarray_result = run_query_on_xarray(zarr_path, query)
+            xarray_result = run_query_on_xarray_chunked(zarr_path, query)
             rust_result = run_query_on_rust_zarr(zarr_path, query)
 
             is_equal, error = compare_results(xarray_result, rust_result)
@@ -341,7 +408,7 @@ class TestPythonRustConsistency:
         zarr_path = str(SYNTHETIC_V3)
 
         try:
-            xarray_result = run_query_on_xarray(zarr_path, query)
+            xarray_result = run_query_on_xarray_chunked(zarr_path, query)
             rust_result = run_query_on_rust_zarr(zarr_path, query)
 
             # For LIMIT queries, we compare row counts and schemas
@@ -365,7 +432,7 @@ class TestPythonRustConsistency:
         zarr_path = str(SYNTHETIC_V3)
 
         try:
-            xarray_result = run_query_on_xarray(zarr_path, query)
+            xarray_result = run_query_on_xarray_chunked(zarr_path, query)
             rust_result = run_query_on_rust_zarr(zarr_path, query)
 
             # For ordered queries, compare exact order
@@ -402,7 +469,7 @@ class TestDeterministicConsistency:
         """Test COUNT(*) produces same result."""
         query = "SELECT COUNT(*) as cnt FROM data"
 
-        xarray_result = run_query_on_xarray(self.zarr_path, query)
+        xarray_result = run_query_on_xarray_chunked(self.zarr_path, query)
         rust_result = run_query_on_rust_zarr(self.zarr_path, query)
 
         is_equal, error = compare_results(xarray_result, rust_result)
@@ -412,7 +479,7 @@ class TestDeterministicConsistency:
         """Test SUM(temperature) produces same result."""
         query = "SELECT SUM(temperature) as total FROM data"
 
-        xarray_result = run_query_on_xarray(self.zarr_path, query)
+        xarray_result = run_query_on_xarray_chunked(self.zarr_path, query)
         rust_result = run_query_on_rust_zarr(self.zarr_path, query)
 
         is_equal, error = compare_results(xarray_result, rust_result)
@@ -422,7 +489,7 @@ class TestDeterministicConsistency:
         """Test AVG(humidity) produces same result."""
         query = "SELECT AVG(humidity) as avg_h FROM data"
 
-        xarray_result = run_query_on_xarray(self.zarr_path, query)
+        xarray_result = run_query_on_xarray_chunked(self.zarr_path, query)
         rust_result = run_query_on_rust_zarr(self.zarr_path, query)
 
         is_equal, error = compare_results(xarray_result, rust_result)
@@ -432,7 +499,7 @@ class TestDeterministicConsistency:
         """Test MIN/MAX produces same result."""
         query = "SELECT MIN(temperature) as min_t, MAX(temperature) as max_t FROM data"
 
-        xarray_result = run_query_on_xarray(self.zarr_path, query)
+        xarray_result = run_query_on_xarray_chunked(self.zarr_path, query)
         rust_result = run_query_on_rust_zarr(self.zarr_path, query)
 
         is_equal, error = compare_results(xarray_result, rust_result)
@@ -442,7 +509,7 @@ class TestDeterministicConsistency:
         """Test SELECT * LIMIT produces same row count."""
         query = "SELECT * FROM data LIMIT 10"
 
-        xarray_result = run_query_on_xarray(self.zarr_path, query)
+        xarray_result = run_query_on_xarray_chunked(self.zarr_path, query)
         rust_result = run_query_on_rust_zarr(self.zarr_path, query)
 
         xarray_count = sum(b.num_rows for b in xarray_result)
@@ -455,7 +522,7 @@ class TestDeterministicConsistency:
         """Test column projection produces same schema."""
         query = "SELECT lat, lon, temperature FROM data LIMIT 5"
 
-        xarray_result = run_query_on_xarray(self.zarr_path, query)
+        xarray_result = run_query_on_xarray_chunked(self.zarr_path, query)
         rust_result = run_query_on_rust_zarr(self.zarr_path, query)
 
         xarray_cols = set(xarray_result[0].schema.names) if xarray_result else set()
@@ -480,7 +547,7 @@ class TestAllZarrVersions:
         """Test COUNT(*) is consistent across all Zarr versions."""
         query = "SELECT COUNT(*) as cnt FROM data"
 
-        xarray_result = run_query_on_xarray(zarr_path, query)
+        xarray_result = run_query_on_xarray_chunked(zarr_path, query)
         rust_result = run_query_on_rust_zarr(zarr_path, query)
 
         is_equal, error = compare_results(xarray_result, rust_result)
@@ -498,11 +565,62 @@ class TestAllZarrVersions:
         ]
 
         for query in queries:
-            xarray_result = run_query_on_xarray(zarr_path, query)
+            xarray_result = run_query_on_xarray_chunked(zarr_path, query)
             rust_result = run_query_on_rust_zarr(zarr_path, query)
 
             is_equal, error = compare_results(xarray_result, rust_result)
             assert is_equal, f"Query '{query}' inconsistent for {zarr_path}: {error}"
+
+
+# =============================================================================
+# Tests for different chunking strategies
+# =============================================================================
+
+@pytest.mark.integration
+class TestChunkingStrategies:
+    """Tests verifying different chunking strategies produce same results."""
+
+    @pytest.fixture(autouse=True)
+    def setup(self):
+        """Check that test data exists."""
+        if not SYNTHETIC_V3.exists():
+            pytest.skip(f"Test data not found: {SYNTHETIC_V3}")
+        self.zarr_path = str(SYNTHETIC_V3)
+
+    @pytest.mark.parametrize("chunks", [
+        {"time": 1},  # Very small chunks
+        {"time": 3, "lat": 5, "lon": 5},  # Medium chunks
+        {"time": 7, "lat": 10, "lon": 10},  # Large chunks (entire dataset)
+        None,  # Use dataset's default chunks
+    ])
+    def test_count_same_with_different_chunks(self, chunks):
+        """Test that COUNT(*) is same regardless of chunking."""
+        query = "SELECT COUNT(*) as cnt FROM data"
+
+        result = run_query_on_xarray_chunked(self.zarr_path, query, chunks=chunks)
+        count = result[0].column(0)[0].as_py()
+
+        # All chunking strategies should give 700 rows (7*10*10)
+        assert count == 700, f"Count mismatch with chunks={chunks}: {count}"
+
+    @pytest.mark.parametrize("chunks", [
+        {"time": 1},
+        {"time": 3, "lat": 5, "lon": 5},
+        {"time": 7, "lat": 10, "lon": 10},
+    ])
+    def test_sum_same_with_different_chunks(self, chunks):
+        """Test that SUM is same regardless of chunking."""
+        query = "SELECT SUM(temperature) as total FROM data"
+
+        result = run_query_on_xarray_chunked(self.zarr_path, query, chunks=chunks)
+        total = result[0].column(0)[0].as_py()
+
+        # Get reference from rust path
+        reference = run_query_on_rust_zarr(self.zarr_path, query)
+        expected = reference[0].column(0)[0].as_py()
+
+        assert abs(total - expected) < 1e-5, \
+            f"SUM mismatch with chunks={chunks}: {total} vs {expected}"
 
 
 if __name__ == "__main__":
