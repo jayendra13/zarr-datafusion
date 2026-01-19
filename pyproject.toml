@@ -34,10 +34,11 @@ dependencies = [
 xarray = [
     "xarray>=2024.1.0",
     "zarr>=2.0.0",
+    "dask>=2024.1.0",
+    "pandas>=2.0.0",
 ]
 dev = [
     "pytest>=7.0.0",
-    "pytest-asyncio>=0.21.0",
     "hypothesis>=6.0.0",
     "numpy>=1.24.0",
 ]

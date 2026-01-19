@@ -57,7 +57,7 @@ def generate_synthetic(
     ntime: int = 7,
     seed: int = 42,
 ) -> None:
-    """Generate synthetic weather data.
+    """Generate synthetic weather data using xarray for proper metadata.
 
     Args:
         version: Zarr format version (2 or 3)
@@ -69,66 +69,40 @@ def generate_synthetic(
     """
     store_path = get_store_path("synthetic", version, with_codecs)
     np.random.seed(seed)
-
-    compressor = BLOSC_LZ4 if with_codecs else None
     codec_desc = "Blosc/LZ4" if with_codecs else "no codecs"
 
+    # Create xarray Dataset with proper coordinates
+    ds = xr.Dataset(
+        data_vars={
+            "temperature": (["time", "lat", "lon"], np.random.randint(-50, 60, (ntime, nlat, nlon))),
+            "humidity": (["time", "lat", "lon"], np.random.randint(10, 80, (ntime, nlat, nlon))),
+        },
+        coords={
+            "time": np.arange(ntime),
+            "lat": np.arange(nlat),
+            "lon": np.arange(nlon),
+        },
+        attrs={"title": "Weekly Weather Sample", "conventions": f"Zarr v{version}"},
+    )
+    ds["temperature"].attrs = {"units": "K", "long_name": "Air Temperature"}
+    ds["humidity"].attrs = {"units": "%", "long_name": "Relative Humidity"}
+
+    # Build encoding for all variables
+    all_vars = list(ds.data_vars) + list(ds.coords)
     if version == 3:
-        store = zarr.storage.LocalStore(str(store_path))
-        root = zarr.group(store=store, overwrite=True, zarr_format=3)
-
+        from zarr.codecs import BloscCodec
         if with_codecs:
-            # Zarr v3 uses compressors parameter
-            from zarr.codecs import BloscCodec
-
-            compressors = BloscCodec(cname="lz4", clevel=5, shuffle="shuffle")
+            encoding = {var: {"compressors": BloscCodec(cname="lz4", clevel=5, shuffle="shuffle")} for var in all_vars}
         else:
-            compressors = None
-
-        # Create coordinate arrays
-        root.create_array("lat", data=np.arange(nlat), compressors=compressors)
-        root.create_array("lon", data=np.arange(nlon), compressors=compressors)
-        root.create_array("time", data=np.arange(ntime), compressors=compressors)
-
-        # Create data variables
-        temperature = root.create_array(
-            "temperature",
-            chunks=(1, nlat, nlon),
-            data=np.random.randint(-50, 60, (ntime, nlat, nlon)),
-            compressors=compressors,
-        )
-        humidity = root.create_array(
-            "humidity",
-            chunks=(1, nlat, nlon),
-            data=np.random.randint(10, 80, (ntime, nlat, nlon)),
-            compressors=compressors,
-        )
+            encoding = {var: {} for var in all_vars}
     else:
-        # Zarr v2
-        root = zarr.open_group(str(store_path), mode="w", zarr_format=2)
+        compressor = BLOSC_LZ4 if with_codecs else None
+        encoding = {var: {"compressor": compressor} for var in all_vars}
 
-        root.create_array("lat", data=np.arange(nlat), compressor=compressor)
-        root.create_array("lon", data=np.arange(nlon), compressor=compressor)
-        root.create_array("time", data=np.arange(ntime), compressor=compressor)
-
-        temperature = root.create_array(
-            "temperature",
-            chunks=(1, nlat, nlon),
-            data=np.random.randint(-50, 60, (ntime, nlat, nlon)),
-            compressor=compressor,
-        )
-        humidity = root.create_array(
-            "humidity",
-            chunks=(1, nlat, nlon),
-            data=np.random.randint(10, 80, (ntime, nlat, nlon)),
-            compressor=compressor,
-        )
-
-    # Add metadata
-    root.attrs["title"] = "Weekly Weather Sample"
-    root.attrs["conventions"] = f"Zarr v{version}"
-    temperature.attrs.update({"units": "K", "long_name": "Air Temperature"})
-    humidity.attrs.update({"units": "%", "long_name": "Relative Humidity"})
+    # Write with xarray (adds proper dimension metadata)
+    if store_path.exists():
+        shutil.rmtree(store_path)
+    ds.to_zarr(str(store_path), mode="w", zarr_format=version, encoding=encoding)
 
     print(f"  Written: {store_path} (v{version}, {codec_desc})")
 
