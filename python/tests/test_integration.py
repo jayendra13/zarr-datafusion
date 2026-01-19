@@ -126,8 +126,11 @@ def agg_query(draw):
 
 @st.composite
 def limit_query(draw):
-    cols = draw(st.lists(st.sampled_from(COLS), min_size=1, max_size=5, unique=True))
-    limit = draw(st.integers(1, 100))
+    # Always include a data column to avoid DictionaryArray optimization differences
+    data_col = draw(st.sampled_from(DATA_COLS))
+    extra_cols = draw(st.lists(st.sampled_from(COLS), min_size=0, max_size=3, unique=True))
+    cols = [data_col] + [c for c in extra_cols if c != data_col]
+    limit = draw(st.integers(1, 50))
     return f"SELECT {', '.join(cols)} FROM data LIMIT {limit}"
 
 

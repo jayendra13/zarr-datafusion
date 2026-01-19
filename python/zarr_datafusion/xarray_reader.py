@@ -269,35 +269,6 @@ class XarrayRecordBatchReader:
         return self._schema.__arrow_c_schema__()
 
 
-# =============================================================================
-# High-level API functions
-# =============================================================================
-
-def read_xarray_lazy(
-    ds: xr.Dataset, chunks: Chunks = None
-) -> XarrayRecordBatchReader:
-    """Create a lazy Arrow stream reader from an xarray Dataset.
-
-    This is the recommended way to create a single-use stream from xarray data.
-    Data is only read when the stream is consumed (e.g., during collect()).
-
-    Args:
-        ds: An xarray Dataset. All data_vars must share the same dimensions.
-        chunks: Xarray-like chunks specification (e.g., {'time': 240}).
-
-    Returns:
-        An XarrayRecordBatchReader implementing __arrow_c_stream__
-
-    Example:
-        >>> import xarray as xr
-        >>> from zarr_datafusion.xarray_reader import read_xarray_lazy
-        >>> ds = xr.open_zarr('data.zarr')
-        >>> reader = read_xarray_lazy(ds, chunks={'time': 240})
-        >>> # Use with PyArrow or DataFusion
-    """
-    return XarrayRecordBatchReader(ds, chunks)
-
-
 def read_xarray_table(
     ds: xr.Dataset,
     chunks: Chunks = None,

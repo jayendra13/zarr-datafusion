@@ -97,3 +97,46 @@ jobs:
         with:
           token: ${{ secrets.CODECOV_TOKEN }}
           fail_ci_if_error: false
+
+  python-tests:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.10", "3.11", "3.12"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v4
+
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-python-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Generate test data
+        run: ./scripts/generate_data.sh
+
+      - name: Build Rust CLI
+        run: cargo build --bin zarr-cli
+
+      - name: Run Python tests
+        run: |
+          uv run --python ${{ matrix.python-version }} \
+            --with pytest --with hypothesis \
+            --with xarray --with zarr --with dask --with pandas --with numpy \
+            --with datafusion --with pyarrow \
+            python -m pytest python/tests/ -v
