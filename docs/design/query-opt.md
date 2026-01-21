@@ -34,4 +34,12 @@ Here are helpful references and some of my thoughts. References 1, 2, and 3 are
 	- This is a previous attempt to build this integration that was never merged into datafusion. It’s four or five years old and both egg and DataFusion have improved since then. 
 	- Implementation can be found in the src directory. The readme has a long todo list of features. 
 	- In general, I wouldn’t trust these sources, but we can learn from this implementation. I think reference [2] solves the technical challenges found in these sources through search and caching.  
-
+9. https://datafusion.apache.org/library-user-guide/query-optimizer.html
+ - This documents the high level interfaces for contributing rewrites. There are useful examples and design implications that are worth noting.
+ - I think we should test our optimizer against the integration tests already written in the datafusion project. Notice the other testing notes.
+ - The AnalysisContext mentioned here also looks like a great place to leveradge Xarray metadata and statistics for optimizations. 
+10. https://github.com/apache/datafusion/blob/main/datafusion-examples/examples/query_planning/optimizer_rule.rs
+ - Concrete examples of writing optimizer rules. This illustrates for me some implications from (2) that our optimizer rules will be based on search via persisted e-graph data structures that try to optimize a set of canonical or challenging query plans. It makes me think we could write this library where the optimizations are "discovered" rather than explicitly hand coded by us.
+ - If this is the case, it would be ideal to design the system such that it was easy to "search more" and add more rewrite/optimization rules. It would be awesome if there was some decoupling so we could improve the optimier faster than our module/library.
+11. https://github.com/apache/datafusion/blob/main/datafusion/expr/src/utils.rs
+ - Feel free to use any of these helpful utilities. 
