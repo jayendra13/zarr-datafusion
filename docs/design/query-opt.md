@@ -8,7 +8,7 @@ High level goal: we are working towards a first milestone, which is being able t
 
 I propose that the core engine we use for our query optimizer is the egg library (which implements a form of equity saturation via e-graphs). Reference [2] explains how egg can be used for query optimizers in a database. 
 
-Please read all of the links I provide. Then, read the zarr-datafusion sources to understand how it works. Then, propose a plan for how to build this query optimizer, making a mental model of how components work and relate to each other. Please write down notes as needed (design docs) in the repo in markdown. When testing, please write integration tests inspired by Extreme Weather Bench and the linked queries. 
+Please read all of the links I provide. Then, read the zarr-datafusion sources to understand how it works. Then, propose a plan for how to build this query optimizer, making a mental model of how components work and relate to each other. Please write down notes as needed (design docs) in the repo in markdown. When testing, please write integration tests inspired by Extreme Weather Bench and the linked queries. Measure the system performance of queries as needed to help make decisions during tradeoffs.
 
 Thanks so much, Claude. I’m very excited about this direction. 
 
