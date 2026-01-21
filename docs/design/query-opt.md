@@ -1,6 +1,7 @@
 # Zarr DataFusion Query Optimizer Design (prompt)
 
 Author: Alex Merose
+
 Created: January 20, 2026
 
 High level goal: we are working towards a first milestone, which is being able to replicate a benchmark in Extreme Weather Bench with SQL via zarr-datafusion (see https://github.com/jayendra13/zarr-datafusion/blob/main/freeze_evaluation_code_flow.md). To that end, we need to implement a SQL query optimizer. This optimizer needs to fit into our stack (Rust, DataFusion, Zarr with Xarray semantics). A core criterion for this query optimizer is that it needs to present a logical view of tables modeled by SQL but not violate the physical data structure semantics modeled by Xarray and Zarr. Please see the zarr-datafusion readme for an understanding of our model: https://github.com/jayendra13/zarr-datafusion/blob/main/README.md 
