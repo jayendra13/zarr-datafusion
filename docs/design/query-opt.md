@@ -14,7 +14,7 @@ Thanks so much, Claude. I’m very excited about this direction. 
 
 ## References 
 
-Here are helpful references and some of my thoughts
+Here are helpful references and some of my thoughts. References 1, 2, and 3 are checked in as PDFs in the design folder next to this README.
 
 1. https://datafusion.apache.org/blog/2025/06/15/optimizing-sql-dataframes-part-two/ 
 	- We can skip the pushdown optimizations and others for now. These will be implemented later. (Especially access path and join order selection, which seems hard.) For now, I want to focus on expression simplification, subquery rewrites, optimized expression evaluation, and using statistics directly.
