@@ -43,3 +43,6 @@ Here are helpful references and some of my thoughts. References 1, 2, and 3 are
  - If this is the case, it would be ideal to design the system such that it was easy to "search more" and add more rewrite/optimization rules. It would be awesome if there was some decoupling so we could improve the optimier faster than our module/library.
 11. https://github.com/apache/datafusion/blob/main/datafusion/expr/src/utils.rs
  - Feel free to use any of these helpful utilities. 
+12. http://www.redbook.io/ch7-queryoptimization.html
+ - I highly trust this author's judgement. He offers a useful history of optimizers from the beginning of databases till 2015. Use his thoughts to resolve ambiguities. Where there are still ambiguities, note that we care about choices that will work best for Xarray shaped Zarr datasets. Further, it would be ideal to encode tradeoffs into tunable parameters. 
+ - This chapter of the redbook is full of killer references that can be used as starting points to further reasearch on optimizers.
