@@ -189,6 +189,64 @@ pub fn decode_cf_time_f64(values: &[f64], unit: &CFTimeUnit) -> Vec<i64> {
     }
 }
 
+// ============================================================================
+// CF Time Conversion Helper
+// ============================================================================
+
+use super::coord::CoordValues;
+use tracing::warn;
+
+/// Apply CF time conversion to raw coordinate values if CF time attributes are present.
+///
+/// This function consolidates the CF time conversion logic used in both sync and async
+/// Zarr reading paths, eliminating code duplication.
+///
+/// # Arguments
+/// * `raw_values` - The raw coordinate values read from Zarr
+/// * `cf_attrs` - Optional CF time attributes (units and calendar)
+/// * `coord_name` - Name of the coordinate (for logging warnings)
+///
+/// # Returns
+/// Converted coordinate values (TimestampMicros if CF time, otherwise unchanged)
+pub fn apply_cf_time_conversion(
+    raw_values: CoordValues,
+    cf_attrs: Option<&CFTimeAttrs>,
+    coord_name: &str,
+) -> CoordValues {
+    let Some(cf_attrs) = cf_attrs else {
+        return raw_values;
+    };
+
+    if !cf_attrs.is_time_coordinate() {
+        return raw_values;
+    }
+
+    match cf_attrs.parse() {
+        Ok(unit) => match raw_values {
+            CoordValues::Int64(v) => CoordValues::TimestampMicros(decode_cf_time(&v, &unit)),
+            CoordValues::Float64(v) => CoordValues::TimestampMicros(decode_cf_time_f64(&v, &unit)),
+            CoordValues::Float32(v) => {
+                // Convert f32 to f64 first
+                let v64: Vec<f64> = v.iter().map(|x| *x as f64).collect();
+                CoordValues::TimestampMicros(decode_cf_time_f64(&v64, &unit))
+            }
+            CoordValues::TimestampMicros(_) => raw_values, // Already timestamp
+            CoordValues::Compact {
+                is_timestamp: true, ..
+            } => raw_values, // Already timestamp
+            CoordValues::Compact { encoding, .. } => {
+                // Expand compact encoding and apply CF time conversion
+                let v = encoding.to_vec_i64();
+                CoordValues::TimestampMicros(decode_cf_time(&v, &unit))
+            }
+        },
+        Err(e) => {
+            warn!(coord = %coord_name, error = %e, "Failed to parse CF time units, keeping raw values");
+            raw_values
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

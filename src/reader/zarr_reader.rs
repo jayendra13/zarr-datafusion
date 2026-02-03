@@ -18,7 +18,7 @@ use std::sync::Arc;
 use std::time::Instant;
 use zarrs::{array::Array, array_subset::ArraySubset, filesystem::FilesystemStore};
 
-use super::cf_time::{decode_cf_time, decode_cf_time_f64};
+use super::cf_time::apply_cf_time_conversion;
 use super::coord::{
     calculate_coord_limits, calculate_limited_subset, create_coord_dictionary_typed, CoordValues,
 };
@@ -231,6 +231,181 @@ macro_rules! read_data_array {
     };
 }
 
+// =============================================================================
+// Helper functions to reduce sync/async duplication
+// =============================================================================
+
+/// Create an empty result stream when filter values are not found.
+///
+/// This consolidates the identical logic used in both sync and async paths when
+/// a filter value doesn't match any coordinate values, requiring an empty result.
+fn create_empty_result_stream(
+    schema: &SchemaRef,
+    projection: Option<&Vec<usize>>,
+) -> Result<SendableRecordBatchStream> {
+    let projected_schema = Arc::new(Schema::new(
+        projection
+            .map(|indices| {
+                indices
+                    .iter()
+                    .map(|&i| schema.field(i).as_ref().clone())
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_else(|| schema.fields().iter().map(|f| f.as_ref().clone()).collect()),
+    ));
+    let batch = RecordBatch::new_empty(projected_schema.clone());
+    let stream = stream::iter(vec![Ok(batch)]);
+    Ok(Box::pin(RecordBatchStreamAdapter::new(
+        projected_schema,
+        stream,
+    )))
+}
+
+/// Build projected schema, excluding coordinates that were skipped due to
+/// mixed-dimensionality optimization.
+///
+/// This consolidates the identical schema building logic used in both sync and async paths.
+fn build_projected_schema(
+    schema: &SchemaRef,
+    projected_indices: &[usize],
+    coord_names: &[String],
+    effective_coord_indices: &[usize],
+) -> SchemaRef {
+    let projected_fields: Vec<_> = projected_indices
+        .iter()
+        .filter_map(|&i| {
+            let field = schema.field(i);
+            let field_name = field.name();
+            // Check if this is a coordinate that was skipped
+            if let Some(coord_idx) = coord_names.iter().position(|n| n == field_name) {
+                if !effective_coord_indices.contains(&coord_idx) {
+                    return None; // Skip coordinates not in effective set
+                }
+            }
+            Some(field.clone())
+        })
+        .collect();
+    Arc::new(Schema::new(projected_fields))
+}
+
+/// Convert CoordValues to CoordValuesRef for filtering.
+///
+/// This consolidates the repeated conversion logic in both sync and async paths.
+fn coord_values_to_refs(coord_values: &[CoordValues]) -> Vec<CoordValuesRef<'_>> {
+    coord_values
+        .iter()
+        .map(|v| match v {
+            CoordValues::Int64(vals) => CoordValuesRef::Int64(vals),
+            CoordValues::Float32(vals) => CoordValuesRef::Float32(vals),
+            CoordValues::Float64(vals) => CoordValuesRef::Float64(vals),
+            CoordValues::TimestampMicros(vals) => CoordValuesRef::TimestampMicros(vals),
+            CoordValues::Compact {
+                encoding,
+                is_timestamp,
+            } => CoordValuesRef::Compact {
+                encoding: *encoding,
+                is_timestamp: *is_timestamp,
+            },
+        })
+        .collect()
+}
+
+/// Calculate effective sizes and filtered rows based on coordinate ranges.
+///
+/// Returns (effective_coord_sizes, effective_rows).
+fn calculate_effective_sizes(
+    coord_sizes: &[usize],
+    coord_ranges: &Option<Vec<(usize, usize)>>,
+) -> (Vec<usize>, usize) {
+    if let Some(ref ranges) = coord_ranges {
+        let sizes: Vec<usize> = ranges.iter().map(|(start, end)| end - start).collect();
+        let rows = calculate_filtered_rows(ranges);
+        (sizes, rows)
+    } else {
+        (coord_sizes.to_vec(), coord_sizes.iter().product())
+    }
+}
+
+/// Extract filtered coordinate values based on ranges.
+fn extract_filtered_coords(
+    coord_values: Vec<CoordValues>,
+    coord_ranges: &Option<Vec<(usize, usize)>>,
+) -> Vec<CoordValues> {
+    if let Some(ref ranges) = coord_ranges {
+        coord_values
+            .iter()
+            .zip(ranges.iter())
+            .map(|(values, (start, end))| values.slice(*start, *end))
+            .collect()
+    } else {
+        coord_values
+    }
+}
+
+/// Recalculate query coordinate sizes and rows for effective coordinates only.
+///
+/// This handles mixed-dimensionality optimization where only a subset of coordinates
+/// are needed for the projected columns.
+fn calculate_query_coord_sizes(
+    coord_sizes: &[usize],
+    effective_coord_sizes: &[usize],
+    effective_coord_indices: &[usize],
+    effective_rows: usize,
+) -> (Vec<usize>, usize) {
+    if effective_coord_indices.len() < coord_sizes.len() {
+        let sizes: Vec<usize> = effective_coord_indices
+            .iter()
+            .map(|&i| effective_coord_sizes[i])
+            .collect();
+        let rows: usize = sizes.iter().product();
+        info!(
+            all_coords = coord_sizes.len(),
+            effective_coords = effective_coord_indices.len(),
+            query_rows = rows,
+            original_rows = effective_rows,
+            "Using reduced coordinate set for variable dimensionality"
+        );
+        (sizes, rows)
+    } else {
+        (effective_coord_sizes.to_vec(), effective_rows)
+    }
+}
+
+/// Create the final result batch, handling empty projections (e.g., COUNT(*)).
+fn create_result_batch(
+    projected_schema: SchemaRef,
+    result_arrays: Vec<ArrayRef>,
+    final_rows: usize,
+) -> Result<RecordBatch> {
+    if result_arrays.is_empty() {
+        info!(final_rows, "Empty projection - returning row count only");
+        Ok(RecordBatch::try_new_with_options(
+            projected_schema,
+            result_arrays,
+            &RecordBatchOptions::new().with_row_count(Some(final_rows)),
+        )?)
+    } else {
+        Ok(RecordBatch::try_new(projected_schema, result_arrays)?)
+    }
+}
+
+/// Apply limit to result arrays by slicing them.
+fn apply_limit_to_arrays(
+    result_arrays: Vec<ArrayRef>,
+    limit: Option<usize>,
+    max_rows: usize,
+) -> Vec<ArrayRef> {
+    if let Some(limit) = limit {
+        let limit = limit.min(max_rows);
+        result_arrays
+            .into_iter()
+            .map(|arr| arr.slice(0, limit))
+            .collect()
+    } else {
+        result_arrays
+    }
+}
+
 pub fn read_zarr(
     store_path: &str,
     schema: SchemaRef,
@@ -277,43 +452,9 @@ pub fn read_zarr(
         let element_bytes = dtype_to_bytes(dtype);
         let raw_values = read_coord_values!(sync, arr, &subset, dtype.as_str());
 
-        // Apply CF time conversion if this coordinate has CF time attributes
-        let values = if let Some(ref cf_attrs) = coord.cf_time_attrs {
-            if cf_attrs.is_time_coordinate() {
-                match cf_attrs.parse() {
-                    Ok(unit) => match raw_values {
-                        CoordValues::Int64(v) => {
-                            CoordValues::TimestampMicros(decode_cf_time(&v, &unit))
-                        }
-                        CoordValues::Float64(v) => {
-                            CoordValues::TimestampMicros(decode_cf_time_f64(&v, &unit))
-                        }
-                        CoordValues::Float32(v) => {
-                            // Convert f32 to f64 first
-                            let v64: Vec<f64> = v.iter().map(|x| *x as f64).collect();
-                            CoordValues::TimestampMicros(decode_cf_time_f64(&v64, &unit))
-                        }
-                        CoordValues::TimestampMicros(_) => raw_values, // Already timestamp
-                        CoordValues::Compact {
-                            is_timestamp: true, ..
-                        } => raw_values, // Already timestamp
-                        CoordValues::Compact { encoding, .. } => {
-                            // Expand compact encoding and apply CF time conversion
-                            let v = encoding.to_vec_i64();
-                            CoordValues::TimestampMicros(decode_cf_time(&v, &unit))
-                        }
-                    },
-                    Err(e) => {
-                        warn!(coord = %coord.name, error = %e, "Failed to parse CF time units, keeping raw values");
-                        raw_values
-                    }
-                }
-            } else {
-                raw_values
-            }
-        } else {
-            raw_values
-        };
+        // Apply CF time conversion using helper function
+        let values =
+            apply_cf_time_conversion(raw_values, coord.cf_time_attrs.as_ref(), &coord.name);
 
         if let Some(ref s) = stats {
             let bytes = size as u64 * element_bytes;
@@ -327,23 +468,7 @@ pub fn read_zarr(
 
     // Calculate coordinate ranges based on filters
     let coord_ranges = if let Some(ref filters) = coord_filters {
-        // Convert coord_values to refs for filtering
-        let coord_refs: Vec<CoordValuesRef> = coord_values
-            .iter()
-            .map(|v| match v {
-                CoordValues::Int64(vals) => CoordValuesRef::Int64(vals),
-                CoordValues::Float32(vals) => CoordValuesRef::Float32(vals),
-                CoordValues::Float64(vals) => CoordValuesRef::Float64(vals),
-                CoordValues::TimestampMicros(vals) => CoordValuesRef::TimestampMicros(vals),
-                CoordValues::Compact {
-                    encoding,
-                    is_timestamp,
-                } => CoordValuesRef::Compact {
-                    encoding: *encoding,
-                    is_timestamp: *is_timestamp,
-                },
-            })
-            .collect();
+        let coord_refs = coord_values_to_refs(&coord_values);
 
         match calculate_coord_ranges(filters, &coord_names, &coord_refs) {
             Some(ranges) => {
@@ -361,25 +486,7 @@ pub fn read_zarr(
             None => {
                 // Filter value not found - return empty result
                 warn!("Filter value not found in coordinates - returning empty result");
-                let projected_schema = Arc::new(Schema::new(
-                    projection
-                        .as_ref()
-                        .map(|indices| {
-                            indices
-                                .iter()
-                                .map(|&i| schema.field(i).as_ref().clone())
-                                .collect::<Vec<_>>()
-                        })
-                        .unwrap_or_else(|| {
-                            schema.fields().iter().map(|f| f.as_ref().clone()).collect()
-                        }),
-                ));
-                let batch = RecordBatch::new_empty(projected_schema.clone());
-                let stream = stream::iter(vec![Ok(batch)]);
-                return Ok(Box::pin(RecordBatchStreamAdapter::new(
-                    projected_schema,
-                    stream,
-                )));
+                return create_empty_result_stream(&schema, projection.as_ref());
             }
         }
     } else {
@@ -387,24 +494,11 @@ pub fn read_zarr(
     };
 
     // Calculate effective sizes based on filters
-    let (effective_coord_sizes, effective_rows) = if let Some(ref ranges) = coord_ranges {
-        let sizes: Vec<usize> = ranges.iter().map(|(start, end)| end - start).collect();
-        let rows = calculate_filtered_rows(ranges);
-        (sizes, rows)
-    } else {
-        (coord_sizes.clone(), total_rows)
-    };
+    let (effective_coord_sizes, effective_rows) =
+        calculate_effective_sizes(&coord_sizes, &coord_ranges);
 
     // Extract filtered coordinate values
-    let filtered_coord_values: Vec<CoordValues> = if let Some(ref ranges) = coord_ranges {
-        coord_values
-            .iter()
-            .zip(ranges.iter())
-            .map(|(values, (start, end))| values.slice(*start, *end))
-            .collect()
-    } else {
-        coord_values
-    };
+    let filtered_coord_values = extract_filtered_coords(coord_values, &coord_ranges);
 
     let total_columns = schema.fields().len();
     let projected_indices = projection.unwrap_or_else(|| (0..total_columns).collect());
@@ -452,24 +546,12 @@ pub fn read_zarr(
     .map_err(DataFusionError::Plan)?;
 
     // Recalculate effective sizes and rows for the relevant coordinates only
-    let (query_coord_sizes, query_rows): (Vec<usize>, usize) =
-        if effective_coord_indices.len() < coord_sizes.len() {
-            let sizes: Vec<usize> = effective_coord_indices
-                .iter()
-                .map(|&i| effective_coord_sizes[i])
-                .collect();
-            let rows: usize = sizes.iter().product();
-            info!(
-                all_coords = coord_sizes.len(),
-                effective_coords = effective_coord_indices.len(),
-                query_rows = rows,
-                original_rows = effective_rows,
-                "Using reduced coordinate set for variable dimensionality"
-            );
-            (sizes, rows)
-        } else {
-            (effective_coord_sizes.clone(), effective_rows)
-        };
+    let (query_coord_sizes, query_rows) = calculate_query_coord_sizes(
+        &coord_sizes,
+        &effective_coord_sizes,
+        &effective_coord_indices,
+        effective_rows,
+    );
 
     // Apply limit (after filter and dimensionality reduction)
     let final_rows = limit.map(|l| l.min(query_rows)).unwrap_or(query_rows);
@@ -541,44 +623,18 @@ pub fn read_zarr(
     }
 
     // Build projected schema, excluding coordinates that were skipped
-    let projected_fields: Vec<_> = projected_indices
-        .iter()
-        .filter_map(|&i| {
-            let field = schema.field(i);
-            let field_name = field.name();
-            // Check if this is a coordinate that was skipped
-            if let Some(coord_idx) = coord_names.iter().position(|n| n == field_name) {
-                if !effective_coord_indices.contains(&coord_idx) {
-                    return None; // Skip coordinates not in effective set
-                }
-            }
-            Some(field.clone())
-        })
-        .collect();
-    let projected_schema = Arc::new(Schema::new(projected_fields));
+    let projected_schema = build_projected_schema(
+        &schema,
+        &projected_indices,
+        &coord_names,
+        &effective_coord_indices,
+    );
 
     // Apply limit if specified (slice the already-filtered arrays)
-    let result_arrays = if let Some(limit) = limit {
-        let limit = limit.min(query_rows);
-        result_arrays
-            .into_iter()
-            .map(|arr| arr.slice(0, limit))
-            .collect()
-    } else {
-        result_arrays
-    };
+    let result_arrays = apply_limit_to_arrays(result_arrays, limit, query_rows);
 
-    // Handle empty projection (e.g., count(*)) - need to set row count explicitly
-    let batch = if result_arrays.is_empty() {
-        info!(final_rows, "Empty projection - returning row count only");
-        RecordBatch::try_new_with_options(
-            projected_schema.clone(),
-            result_arrays,
-            &RecordBatchOptions::new().with_row_count(Some(final_rows)),
-        )?
-    } else {
-        RecordBatch::try_new(projected_schema.clone(), result_arrays)?
-    };
+    // Create result batch and wrap in stream
+    let batch = create_result_batch(projected_schema.clone(), result_arrays, final_rows)?;
     let stream = stream::iter(vec![Ok(batch)]);
 
     Ok(Box::pin(RecordBatchStreamAdapter::new(
@@ -668,43 +724,9 @@ pub async fn read_zarr_async(
         let element_bytes = dtype_to_bytes(dtype);
         let raw_values = read_coord_values!(async, arr, &subset, dtype.as_str());
 
-        // Apply CF time conversion if this coordinate has CF time attributes
-        let values = if let Some(ref cf_attrs) = coord.cf_time_attrs {
-            if cf_attrs.is_time_coordinate() {
-                match cf_attrs.parse() {
-                    Ok(unit) => match raw_values {
-                        CoordValues::Int64(v) => {
-                            CoordValues::TimestampMicros(decode_cf_time(&v, &unit))
-                        }
-                        CoordValues::Float64(v) => {
-                            CoordValues::TimestampMicros(decode_cf_time_f64(&v, &unit))
-                        }
-                        CoordValues::Float32(v) => {
-                            // Convert f32 to f64 first
-                            let v64: Vec<f64> = v.iter().map(|x| *x as f64).collect();
-                            CoordValues::TimestampMicros(decode_cf_time_f64(&v64, &unit))
-                        }
-                        CoordValues::TimestampMicros(_) => raw_values, // Already timestamp
-                        CoordValues::Compact {
-                            is_timestamp: true, ..
-                        } => raw_values, // Already timestamp
-                        CoordValues::Compact { encoding, .. } => {
-                            // Expand compact encoding and apply CF time conversion
-                            let v = encoding.to_vec_i64();
-                            CoordValues::TimestampMicros(decode_cf_time(&v, &unit))
-                        }
-                    },
-                    Err(e) => {
-                        warn!(coord = %coord.name, error = %e, "Failed to parse CF time units, keeping raw values");
-                        raw_values
-                    }
-                }
-            } else {
-                raw_values
-            }
-        } else {
-            raw_values
-        };
+        // Apply CF time conversion using helper function
+        let values =
+            apply_cf_time_conversion(raw_values, coord.cf_time_attrs.as_ref(), &coord.name);
 
         debug!(path = %array_path, "Coordinate values loaded");
         if let Some(ref s) = stats {
@@ -716,22 +738,7 @@ pub async fn read_zarr_async(
 
     // Calculate coordinate ranges based on filters
     let coord_ranges = if let Some(ref filters) = coord_filters {
-        let coord_refs: Vec<CoordValuesRef> = all_coord_values
-            .iter()
-            .map(|v| match v {
-                CoordValues::Int64(vals) => CoordValuesRef::Int64(vals),
-                CoordValues::Float32(vals) => CoordValuesRef::Float32(vals),
-                CoordValues::Float64(vals) => CoordValuesRef::Float64(vals),
-                CoordValues::TimestampMicros(vals) => CoordValuesRef::TimestampMicros(vals),
-                CoordValues::Compact {
-                    encoding,
-                    is_timestamp,
-                } => CoordValuesRef::Compact {
-                    encoding: *encoding,
-                    is_timestamp: *is_timestamp,
-                },
-            })
-            .collect();
+        let coord_refs = coord_values_to_refs(&all_coord_values);
 
         match calculate_coord_ranges(filters, &coord_names, &coord_refs) {
             Some(ranges) => {
@@ -749,25 +756,7 @@ pub async fn read_zarr_async(
             None => {
                 // Filter value not found - return empty result
                 warn!("Filter value not found in coordinates - returning empty result");
-                let projected_schema = Arc::new(Schema::new(
-                    projection
-                        .as_ref()
-                        .map(|indices| {
-                            indices
-                                .iter()
-                                .map(|&i| schema.field(i).as_ref().clone())
-                                .collect::<Vec<_>>()
-                        })
-                        .unwrap_or_else(|| {
-                            schema.fields().iter().map(|f| f.as_ref().clone()).collect()
-                        }),
-                ));
-                let batch = RecordBatch::new_empty(projected_schema.clone());
-                let stream = stream::iter(vec![Ok(batch)]);
-                return Ok(Box::pin(RecordBatchStreamAdapter::new(
-                    projected_schema,
-                    stream,
-                )));
+                return create_empty_result_stream(&schema, projection.as_ref());
             }
         }
     } else {
@@ -776,24 +765,11 @@ pub async fn read_zarr_async(
     debug!(?coord_ranges, "Coordinate ranges calculated");
 
     // Calculate effective sizes based on filters
-    let (effective_coord_sizes, rows_after_filter) = if let Some(ref ranges) = coord_ranges {
-        let sizes: Vec<usize> = ranges.iter().map(|(start, end)| end - start).collect();
-        let rows = calculate_filtered_rows(ranges);
-        (sizes, rows)
-    } else {
-        (coord_sizes.clone(), total_rows)
-    };
+    let (effective_coord_sizes, rows_after_filter) =
+        calculate_effective_sizes(&coord_sizes, &coord_ranges);
 
     // Extract filtered coordinate values
-    let filtered_coord_values: Vec<CoordValues> = if let Some(ref ranges) = coord_ranges {
-        all_coord_values
-            .iter()
-            .zip(ranges.iter())
-            .map(|(values, (start, end))| values.slice(*start, *end))
-            .collect()
-    } else {
-        all_coord_values
-    };
+    let filtered_coord_values = extract_filtered_coords(all_coord_values, &coord_ranges);
 
     // Apply limit (after filter reduction)
     let effective_rows = limit
@@ -867,24 +843,12 @@ pub async fn read_zarr_async(
     .map_err(DataFusionError::Plan)?;
 
     // Recalculate effective sizes and rows for the relevant coordinates only
-    let (query_coord_sizes, query_rows): (Vec<usize>, usize) =
-        if effective_coord_indices.len() < coord_sizes.len() {
-            let sizes: Vec<usize> = effective_coord_indices
-                .iter()
-                .map(|&i| effective_coord_sizes[i])
-                .collect();
-            let rows: usize = sizes.iter().product();
-            info!(
-                all_coords = coord_sizes.len(),
-                effective_coords = effective_coord_indices.len(),
-                query_rows = rows,
-                original_rows = rows_after_filter,
-                "Using reduced coordinate set for variable dimensionality"
-            );
-            (sizes, rows)
-        } else {
-            (effective_coord_sizes.clone(), rows_after_filter)
-        };
+    let (query_coord_sizes, query_rows) = calculate_query_coord_sizes(
+        &coord_sizes,
+        &effective_coord_sizes,
+        &effective_coord_indices,
+        rows_after_filter,
+    );
 
     // Recalculate effective_rows with limit applied to query_rows
     let effective_rows = limit.map(|l| l.min(query_rows)).unwrap_or(query_rows);
@@ -995,46 +959,22 @@ pub async fn read_zarr_async(
 
     // Build projected schema, excluding coordinates that were skipped
     debug!("Building projected schema");
-    let projected_fields: Vec<_> = projected_indices
-        .iter()
-        .filter_map(|&i| {
-            let field = schema.field(i);
-            let field_name = field.name();
-            // Check if this is a coordinate that was skipped
-            if let Some(coord_idx) = coord_names.iter().position(|n| n == field_name) {
-                if !effective_coord_indices.contains(&coord_idx) {
-                    return None; // Skip coordinates not in effective set
-                }
-            }
-            Some(field.clone())
-        })
-        .collect();
-    let projected_schema = Arc::new(Schema::new(projected_fields));
+    let projected_schema = build_projected_schema(
+        &schema,
+        &projected_indices,
+        &coord_names,
+        &effective_coord_indices,
+    );
 
     // Apply final limit slice if needed (use query_rows, not rows_after_filter)
     let final_rows = limit.map(|l| l.min(query_rows)).unwrap_or(query_rows);
-    let result_arrays = if let Some(limit) = limit {
-        let limit = limit.min(query_rows);
-        debug!(limit, "Applying final limit slice");
-        result_arrays
-            .into_iter()
-            .map(|arr| arr.slice(0, limit))
-            .collect()
-    } else {
-        result_arrays
-    };
+    let result_arrays = apply_limit_to_arrays(result_arrays, limit, query_rows);
+    if limit.is_some() {
+        debug!(final_rows, "Applied final limit slice");
+    }
 
-    // Handle empty projection (e.g., count(*)) - need to set row count explicitly
-    let batch = if result_arrays.is_empty() {
-        info!(final_rows, "Empty projection - returning row count only");
-        RecordBatch::try_new_with_options(
-            projected_schema.clone(),
-            result_arrays,
-            &RecordBatchOptions::new().with_row_count(Some(final_rows)),
-        )?
-    } else {
-        RecordBatch::try_new(projected_schema.clone(), result_arrays)?
-    };
+    // Create result batch and wrap in stream
+    let batch = create_result_batch(projected_schema.clone(), result_arrays, final_rows)?;
     info!(
         num_rows = batch.num_rows(),
         num_columns = batch.num_columns(),
