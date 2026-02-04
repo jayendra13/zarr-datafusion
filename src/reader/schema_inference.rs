@@ -44,6 +44,56 @@ pub enum ZarrVersion {
     V3,
 }
 
+// =============================================================================
+// Schema building helper
+// =============================================================================
+
+/// Build an Arrow schema from Zarr store metadata.
+///
+/// This consolidates the identical schema building logic used in:
+/// - `infer_schema_from_zmetadata_json`
+/// - `infer_schema_with_meta`
+/// - `infer_schema_with_meta_async`
+///
+/// Coordinates use Dictionary encoding for memory efficiency.
+/// CF time coordinates use Dictionary with Timestamp(Microsecond, UTC) values.
+pub fn build_schema_from_store_meta(meta: &ZarrStoreMeta) -> Schema {
+    let mut fields: Vec<Field> = Vec::new();
+
+    // Coordinates use Dictionary encoding for memory efficiency
+    // CF time coordinates use Dictionary with Timestamp values
+    for coord in &meta.coords {
+        let data_type = if coord
+            .cf_time_attrs
+            .as_ref()
+            .is_some_and(|a| a.is_time_coordinate())
+        {
+            // CF time coordinate: Dictionary with Timestamp(Microsecond, UTC) values
+            DataType::Dictionary(
+                Box::new(DataType::Int16),
+                Box::new(DataType::Timestamp(
+                    TimeUnit::Microsecond,
+                    Some("UTC".into()),
+                )),
+            )
+        } else {
+            zarr_dtype_to_arrow_dictionary(&coord.data_type)
+        };
+        fields.push(Field::new(&coord.name, data_type, false));
+    }
+
+    // Data variables use regular arrays
+    for var in &meta.data_vars {
+        fields.push(Field::new(
+            &var.name,
+            zarr_dtype_to_arrow(&var.data_type),
+            true,
+        ));
+    }
+
+    Schema::new(fields)
+}
+
 /// Detect Zarr version by checking metadata files
 pub fn detect_zarr_version(
     store_path: &str,
@@ -146,45 +196,9 @@ pub fn discover_arrays(
 pub fn infer_schema_from_zmetadata_json(
     metadata: &serde_json::Value,
 ) -> Result<(Schema, ZarrStoreMeta), Box<dyn std::error::Error + Send + Sync>> {
-    use arrow::datatypes::{DataType, Field, TimeUnit};
-
     let meta = discover_arrays_from_json(metadata)?.ok_or("No arrays found in .zmetadata JSON")?;
-
-    // Build schema from meta (same logic as infer_schema_with_meta)
-    let mut fields: Vec<Field> = Vec::new();
-
-    // Coordinates use Dictionary encoding for memory efficiency
-    // CF time coordinates use Dictionary with Timestamp values
-    for coord in &meta.coords {
-        let data_type = if coord
-            .cf_time_attrs
-            .as_ref()
-            .is_some_and(|a| a.is_time_coordinate())
-        {
-            // CF time coordinate: Dictionary with Timestamp(Microsecond, UTC) values
-            DataType::Dictionary(
-                Box::new(DataType::Int16),
-                Box::new(DataType::Timestamp(
-                    TimeUnit::Microsecond,
-                    Some("UTC".into()),
-                )),
-            )
-        } else {
-            zarr_dtype_to_arrow_dictionary(&coord.data_type)
-        };
-        fields.push(Field::new(&coord.name, data_type, false));
-    }
-
-    // Data variables use regular arrays
-    for var in &meta.data_vars {
-        fields.push(Field::new(
-            &var.name,
-            zarr_dtype_to_arrow(&var.data_type),
-            true,
-        ));
-    }
-
-    Ok((Schema::new(fields), meta))
+    let schema = build_schema_from_store_meta(&meta);
+    Ok((schema, meta))
 }
 
 /// Discover arrays from a pre-loaded .zmetadata JSON value
@@ -727,44 +741,12 @@ pub fn infer_schema_with_meta(
     store_path: &str,
 ) -> Result<(Schema, ZarrStoreMeta), Box<dyn std::error::Error + Send + Sync>> {
     let meta = discover_arrays(store_path)?;
-
-    let mut fields: Vec<Field> = Vec::new();
-
-    // Coordinates use Dictionary encoding for memory efficiency
-    // CF time coordinates use Dictionary with Timestamp values
-    for coord in &meta.coords {
-        let data_type = if coord
-            .cf_time_attrs
-            .as_ref()
-            .is_some_and(|a| a.is_time_coordinate())
-        {
-            // CF time coordinate: Dictionary with Timestamp(Microsecond, UTC) values
-            DataType::Dictionary(
-                Box::new(DataType::Int16),
-                Box::new(DataType::Timestamp(
-                    TimeUnit::Microsecond,
-                    Some("UTC".into()),
-                )),
-            )
-        } else {
-            zarr_dtype_to_arrow_dictionary(&coord.data_type)
-        };
-        fields.push(Field::new(&coord.name, data_type, false));
-    }
-
-    // Data variables use regular arrays
-    for var in &meta.data_vars {
-        fields.push(Field::new(
-            &var.name,
-            zarr_dtype_to_arrow(&var.data_type),
-            true,
-        ));
-    }
+    let schema = build_schema_from_store_meta(&meta);
 
     // Note: Schema metadata causes issues with DataFusion's optimizer schema comparisons.
     // Instead of storing metadata in the schema, we return ZarrStoreMeta which contains
     // all dimension info. The CLI can access this via the ZarrTable struct.
-    Ok((Schema::new(fields), meta))
+    Ok((schema, meta))
 }
 
 /// Parse CF time attributes from a JSON attributes object
@@ -1316,45 +1298,13 @@ pub async fn infer_schema_with_meta_async(
 ) -> Result<(Schema, ZarrStoreMeta), Box<dyn std::error::Error + Send + Sync>> {
     debug!("Starting async schema inference");
     let meta = discover_arrays_async(store, prefix).await?;
-
-    let mut fields: Vec<Field> = Vec::new();
-
-    // Coordinates use Dictionary encoding for memory efficiency
-    // CF time coordinates use Dictionary with Timestamp values
-    for coord in &meta.coords {
-        let data_type = if coord
-            .cf_time_attrs
-            .as_ref()
-            .is_some_and(|a| a.is_time_coordinate())
-        {
-            // CF time coordinate: Dictionary with Timestamp(Microsecond, UTC) values
-            DataType::Dictionary(
-                Box::new(DataType::Int16),
-                Box::new(DataType::Timestamp(
-                    TimeUnit::Microsecond,
-                    Some("UTC".into()),
-                )),
-            )
-        } else {
-            zarr_dtype_to_arrow_dictionary(&coord.data_type)
-        };
-        fields.push(Field::new(&coord.name, data_type, false));
-    }
-
-    // Data variables use regular arrays
-    for var in &meta.data_vars {
-        fields.push(Field::new(
-            &var.name,
-            zarr_dtype_to_arrow(&var.data_type),
-            true,
-        ));
-    }
+    let schema = build_schema_from_store_meta(&meta);
 
     // Note: Schema metadata causes issues with DataFusion's optimizer schema comparisons.
     // Instead of storing metadata in the schema, we return ZarrStoreMeta which contains
     // all dimension info. The CLI can access this via the ZarrTable struct.
-    info!(num_fields = fields.len(), "Schema inferred");
-    Ok((Schema::new(fields), meta))
+    info!(num_fields = schema.fields().len(), "Schema inferred");
+    Ok((schema, meta))
 }
 
 #[cfg(test)]
