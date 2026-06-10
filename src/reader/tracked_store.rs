@@ -5,6 +5,7 @@
 
 use std::sync::Arc;
 
+use tracing::trace;
 use zarrs::storage::{
     byte_range::{ByteRange, ByteRangeIterator},
     ListableStorageTraits, MaybeBytes, MaybeBytesIterator, ReadableStorageTraits, StorageError,
@@ -36,6 +37,7 @@ impl<S: ReadableStorageTraits> ReadableStorageTraits for TrackedStore<S> {
         // Track actual bytes read from disk
         if let Some(ref bytes) = result {
             self.stats.record_disk_read(bytes.len() as u64);
+            trace!(key = %key, bytes = bytes.len(), "store get");
         }
 
         Ok(result)
@@ -48,6 +50,7 @@ impl<S: ReadableStorageTraits> ReadableStorageTraits for TrackedStore<S> {
     ) -> Result<MaybeBytesIterator<'a>, StorageError> {
         // Collect ranges to allow reuse
         let ranges: Vec<ByteRange> = byte_ranges.collect();
+        let num_ranges = ranges.len();
 
         let result = self
             .inner
@@ -58,6 +61,7 @@ impl<S: ReadableStorageTraits> ReadableStorageTraits for TrackedStore<S> {
             let bytes_vec: Vec<_> = iter.collect::<Result<Vec<_>, _>>()?;
             let total_bytes: u64 = bytes_vec.iter().map(|b| b.len() as u64).sum();
             self.stats.record_disk_read(total_bytes);
+            trace!(key = %key, ranges = num_ranges, bytes = total_bytes, "store get_partial");
 
             // Return a new iterator over the collected bytes
             Ok(Some(Box::new(bytes_vec.into_iter().map(Ok))))
