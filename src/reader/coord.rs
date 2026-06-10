@@ -387,6 +387,28 @@ impl CoordValues {
         }
     }
 
+    /// Gather values at the given scattered indices into a new CoordValues.
+    ///
+    /// Used when a DatePart filter produces non-contiguous index sets.
+    /// Compact encodings are expanded to explicit values since the result
+    /// is no longer an arithmetic sequence.
+    pub fn gather(&self, indices: &[usize]) -> CoordValues {
+        match self {
+            CoordValues::Compact { encoding, is_timestamp } => {
+                let vals: Vec<i64> = indices.iter().map(|&i| encoding.value_at_i64(i)).collect();
+                if *is_timestamp {
+                    CoordValues::TimestampMicros(vals)
+                } else {
+                    CoordValues::Int64(vals)
+                }
+            }
+            CoordValues::Int64(v) => CoordValues::Int64(indices.iter().map(|&i| v[i]).collect()),
+            CoordValues::Float32(v) => CoordValues::Float32(indices.iter().map(|&i| v[i]).collect()),
+            CoordValues::Float64(v) => CoordValues::Float64(indices.iter().map(|&i| v[i]).collect()),
+            CoordValues::TimestampMicros(v) => CoordValues::TimestampMicros(indices.iter().map(|&i| v[i]).collect()),
+        }
+    }
+
     /// Get values as i64 Vec (for filtering). Generates from compact encoding if needed.
     pub fn as_i64_vec(&self) -> Vec<i64> {
         match self {
