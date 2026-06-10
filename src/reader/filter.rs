@@ -359,8 +359,7 @@ fn extract_filters(
                         value = %value,
                         "Found date_part equality filter"
                     );
-                    partial_bounds.entry(col_name).or_default().date_part =
-                        Some((field, value));
+                    partial_bounds.entry(col_name).or_default().date_part = Some((field, value));
                 }
             }
         }
@@ -1224,14 +1223,14 @@ pub fn find_date_part_indices(values: &CoordValuesRef<'_>, field: &str, value: i
             let dt = Utc.timestamp_micros(us).single();
             let Some(dt) = dt else { return false };
             let part = match field_upper.as_str() {
-                "MONTH"         => dt.month()  as i32,
-                "YEAR"          => dt.year(),
-                "DAY"           => dt.day()    as i32,
-                "HOUR"          => dt.hour()   as i32,
-                "MINUTE"        => dt.minute() as i32,
-                "DOW" | "ISODOW"=> dt.weekday().num_days_from_monday() as i32,
-                "DOY"           => dt.ordinal() as i32,
-                "QUARTER"       => (dt.month() as i32 - 1) / 3 + 1,
+                "MONTH" => dt.month() as i32,
+                "YEAR" => dt.year(),
+                "DAY" => dt.day() as i32,
+                "HOUR" => dt.hour() as i32,
+                "MINUTE" => dt.minute() as i32,
+                "DOW" | "ISODOW" => dt.weekday().num_days_from_monday() as i32,
+                "DOY" => dt.ordinal() as i32,
+                "QUARTER" => (dt.month() as i32 - 1) / 3 + 1,
                 _ => return false,
             };
             part == value
@@ -1679,8 +1678,8 @@ mod tests {
         // time: 3 scattered indices, lat: range of 41, lon: range of 201
         let selections = vec![
             CoordSelection::Indices(vec![360, 9120, 17880]),
-            CoordSelection::Range(706, 747),   // 41 values
-            CoordSelection::Range(760, 961),   // 201 values
+            CoordSelection::Range(706, 747), // 41 values
+            CoordSelection::Range(760, 961), // 201 values
         ];
         let rows = calculate_filtered_rows(&selections);
         assert_eq!(rows, 3 * 41 * 201);
@@ -2385,11 +2384,7 @@ mod tests {
                 .unwrap()
                 .timestamp_micros()
         };
-        let timestamps = vec![
-            to_micros(1997, 12),
-            to_micros(1998, 1),
-            to_micros(1998, 6),
-        ];
+        let timestamps = vec![to_micros(1997, 12), to_micros(1998, 1), to_micros(1998, 6)];
         let values = CoordValuesRef::TimestampMicros(&timestamps);
 
         let indices = find_date_part_indices(&values, "YEAR", 1998);
