@@ -10,7 +10,7 @@ use zarrs::storage::AsyncReadableListableStorage;
 use zarrs_object_store::object_store::path::Path as ObjectPath;
 
 use crate::physical_plan::zarr_exec::ZarrExec;
-use crate::reader::filter::parse_coord_filters;
+use crate::reader::filter::{is_date_part_filter, parse_coord_filters};
 use crate::reader::schema_inference::ZarrStoreMeta;
 use crate::reader::virtual_store::VirtualStoreAdapter;
 
@@ -142,7 +142,16 @@ impl TableProvider for ZarrTable {
     ) -> Result<Vec<TableProviderFilterPushDown>> {
         Ok(filters
             .iter()
-            .map(|_| TableProviderFilterPushDown::Inexact)
+            .map(|f| {
+                // DatePart filters are handled exactly by ZarrExec (via index gather),
+                // so tell DataFusion to drop the FilterExec — otherwise it re-evaluates
+                // date_part() on Dictionary-encoded columns and hits a type error.
+                if is_date_part_filter(f) {
+                    TableProviderFilterPushDown::Exact
+                } else {
+                    TableProviderFilterPushDown::Inexact
+                }
+            })
             .collect())
     }
 
