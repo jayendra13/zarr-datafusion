@@ -364,9 +364,8 @@ fn build_read_subsets(
 
     match indices_pos {
         None => {
-            let array_ranges =
-                match_ranges_to_data_var(coord_sizes, selections, data_var_shape)
-                    .unwrap_or_else(|| data_var_shape.iter().map(|&s| 0..s).collect());
+            let array_ranges = match_ranges_to_data_var(coord_sizes, selections, data_var_shape)
+                .unwrap_or_else(|| data_var_shape.iter().map(|&s| 0..s).collect());
             vec![ArraySubset::new_with_ranges(&array_ranges)]
         }
         Some(pos) => {
@@ -967,8 +966,7 @@ pub async fn read_zarr_async(
             let subsets = if let Some(ref sels) = coord_ranges {
                 let subsets = build_read_subsets(sels, &coord_sizes, data_var_shape);
                 let subset_elements: u64 = subsets.iter().map(|s| s.num_elements()).sum();
-                let reduction_pct =
-                    100.0 * (1.0 - (subset_elements as f64 / full_elements as f64));
+                let reduction_pct = 100.0 * (1.0 - (subset_elements as f64 / full_elements as f64));
                 info!(
                     field = %field_name,
                     subset_elements,
@@ -982,8 +980,7 @@ pub async fn read_zarr_async(
                 let ranges = calculate_limited_subset(arr.shape(), effective_rows);
                 let limited_subset = ArraySubset::new_with_ranges(&ranges);
                 let subset_elements = limited_subset.num_elements();
-                let reduction_pct =
-                    100.0 * (1.0 - (subset_elements as f64 / full_elements as f64));
+                let reduction_pct = 100.0 * (1.0 - (subset_elements as f64 / full_elements as f64));
                 info!(
                     field = %field_name,
                     subset_elements,

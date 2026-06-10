@@ -394,7 +394,10 @@ impl CoordValues {
     /// is no longer an arithmetic sequence.
     pub fn gather(&self, indices: &[usize]) -> CoordValues {
         match self {
-            CoordValues::Compact { encoding, is_timestamp } => {
+            CoordValues::Compact {
+                encoding,
+                is_timestamp,
+            } => {
                 let vals: Vec<i64> = indices.iter().map(|&i| encoding.value_at_i64(i)).collect();
                 if *is_timestamp {
                     CoordValues::TimestampMicros(vals)
@@ -403,9 +406,15 @@ impl CoordValues {
                 }
             }
             CoordValues::Int64(v) => CoordValues::Int64(indices.iter().map(|&i| v[i]).collect()),
-            CoordValues::Float32(v) => CoordValues::Float32(indices.iter().map(|&i| v[i]).collect()),
-            CoordValues::Float64(v) => CoordValues::Float64(indices.iter().map(|&i| v[i]).collect()),
-            CoordValues::TimestampMicros(v) => CoordValues::TimestampMicros(indices.iter().map(|&i| v[i]).collect()),
+            CoordValues::Float32(v) => {
+                CoordValues::Float32(indices.iter().map(|&i| v[i]).collect())
+            }
+            CoordValues::Float64(v) => {
+                CoordValues::Float64(indices.iter().map(|&i| v[i]).collect())
+            }
+            CoordValues::TimestampMicros(v) => {
+                CoordValues::TimestampMicros(indices.iter().map(|&i| v[i]).collect())
+            }
         }
     }
 
