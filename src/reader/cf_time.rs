@@ -20,7 +20,7 @@
 use chrono::{NaiveDate, NaiveDateTime, NaiveTime};
 
 /// CF time attributes from Zarr metadata
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct CFTimeAttrs {
     /// The units string, e.g., "hours since 1900-01-01 00:00:00"
     pub units: String,

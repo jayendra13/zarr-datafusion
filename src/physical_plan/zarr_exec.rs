@@ -135,6 +135,21 @@ impl ZarrExec {
         self.limit
     }
 
+    /// Get the full (unprojected) schema
+    pub fn schema(&self) -> &SchemaRef {
+        &self.schema
+    }
+
+    /// Get the store path
+    pub fn path(&self) -> &str {
+        &self.path
+    }
+
+    /// Get the projection indices, if any
+    pub fn projection(&self) -> Option<&Vec<usize>> {
+        self.projection.as_ref()
+    }
+
     /// Get the coordinate filters
     pub fn coord_filters(&self) -> Option<&CoordFilters> {
         self.coord_filters.as_ref()

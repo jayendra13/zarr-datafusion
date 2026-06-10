@@ -127,7 +127,7 @@ pub fn detect_zarr_version(
     Err("Could not detect Zarr version: no metadata files found".into())
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct ZarrArrayMeta {
     pub name: String,
     pub data_type: String,
@@ -159,7 +159,7 @@ impl ZarrArrayMeta {
 }
 
 /// Discovered Zarr store structure
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct ZarrStoreMeta {
     pub coords: Vec<ZarrArrayMeta>,    // 1D arrays (sorted by name)
     pub data_vars: Vec<ZarrArrayMeta>, // nD arrays

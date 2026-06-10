@@ -115,6 +115,11 @@ impl ZarrTable {
     pub fn store_meta(&self) -> Option<&ZarrStoreMeta> {
         self.store_meta.as_ref()
     }
+
+    /// Get the store path
+    pub fn path(&self) -> &str {
+        &self.path
+    }
 }
 
 #[async_trait]
