@@ -9,6 +9,7 @@
 //! those coordinates match, dramatically reducing memory usage.
 
 use crate::reader::coord::CompactCoord;
+use chrono::{Datelike, TimeZone, Timelike, Utc};
 use datafusion::common::ScalarValue;
 use datafusion::logical_expr::{Between, Expr, Operator};
 use std::collections::HashMap;
@@ -46,6 +47,13 @@ pub enum CoordFilterKind {
         /// Whether upper bound is inclusive (true for <=, false for <)
         high_inclusive: bool,
     },
+    /// Date part equality: EXTRACT(field FROM coord) = value
+    DatePart {
+        /// The date part field, e.g. "MONTH", "YEAR"
+        field: String,
+        /// The integer value to match
+        value: i32,
+    },
 }
 
 impl std::fmt::Display for CoordFilterKind {
@@ -67,6 +75,43 @@ impl std::fmt::Display for CoordFilterKind {
                 }
                 (None, None) => write!(f, " (unbounded)"),
             },
+            CoordFilterKind::DatePart { field, value } => {
+                write!(f, " EXTRACT({field})={value}")
+            }
+        }
+    }
+}
+
+/// Selected positions in a coordinate array after filter evaluation
+///
+/// `Range` covers a contiguous slice (equality / BETWEEN / comparison filters).
+/// `Indices` covers a scattered set of positions (EXTRACT date-part filters).
+#[derive(Debug, Clone)]
+pub enum CoordSelection {
+    /// Contiguous slice `[start, end)` — existing fast path
+    Range(usize, usize),
+    /// Scattered positions — e.g. all December timestamps
+    Indices(Vec<usize>),
+}
+
+impl CoordSelection {
+    /// Number of selected positions
+    pub fn len(&self) -> usize {
+        match self {
+            CoordSelection::Range(start, end) => end - start,
+            CoordSelection::Indices(v) => v.len(),
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// Return `(start, end)` if this is a `Range`, otherwise `None`
+    pub fn as_range(&self) -> Option<(usize, usize)> {
+        match self {
+            CoordSelection::Range(s, e) => Some((*s, *e)),
+            CoordSelection::Indices(_) => None,
         }
     }
 }
@@ -135,6 +180,7 @@ pub fn filter_satisfiable_by_bounds(
 
         // Check if filter overlaps with coordinate bounds
         let satisfiable = match filter_kind {
+            CoordFilterKind::DatePart { .. } => true,
             CoordFilterKind::Eq(value) => {
                 // Equality filter: value must be within [min, max]
                 match scalar_to_f64(value) {
@@ -190,6 +236,8 @@ struct PartialBounds {
     low: Option<(ScalarValue, bool)>,
     /// Upper bound with inclusivity flag (value, inclusive)
     high: Option<(ScalarValue, bool)>,
+    /// Date part filter: EXTRACT(field FROM coord) = value
+    date_part: Option<(String, i32)>,
 }
 
 impl PartialBounds {
@@ -211,6 +259,10 @@ impl PartialBounds {
                 low_inclusive,
                 high_inclusive,
             });
+        }
+
+        if let Some((field, value)) = self.date_part {
+            return Some(CoordFilterKind::DatePart { field, value });
         }
 
         None
@@ -296,6 +348,19 @@ fn extract_filters(
                         column = %col_name,
                         "Equality filter on non-coordinate column, skipping"
                     );
+                }
+            } else if let Some((col_name, field, value)) =
+                extract_date_part_eq(&binary.left, &binary.right)
+            {
+                if coord_names.contains(&col_name) {
+                    debug!(
+                        coord = %col_name,
+                        field = %field,
+                        value = %value,
+                        "Found date_part equality filter"
+                    );
+                    partial_bounds.entry(col_name).or_default().date_part =
+                        Some((field, value));
                 }
             }
         }
@@ -442,6 +507,44 @@ fn extract_column_literal_eq(left: &Expr, right: &Expr) -> Option<(String, Scala
     None
 }
 
+/// Return true if `expr` is a top-level `date_part(field, col) = value` equality.
+///
+/// Used by `supports_filters_pushdown` to declare `Exact` for DatePart filters so
+/// DataFusion removes the post-scan FilterExec (which would fail on Dictionary columns).
+pub fn is_date_part_filter(expr: &Expr) -> bool {
+    if let Expr::BinaryExpr(binary) = expr {
+        if binary.op == Operator::Eq {
+            return extract_date_part_eq(&binary.left, &binary.right).is_some()
+                || extract_date_part_eq(&binary.right, &binary.left).is_some();
+        }
+    }
+    false
+}
+
+/// Extract (coord_name, field, value) from date_part(field, coord) = value
+///
+/// Matches the DataFusion lowering of EXTRACT(field FROM coord) = value:
+///   date_part(Utf8("MONTH"), col("time")) = Int32(12)
+fn extract_date_part_eq(left: &Expr, right: &Expr) -> Option<(String, String, i32)> {
+    let Expr::ScalarFunction(sf) = left else {
+        return None;
+    };
+    if sf.func.name() != "date_part" || sf.args.len() != 2 {
+        return None;
+    }
+    let field = match extract_literal(&sf.args[0]) {
+        Some(ScalarValue::Utf8(Some(s))) => s,
+        _ => return None,
+    };
+    let col_name = extract_column_name(&sf.args[1])?;
+    let value = match extract_literal(right) {
+        Some(ScalarValue::Int32(Some(v))) => v,
+        Some(ScalarValue::Int64(Some(v))) => v as i32,
+        _ => return None,
+    };
+    Some((col_name, field, value))
+}
+
 /// Extract column name from expression, handling Cast wrappers
 fn extract_column_name(expr: &Expr) -> Option<String> {
     match expr {
@@ -499,38 +602,60 @@ pub fn calculate_coord_ranges(
     filters: &CoordFilters,
     coord_names: &[String],
     coord_values: &[CoordValuesRef<'_>],
-) -> Option<Vec<(usize, usize)>> {
-    let mut ranges = Vec::with_capacity(coord_names.len());
+) -> Option<Vec<CoordSelection>> {
+    let mut selections = Vec::with_capacity(coord_names.len());
 
     for (i, name) in coord_names.iter().enumerate() {
         let values = &coord_values[i];
-        let range = if let Some(filter) = filters.get(name) {
-            // Find the range of indices matching the filter
-            if let Some((start, end)) = find_filter_range(values, filter) {
-                debug!(
-                    coord = %name,
-                    filter = %filter,
-                    start,
-                    end,
-                    "Found filter range"
-                );
-                (start, end)
-            } else {
-                warn!(
-                    coord = %name,
-                    filter = %filter,
-                    "Filter did not match any values - query will return no results"
-                );
-                return None; // No matches possible
+        let selection = if let Some(filter) = filters.get(name) {
+            match filter {
+                CoordFilterKind::DatePart { field, value } => {
+                    let indices = find_date_part_indices(values, field, *value);
+                    if indices.is_empty() {
+                        warn!(
+                            coord = %name,
+                            field = %field,
+                            value = %value,
+                            "DatePart filter matched no coordinate values"
+                        );
+                        return None;
+                    }
+                    debug!(
+                        coord = %name,
+                        field = %field,
+                        value = %value,
+                        count = indices.len(),
+                        "DatePart filter matched indices"
+                    );
+                    CoordSelection::Indices(indices)
+                }
+                _ => {
+                    if let Some((start, end)) = find_filter_range(values, filter) {
+                        debug!(
+                            coord = %name,
+                            filter = %filter,
+                            start,
+                            end,
+                            "Found filter range"
+                        );
+                        CoordSelection::Range(start, end)
+                    } else {
+                        warn!(
+                            coord = %name,
+                            filter = %filter,
+                            "Filter did not match any values - query will return no results"
+                        );
+                        return None;
+                    }
+                }
             }
         } else {
-            // No filter on this coordinate - read all values
-            (0, values.len())
+            CoordSelection::Range(0, values.len())
         };
-        ranges.push(range);
+        selections.push(selection);
     }
 
-    Some(ranges)
+    Some(selections)
 }
 
 /// Reference to coordinate values for searching
@@ -1072,7 +1197,47 @@ fn find_filter_range(
                 None
             }
         }
+        // DatePart filters are not resolvable to a contiguous index range —
+        // they match scattered indices across the coordinate array.
+        // Callers that use find_filter_range must handle this case separately.
+        CoordFilterKind::DatePart { .. } => None,
     }
+}
+
+/// Return indices of all positions in a timestamp coordinate whose date part matches `value`.
+///
+/// `field` is the date part name as DataFusion produces it: `"MONTH"`, `"YEAR"`, `"DAY"`, etc.
+/// Values in `CoordValuesRef::TimestampMicros` are microseconds since Unix epoch (UTC).
+/// Returns an empty vec for coordinate types that are not timestamps.
+pub fn find_date_part_indices(values: &CoordValuesRef<'_>, field: &str, value: i32) -> Vec<usize> {
+    let micros = match values {
+        CoordValuesRef::TimestampMicros(v) => *v,
+        _ => return vec![],
+    };
+
+    let field_upper = field.to_uppercase();
+
+    micros
+        .iter()
+        .enumerate()
+        .filter(|(_, &us)| {
+            let dt = Utc.timestamp_micros(us).single();
+            let Some(dt) = dt else { return false };
+            let part = match field_upper.as_str() {
+                "MONTH"         => dt.month()  as i32,
+                "YEAR"          => dt.year(),
+                "DAY"           => dt.day()    as i32,
+                "HOUR"          => dt.hour()   as i32,
+                "MINUTE"        => dt.minute() as i32,
+                "DOW" | "ISODOW"=> dt.weekday().num_days_from_monday() as i32,
+                "DOY"           => dt.ordinal() as i32,
+                "QUARTER"       => (dt.month() as i32 - 1) / 3 + 1,
+                _ => return false,
+            };
+            part == value
+        })
+        .map(|(i, _)| i)
+        .collect()
 }
 
 /// Unified function for descending array bound search.
@@ -1155,11 +1320,8 @@ fn find_first_lt_descending(
 }
 
 /// Calculate the total number of rows after applying coordinate filters
-pub fn calculate_filtered_rows(coord_ranges: &[(usize, usize)]) -> usize {
-    coord_ranges
-        .iter()
-        .map(|(start, end)| end - start)
-        .product()
+pub fn calculate_filtered_rows(selections: &[CoordSelection]) -> usize {
+    selections.iter().map(|s| s.len()).product()
 }
 
 /// Calculate Zarr array subset ranges from coordinate filter ranges
@@ -1173,32 +1335,38 @@ pub fn coord_ranges_to_array_ranges(coord_ranges: &[(usize, usize)]) -> Vec<std:
         .collect()
 }
 
-/// Match coordinate ranges to a data variable's actual dimensions
+/// Match coordinate selections to a data variable's actual dimensions
 ///
 /// Some data variables have fewer dimensions than the total number of coordinates.
 /// For example, ERA5 has coordinates [time, level, latitude, longitude] but surface
 /// variables like `2m_temperature` only have [time, latitude, longitude] (no level).
 ///
-/// This function matches coordinate dimensions to the data variable by size,
-/// returning only the ranges that apply to this specific variable.
+/// Callers must expand `CoordSelection::Indices` into a single `Range` before calling
+/// this function (see `expand_to_range_sets` in zarr_reader).
 ///
 /// # Arguments
 /// * `coord_sizes` - Full size of each coordinate (e.g., [1323648, 37, 721, 1440])
-/// * `coord_ranges` - Filtered ranges for each coordinate (e.g., [(0, 277), (0, 37), (141, 265), (1000, 1116)])
+/// * `selections` - One selection per coordinate — must all be `Range` variants
 /// * `data_var_shape` - Shape of the data variable (e.g., [1323648, 721, 1440] for 3D)
-///
-/// # Returns
-/// Ranges matching the data variable's dimensions, or None if dimensions can't be matched
 pub fn match_ranges_to_data_var(
     coord_sizes: &[usize],
-    coord_ranges: &[(usize, usize)],
+    selections: &[CoordSelection],
     data_var_shape: &[u64],
 ) -> Option<Vec<std::ops::Range<u64>>> {
     use tracing::debug;
 
+    // Extract (start, end) from each selection — Indices must be expanded before this call
+    let ranges: Vec<(usize, usize)> = selections
+        .iter()
+        .map(|s| {
+            s.as_range()
+                .expect("CoordSelection::Indices must be expanded before match_ranges_to_data_var")
+        })
+        .collect();
+
     // If dimensions match exactly, use all ranges
-    if coord_ranges.len() == data_var_shape.len() {
-        return Some(coord_ranges_to_array_ranges(coord_ranges));
+    if ranges.len() == data_var_shape.len() {
+        return Some(coord_ranges_to_array_ranges(&ranges));
     }
 
     // Data variable has fewer dimensions - match by size
@@ -1207,14 +1375,11 @@ pub fn match_ranges_to_data_var(
     for dim_size in data_var_shape {
         let dim_size_usize = *dim_size as usize;
 
-        // Find the coordinate that matches this dimension size
         let mut found = false;
         for (coord_idx, &coord_size) in coord_sizes.iter().enumerate() {
             if coord_size == dim_size_usize {
-                // Check if we haven't already used this coordinate
-                // (handles case where multiple coords have same size)
                 if matched_ranges.len() == matched_ranges.iter().filter(|_| true).count() {
-                    let (start, end) = coord_ranges[coord_idx];
+                    let (start, end) = ranges[coord_idx];
                     matched_ranges.push((start as u64)..(end as u64));
                     found = true;
                     break;
@@ -1223,7 +1388,6 @@ pub fn match_ranges_to_data_var(
         }
 
         if !found {
-            // If no matching coordinate found, use full range for this dimension
             debug!(
                 dim_size = dim_size_usize,
                 "No matching coordinate for dimension, using full range"
@@ -1500,9 +1664,26 @@ mod tests {
     #[allow(clippy::identity_op)]
     fn test_calculate_filtered_rows() {
         // time: 1 value, hybrid: 1 value, lat: 721, lon: 1440
-        let ranges = vec![(5, 6), (10, 11), (0, 721), (0, 1440)];
-        let rows = calculate_filtered_rows(&ranges);
+        let selections = vec![
+            CoordSelection::Range(5, 6),
+            CoordSelection::Range(10, 11),
+            CoordSelection::Range(0, 721),
+            CoordSelection::Range(0, 1440),
+        ];
+        let rows = calculate_filtered_rows(&selections);
         assert_eq!(rows, 1 * 1 * 721 * 1440);
+    }
+
+    #[test]
+    fn test_calculate_filtered_rows_with_indices() {
+        // time: 3 scattered indices, lat: range of 41, lon: range of 201
+        let selections = vec![
+            CoordSelection::Indices(vec![360, 9120, 17880]),
+            CoordSelection::Range(706, 747),   // 41 values
+            CoordSelection::Range(760, 961),   // 201 values
+        ];
+        let rows = calculate_filtered_rows(&selections);
+        assert_eq!(rows, 3 * 41 * 201);
     }
 
     // ==================== Binary search tests ====================
@@ -2148,5 +2329,78 @@ mod tests {
             },
         );
         assert!(!filter_satisfiable_by_bounds(&filters, &coords));
+    }
+
+    #[test]
+    fn test_parse_extract_month() {
+        use datafusion::functions::datetime::date_part;
+
+        let coord_names = vec!["time".to_string()];
+
+        // EXTRACT(MONTH FROM time) = 12
+        // DataFusion lowers this to: date_part(Utf8("MONTH"), col("time")) = Int32(12)
+        let filter = date_part()
+            .call(vec![lit("MONTH"), col("time")])
+            .eq(lit(12i32));
+
+        let filters = parse_coord_filters(&[filter], &coord_names);
+
+        assert!(filters.get("time").is_some());
+    }
+
+    #[test]
+    fn test_find_date_part_indices_month() {
+        use chrono::{TimeZone, Utc};
+
+        // Build a small timestamp slice: Jan, Feb, Dec 2020 then Dec 2021
+        let to_micros = |y, m, d| {
+            Utc.with_ymd_and_hms(y, m, d, 0, 0, 0)
+                .unwrap()
+                .timestamp_micros()
+        };
+        let timestamps = vec![
+            to_micros(2020, 1, 1),
+            to_micros(2020, 2, 1),
+            to_micros(2020, 12, 15),
+            to_micros(2021, 12, 15),
+        ];
+        let values = CoordValuesRef::TimestampMicros(&timestamps);
+
+        let indices = find_date_part_indices(&values, "MONTH", 12);
+        assert_eq!(indices, vec![2, 3]);
+
+        let indices_jan = find_date_part_indices(&values, "MONTH", 1);
+        assert_eq!(indices_jan, vec![0]);
+
+        let indices_none = find_date_part_indices(&values, "MONTH", 6);
+        assert!(indices_none.is_empty());
+    }
+
+    #[test]
+    fn test_find_date_part_indices_year() {
+        use chrono::{TimeZone, Utc};
+
+        let to_micros = |y, m| {
+            Utc.with_ymd_and_hms(y, m, 1, 0, 0, 0)
+                .unwrap()
+                .timestamp_micros()
+        };
+        let timestamps = vec![
+            to_micros(1997, 12),
+            to_micros(1998, 1),
+            to_micros(1998, 6),
+        ];
+        let values = CoordValuesRef::TimestampMicros(&timestamps);
+
+        let indices = find_date_part_indices(&values, "YEAR", 1998);
+        assert_eq!(indices, vec![1, 2]);
+    }
+
+    #[test]
+    fn test_find_date_part_indices_non_timestamp() {
+        let floats = vec![1.0f32, 2.0, 3.0];
+        let values = CoordValuesRef::Float32(&floats);
+        let indices = find_date_part_indices(&values, "MONTH", 12);
+        assert!(indices.is_empty());
     }
 }

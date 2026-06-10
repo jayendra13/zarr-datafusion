@@ -24,7 +24,7 @@ use super::coord::{
 };
 use super::filter::{
     calculate_coord_ranges, calculate_filtered_rows, determine_effective_coords,
-    match_ranges_to_data_var, CoordFilters, CoordValuesRef,
+    match_ranges_to_data_var, CoordFilters, CoordSelection, CoordValuesRef,
 };
 use super::schema_inference::discover_arrays;
 use super::stats::SharedIoStats;
@@ -310,35 +310,90 @@ fn coord_values_to_refs(coord_values: &[CoordValues]) -> Vec<CoordValuesRef<'_>>
         .collect()
 }
 
-/// Calculate effective sizes and filtered rows based on coordinate ranges.
+/// Calculate effective sizes and filtered rows based on coordinate selections.
 ///
 /// Returns (effective_coord_sizes, effective_rows).
 fn calculate_effective_sizes(
     coord_sizes: &[usize],
-    coord_ranges: &Option<Vec<(usize, usize)>>,
+    selections: &Option<Vec<CoordSelection>>,
 ) -> (Vec<usize>, usize) {
-    if let Some(ref ranges) = coord_ranges {
-        let sizes: Vec<usize> = ranges.iter().map(|(start, end)| end - start).collect();
-        let rows = calculate_filtered_rows(ranges);
+    if let Some(ref sels) = selections {
+        let sizes: Vec<usize> = sels.iter().map(|s| s.len()).collect();
+        let rows = calculate_filtered_rows(sels);
         (sizes, rows)
     } else {
         (coord_sizes.to_vec(), coord_sizes.iter().product())
     }
 }
 
-/// Extract filtered coordinate values based on ranges.
+/// Extract filtered coordinate values based on selections.
+///
+/// `Range` selections slice contiguously; `Indices` selections gather scattered positions.
 fn extract_filtered_coords(
     coord_values: Vec<CoordValues>,
-    coord_ranges: &Option<Vec<(usize, usize)>>,
+    selections: &Option<Vec<CoordSelection>>,
 ) -> Vec<CoordValues> {
-    if let Some(ref ranges) = coord_ranges {
+    if let Some(ref sels) = selections {
         coord_values
             .iter()
-            .zip(ranges.iter())
-            .map(|(values, (start, end))| values.slice(*start, *end))
+            .zip(sels.iter())
+            .map(|(values, sel)| match sel {
+                CoordSelection::Range(start, end) => values.slice(*start, *end),
+                CoordSelection::Indices(indices) => values.gather(indices),
+            })
             .collect()
     } else {
         coord_values
+    }
+}
+
+/// Expand coordinate selections into `ArraySubset`s for zarr chunk reading.
+///
+/// All-Range selections produce a single subset (one read, existing behavior).
+/// A selection containing `Indices` produces one subset per index — each a
+/// single-step Range in that dimension — so scattered chunks are read individually
+/// and their results concatenated by the caller.
+fn build_read_subsets(
+    selections: &[CoordSelection],
+    coord_sizes: &[usize],
+    data_var_shape: &[u64],
+) -> Vec<ArraySubset> {
+    let indices_pos = selections
+        .iter()
+        .position(|s| matches!(s, CoordSelection::Indices(_)));
+
+    match indices_pos {
+        None => {
+            let array_ranges =
+                match_ranges_to_data_var(coord_sizes, selections, data_var_shape)
+                    .unwrap_or_else(|| data_var_shape.iter().map(|&s| 0..s).collect());
+            vec![ArraySubset::new_with_ranges(&array_ranges)]
+        }
+        Some(pos) => {
+            let CoordSelection::Indices(ref indices) = selections[pos] else {
+                unreachable!()
+            };
+            indices
+                .iter()
+                .map(|&idx| {
+                    let expanded: Vec<CoordSelection> = selections
+                        .iter()
+                        .enumerate()
+                        .map(|(i, s)| {
+                            if i == pos {
+                                CoordSelection::Range(idx, idx + 1)
+                            } else {
+                                s.clone()
+                            }
+                        })
+                        .collect();
+                    let array_ranges =
+                        match_ranges_to_data_var(coord_sizes, &expanded, data_var_shape)
+                            .unwrap_or_else(|| data_var_shape.iter().map(|&s| 0..s).collect());
+                    ArraySubset::new_with_ranges(&array_ranges)
+                })
+                .collect()
+        }
     }
 }
 
@@ -601,18 +656,25 @@ pub fn read_zarr(
             let arr = Array::open(store.clone(), &format!("/{}", field_name)).map_err(zarr_err)?;
             let data_var_shape = arr.shape();
 
-            // Calculate the subset to read based on coordinate filters
-            let subset = if let Some(ref ranges) = coord_ranges {
-                // Match coordinate ranges to this data variable's actual dimensions
-                let array_ranges = match_ranges_to_data_var(&coord_sizes, ranges, data_var_shape)
-                    .unwrap_or_else(|| data_var_shape.iter().map(|&s| 0..s).collect());
-                ArraySubset::new_with_ranges(&array_ranges)
+            // Build subsets: one for all-Range filters, N for Indices (scattered chunks)
+            let subsets = if let Some(ref sels) = coord_ranges {
+                build_read_subsets(sels, &coord_sizes, data_var_shape)
             } else {
-                ArraySubset::new_with_shape(arr.shape().to_vec())
+                vec![ArraySubset::new_with_shape(arr.shape().to_vec())]
             };
-            let num_elements: u64 = subset.num_elements();
+            let num_elements: u64 = subsets.iter().map(|s| s.num_elements()).sum();
 
-            let array: ArrayRef = read_data_array!(sync, arr, &subset, field.data_type());
+            let mut parts: Vec<ArrayRef> = Vec::with_capacity(subsets.len());
+            for subset in &subsets {
+                parts.push(read_data_array!(sync, arr, subset, field.data_type()));
+            }
+            let array: ArrayRef = if parts.len() == 1 {
+                parts.remove(0)
+            } else {
+                let refs: Vec<&dyn arrow::array::Array> =
+                    parts.iter().map(|a| a.as_ref()).collect();
+                arrow::compute::concat(&refs).map_err(DataFusionError::from)?
+            };
 
             if let Some(ref s) = stats {
                 let bytes = num_elements * arrow_dtype_to_bytes(field.data_type());
@@ -899,39 +961,29 @@ pub async fn read_zarr_async(
                 .map_err(zarr_err)?;
             debug!(shape = ?arr.shape(), "Data variable shape");
 
-            // Calculate the subset to read based on coordinate filters
+            // Build subsets: one for all-Range filters, N for Indices (scattered chunks)
             let full_elements: u64 = arr.shape().iter().product();
             let data_var_shape = arr.shape();
-            let subset = if let Some(ref ranges) = coord_ranges {
-                // Match coordinate ranges to this data variable's actual dimensions
-                // (handles variables with fewer dimensions than total coordinates)
-                let array_ranges = match_ranges_to_data_var(&coord_sizes, ranges, data_var_shape)
-                    .unwrap_or_else(|| {
-                        debug!(
-                            field = %field_name,
-                            coord_dims = ranges.len(),
-                            var_dims = data_var_shape.len(),
-                            "Dimension mismatch, falling back to full array"
-                        );
-                        data_var_shape.iter().map(|&s| 0..s).collect()
-                    });
-                let filtered_subset = ArraySubset::new_with_ranges(&array_ranges);
-                let subset_elements = filtered_subset.num_elements();
-                let reduction_pct = 100.0 * (1.0 - (subset_elements as f64 / full_elements as f64));
+            let subsets = if let Some(ref sels) = coord_ranges {
+                let subsets = build_read_subsets(sels, &coord_sizes, data_var_shape);
+                let subset_elements: u64 = subsets.iter().map(|s| s.num_elements()).sum();
+                let reduction_pct =
+                    100.0 * (1.0 - (subset_elements as f64 / full_elements as f64));
                 info!(
                     field = %field_name,
                     subset_elements,
                     full_elements,
-                    var_dims = data_var_shape.len(),
+                    num_subsets = subsets.len(),
                     reduction_pct = format!("{:.2}%", reduction_pct),
                     "Filter-based data subset optimization"
                 );
-                filtered_subset
+                subsets
             } else if effective_rows < total_rows {
                 let ranges = calculate_limited_subset(arr.shape(), effective_rows);
                 let limited_subset = ArraySubset::new_with_ranges(&ranges);
                 let subset_elements = limited_subset.num_elements();
-                let reduction_pct = 100.0 * (1.0 - (subset_elements as f64 / full_elements as f64));
+                let reduction_pct =
+                    100.0 * (1.0 - (subset_elements as f64 / full_elements as f64));
                 info!(
                     field = %field_name,
                     subset_elements,
@@ -939,14 +991,24 @@ pub async fn read_zarr_async(
                     reduction_pct = format!("{:.2}%", reduction_pct),
                     "Limit-based data subset optimization"
                 );
-                limited_subset
+                vec![limited_subset]
             } else {
                 debug!(field = %field_name, full_elements, "Reading full array");
-                ArraySubset::new_with_shape(arr.shape().to_vec())
+                vec![ArraySubset::new_with_shape(arr.shape().to_vec())]
             };
-            let num_elements: u64 = subset.num_elements();
+            let num_elements: u64 = subsets.iter().map(|s| s.num_elements()).sum();
 
-            let array: ArrayRef = read_data_array!(async, arr, &subset, field.data_type());
+            let mut parts: Vec<ArrayRef> = Vec::with_capacity(subsets.len());
+            for subset in &subsets {
+                parts.push(read_data_array!(async, arr, subset, field.data_type()));
+            }
+            let array: ArrayRef = if parts.len() == 1 {
+                parts.remove(0)
+            } else {
+                let refs: Vec<&dyn arrow::array::Array> =
+                    parts.iter().map(|a| a.as_ref()).collect();
+                arrow::compute::concat(&refs).map_err(DataFusionError::from)?
+            };
 
             debug!(elapsed = ?read_start.elapsed(), "Data variable read complete");
             if let Some(ref s) = stats {
