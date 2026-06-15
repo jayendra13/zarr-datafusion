@@ -566,7 +566,7 @@ fn extract_literal(expr: &Expr) -> Option<ScalarValue> {
             if let Expr::Literal(value, _) = cast.expr.as_ref() {
                 // Try to cast the value to the target type
                 value
-                    .cast_to(&cast.data_type)
+                    .cast_to(cast.field.data_type())
                     .ok()
                     .map(unwrap_dictionary_value)
             } else {

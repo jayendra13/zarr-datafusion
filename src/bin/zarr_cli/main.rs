@@ -257,7 +257,7 @@ fn print_help() {
 /// Recursively search the execution plan tree for ZarrExec and return its I/O stats
 fn find_zarr_exec_stats(plan: &Arc<dyn ExecutionPlan>) -> Option<SharedIoStats> {
     // Check if this node is ZarrExec
-    if let Some(zarr_exec) = plan.as_any().downcast_ref::<ZarrExec>() {
+    if let Some(zarr_exec) = plan.downcast_ref::<ZarrExec>() {
         return Some(zarr_exec.io_stats());
     }
 

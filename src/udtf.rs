@@ -65,7 +65,7 @@ impl TableFunctionImpl for ZarrDescribeFunc {
         let schema = provider.schema();
 
         // Try to get Zarr-specific metadata
-        let zarr_table = provider.as_any().downcast_ref::<ZarrTable>();
+        let zarr_table = provider.downcast_ref::<ZarrTable>();
         let is_zarr_table = zarr_table.is_some();
         let store_meta = zarr_table.and_then(|t| t.store_meta());
 

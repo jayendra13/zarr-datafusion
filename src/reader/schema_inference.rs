@@ -1393,10 +1393,12 @@ mod tests {
     fn test_discover_arrays_v2() {
         let meta = discover_arrays("data/synthetic_v2.zarr").unwrap();
 
-        // 3 coordinates (native Zarr ordering): time, lat, lon
+        // 3 coordinates (native Zarr ordering): time, lat, lon.
+        // lat/lon are both size 10, so their relative order is decided by the
+        // object store's (now lexicographic) listing order.
         assert_eq!(meta.coords.len(), 3);
         let coord_names: Vec<_> = meta.coords.iter().map(|c| c.name.as_str()).collect();
-        assert_eq!(coord_names, vec!["time", "lon", "lat"]);
+        assert_eq!(coord_names, vec!["time", "lat", "lon"]);
 
         // 2 data variables (sorted): humidity, temperature
         assert_eq!(meta.data_vars.len(), 2);
@@ -1404,9 +1406,9 @@ mod tests {
         assert_eq!(var_names, vec!["humidity", "temperature"]);
 
         // Shapes
-        assert_eq!(meta.coords[0].shape, vec![7]); // lat
-        assert_eq!(meta.coords[1].shape, vec![10]); // lon
-        assert_eq!(meta.coords[2].shape, vec![10]); // time
+        assert_eq!(meta.coords[0].shape, vec![7]); // time
+        assert_eq!(meta.coords[1].shape, vec![10]); // lat
+        assert_eq!(meta.coords[2].shape, vec![10]); // lon
         assert_eq!(meta.data_vars[0].shape, vec![7, 10, 10]); // humidity
         assert_eq!(meta.data_vars[1].shape, vec![7, 10, 10]); // temperature
 
@@ -1425,7 +1427,7 @@ mod tests {
         assert_eq!(meta.data_vars.len(), 2);
 
         let coord_names: Vec<_> = meta.coords.iter().map(|c| c.name.as_str()).collect();
-        assert_eq!(coord_names, vec!["time", "lon", "lat"]);
+        assert_eq!(coord_names, vec!["time", "lat", "lon"]);
 
         let var_names: Vec<_> = meta.data_vars.iter().map(|v| v.name.as_str()).collect();
         assert_eq!(var_names, vec!["humidity", "temperature"]);
@@ -1441,7 +1443,7 @@ mod tests {
         assert_eq!(schema.fields().len(), 5);
 
         let names: Vec<_> = schema.fields().iter().map(|f| f.name().as_str()).collect();
-        assert_eq!(names, vec!["time", "lon", "lat", "humidity", "temperature"]);
+        assert_eq!(names, vec!["time", "lat", "lon", "humidity", "temperature"]);
     }
 
     #[test]

@@ -6,7 +6,6 @@ use arrow::array::{Array, BooleanArray, Float64Array, Int64Array};
 use arrow::datatypes::DataType;
 use datafusion::common::Result;
 use datafusion::logical_expr::{ColumnarValue, ScalarUDF, ScalarUDFImpl, Signature, Volatility};
-use std::any::Any;
 use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 
@@ -45,10 +44,6 @@ impl Hash for MaeUdf {
 }
 
 impl ScalarUDFImpl for MaeUdf {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn name(&self) -> &str {
         "mae"
     }
@@ -123,10 +118,6 @@ impl Hash for BiasUdf {
 }
 
 impl ScalarUDFImpl for BiasUdf {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn name(&self) -> &str {
         "bias"
     }
@@ -201,10 +192,6 @@ impl Hash for SquaredErrorUdf {
 }
 
 impl ScalarUDFImpl for SquaredErrorUdf {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn name(&self) -> &str {
         "squared_error"
     }
@@ -279,10 +266,6 @@ impl Hash for GridRoundUdf {
 }
 
 impl ScalarUDFImpl for GridRoundUdf {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn name(&self) -> &str {
         "grid_round"
     }
@@ -353,10 +336,6 @@ impl Hash for KelvinToCelsiusUdf {
 }
 
 impl ScalarUDFImpl for KelvinToCelsiusUdf {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn name(&self) -> &str {
         "kelvin_to_celsius"
     }
@@ -418,10 +397,6 @@ impl Hash for IsFreezingUdf {
 }
 
 impl ScalarUDFImpl for IsFreezingUdf {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn name(&self) -> &str {
         "is_freezing"
     }
@@ -486,10 +461,6 @@ impl Hash for WithinWindowUdf {
 }
 
 impl ScalarUDFImpl for WithinWindowUdf {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn name(&self) -> &str {
         "within_window"
     }
