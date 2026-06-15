@@ -147,20 +147,20 @@ fn format_plan_structure(plan: &Arc<dyn ExecutionPlan>, depth: usize) -> String 
     let mut result = format!("{}{}", indent, plan.name());
 
     // Add limit info if present
-    if let Some(coalesce) = plan.as_any().downcast_ref::<CoalescePartitionsExec>() {
+    if let Some(coalesce) = plan.downcast_ref::<CoalescePartitionsExec>() {
         if let Some(fetch) = coalesce.fetch() {
             result.push_str(&format!("(fetch={})", fetch));
         }
     }
-    if let Some(global) = plan.as_any().downcast_ref::<GlobalLimitExec>() {
+    if let Some(global) = plan.downcast_ref::<GlobalLimitExec>() {
         if let Some(fetch) = global.fetch() {
             result.push_str(&format!("(fetch={})", fetch));
         }
     }
-    if let Some(local) = plan.as_any().downcast_ref::<LocalLimitExec>() {
+    if let Some(local) = plan.downcast_ref::<LocalLimitExec>() {
         result.push_str(&format!("(fetch={})", local.fetch()));
     }
-    if let Some(zarr) = plan.as_any().downcast_ref::<ZarrExec>() {
+    if let Some(zarr) = plan.downcast_ref::<ZarrExec>() {
         if let Some(limit) = zarr.limit() {
             result.push_str(&format!("(limit={})", limit));
         }
@@ -202,21 +202,21 @@ fn find_limit_anywhere(plan: &Arc<dyn ExecutionPlan>) -> Option<usize> {
 /// Extract limit value from a single plan node (not recursive)
 fn extract_limit_from_node(plan: &Arc<dyn ExecutionPlan>) -> Option<usize> {
     // Check for CoalescePartitionsExec with fetch
-    if let Some(coalesce) = plan.as_any().downcast_ref::<CoalescePartitionsExec>() {
+    if let Some(coalesce) = plan.downcast_ref::<CoalescePartitionsExec>() {
         if let Some(fetch) = coalesce.fetch() {
             return Some(fetch);
         }
     }
 
     // Check for GlobalLimitExec
-    if let Some(global_limit) = plan.as_any().downcast_ref::<GlobalLimitExec>() {
+    if let Some(global_limit) = plan.downcast_ref::<GlobalLimitExec>() {
         if let Some(fetch) = global_limit.fetch() {
             return Some(fetch);
         }
     }
 
     // Check for LocalLimitExec
-    if let Some(local_limit) = plan.as_any().downcast_ref::<LocalLimitExec>() {
+    if let Some(local_limit) = plan.downcast_ref::<LocalLimitExec>() {
         return Some(local_limit.fetch());
     }
 
@@ -235,7 +235,7 @@ fn push_limit_to_zarr(
     );
 
     // Check if current node is ZarrExec
-    if let Some(zarr_exec) = plan.as_any().downcast_ref::<ZarrExec>() {
+    if let Some(zarr_exec) = plan.downcast_ref::<ZarrExec>() {
         debug!(
             current_limit = ?zarr_exec.limit(),
             incoming_limit = ?limit,

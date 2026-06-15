@@ -27,7 +27,7 @@ pub struct ZarrExec {
     path: String,
     projection: Option<Vec<usize>>,
     limit: Option<usize>,
-    properties: PlanProperties,
+    properties: Arc<PlanProperties>,
     io_stats: SharedIoStats,
     /// Cached remote store and metadata (avoids recreating on each query)
     cached_remote: CachedRemoteStore,
@@ -106,12 +106,12 @@ impl ZarrExec {
             schema.clone()
         };
 
-        let properties = PlanProperties::new(
+        let properties = Arc::new(PlanProperties::new(
             EquivalenceProperties::new(projected_schema),
             Partitioning::UnknownPartitioning(1),
             EmissionType::Incremental,
             Boundedness::Bounded,
-        );
+        ));
         Self {
             schema,
             path,
@@ -173,15 +173,11 @@ impl ExecutionPlan for ZarrExec {
         "ZarrExec"
     }
 
-    fn as_any(&self) -> &dyn std::any::Any {
-        self
-    }
-
     fn children(&self) -> Vec<&std::sync::Arc<dyn ExecutionPlan>> {
         vec![]
     }
 
-    fn properties(&self) -> &datafusion::physical_plan::PlanProperties {
+    fn properties(&self) -> &Arc<datafusion::physical_plan::PlanProperties> {
         &self.properties
     }
 

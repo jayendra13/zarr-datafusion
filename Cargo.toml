@@ -13,21 +13,21 @@ keywords = ["zarr", "datafusion", "sql", "arrow", "scientific-data"]
 categories = ["database", "science", "data-structures"]
 
 [dependencies]
-arrow = "57.1.0"
+arrow = "58"
 async-trait = "0.1"
 bytes = "1.11"
 chrono = "0.4"
-datafusion = "51.0.0"
+datafusion = "54.0.0"
 futures = "0.3.31"
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 zarrs = { version = "0.22.10", features = ["ndarray", "async", "zlib"] }
 zarrs_object_store = { version = "0.6", features = ["gcp", "aws", "http"] }
-parquet = { version = "57", default-features = false, features = ["arrow", "async"] }
+parquet = { version = "58", default-features = false, features = ["arrow", "async"] }
 glob = "0.3"
 url = "2"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-datafusion-proto = "51.0.0"
+datafusion-proto = "54.0.0"
 prost = "0.14.4"
 serde = { version = "1.0.228", features = ["derive"] }
 

@@ -209,7 +209,6 @@ impl PhysicalExtensionCodec for ZarrPhysicalCodec {
 
     fn try_encode(&self, node: Arc<dyn ExecutionPlan>, buf: &mut Vec<u8>) -> Result<()> {
         let exec = node
-            .as_any()
             .downcast_ref::<ZarrExec>()
             .ok_or_else(|| DataFusionError::Internal("not a ZarrExec".to_string()))?;
         let dto = ZarrExecDto::from_exec(exec)?;
@@ -287,7 +286,6 @@ impl LogicalExtensionCodec for ZarrLogicalCodec {
         buf: &mut Vec<u8>,
     ) -> Result<()> {
         let table = node
-            .as_any()
             .downcast_ref::<ZarrTable>()
             .ok_or_else(|| DataFusionError::Internal("not a ZarrTable".to_string()))?;
         let dto = ZarrTableDto {
@@ -365,7 +363,7 @@ mod tests {
             .unwrap();
 
         let decoded = codec.try_decode(&buf, &[], &ctx).unwrap();
-        let decoded = decoded.as_any().downcast_ref::<ZarrExec>().unwrap();
+        let decoded = decoded.downcast_ref::<ZarrExec>().unwrap();
 
         assert_eq!(decoded.path(), "gs://bucket/data.zarr");
         assert_eq!(decoded.projection(), Some(&vec![0, 2]));
@@ -422,7 +420,7 @@ mod tests {
             .try_encode(Arc::new(exec) as Arc<dyn ExecutionPlan>, &mut buf)
             .unwrap();
         let decoded = codec.try_decode(&buf, &[], &ctx).unwrap();
-        let decoded = decoded.as_any().downcast_ref::<ZarrExec>().unwrap();
+        let decoded = decoded.downcast_ref::<ZarrExec>().unwrap();
 
         assert_eq!(decoded.path(), "/tmp/local.zarr");
         assert!(decoded.projection().is_none());
@@ -488,7 +486,7 @@ mod tests {
         let decoded = codec
             .try_decode_table_provider(&buf, &table_ref, schema.clone(), &ctx)
             .unwrap();
-        let decoded = decoded.as_any().downcast_ref::<ZarrTable>().unwrap();
+        let decoded = decoded.downcast_ref::<ZarrTable>().unwrap();
 
         assert_eq!(decoded.path(), "gs://bucket/data.zarr");
         assert_eq!(decoded.schema().as_ref(), schema.as_ref());
@@ -523,7 +521,7 @@ mod tests {
         let decoded = codec
             .try_decode_table_provider(&buf, &table_ref, schema.clone(), &ctx)
             .unwrap();
-        let decoded = decoded.as_any().downcast_ref::<ZarrTable>().unwrap();
+        let decoded = decoded.downcast_ref::<ZarrTable>().unwrap();
 
         assert_eq!(decoded.path(), "/tmp/local.zarr");
         assert!(decoded.store_meta().is_none());

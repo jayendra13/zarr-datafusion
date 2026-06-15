@@ -104,7 +104,7 @@ pub async fn get_physical_plan(ctx: &SessionContext, sql: &str) -> Arc<dyn Execu
 /// Find ZarrExec node in a physical plan (recursive search)
 pub fn find_zarr_exec(plan: &Arc<dyn ExecutionPlan>) -> Option<&ZarrExec> {
     // Check if current node is ZarrExec
-    if let Some(zarr_exec) = plan.as_any().downcast_ref::<ZarrExec>() {
+    if let Some(zarr_exec) = plan.downcast_ref::<ZarrExec>() {
         return Some(zarr_exec);
     }
 

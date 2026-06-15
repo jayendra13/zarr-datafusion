@@ -11,7 +11,6 @@ use datafusion::common::{Result, ScalarValue};
 use datafusion::logical_expr::{
     Accumulator, AggregateUDF, AggregateUDFImpl, Signature, Volatility,
 };
-use std::any::Any;
 use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 
@@ -50,10 +49,6 @@ impl Hash for RmseUdaf {
 }
 
 impl AggregateUDFImpl for RmseUdaf {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn name(&self) -> &str {
         "rmse"
     }
@@ -184,10 +179,6 @@ impl Hash for MeanMaeUdaf {
 }
 
 impl AggregateUDFImpl for MeanMaeUdaf {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn name(&self) -> &str {
         "mean_mae"
     }
@@ -319,10 +310,6 @@ impl Hash for SpatialMeanUdaf {
 }
 
 impl AggregateUDFImpl for SpatialMeanUdaf {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn name(&self) -> &str {
         "spatial_mean"
     }
