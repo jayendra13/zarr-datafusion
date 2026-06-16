@@ -2,6 +2,12 @@
 data/era5_*.zarr
 plans/
 
+# Local distributed cluster runtime artifacts (logs/pids from scripts/cluster.sh)
+.cluster/
+
+# Python
+__pycache__/
+
 # Terraform
 terraform/.terraform/
 terraform/terraform.tfstate
