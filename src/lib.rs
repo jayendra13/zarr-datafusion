@@ -1,4 +1,6 @@
 pub mod datasource;
+#[cfg(feature = "distributed")]
+pub mod distributed;
 pub mod optimizer;
 pub mod physical_plan;
 pub mod reader;

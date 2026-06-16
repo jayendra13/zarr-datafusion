@@ -9,10 +9,11 @@ use tracing::{debug, info};
 use zarrs::storage::AsyncReadableListableStorage;
 use zarrs_object_store::object_store::path::Path as ObjectPath;
 
+use crate::physical_plan::partition::{plan_partitions, PartitionSpec};
 use crate::physical_plan::zarr_exec::ZarrExec;
 use crate::reader::filter::{is_date_part_filter, parse_coord_filters};
 use crate::reader::schema_inference::ZarrStoreMeta;
-use crate::reader::virtual_store::VirtualStoreAdapter;
+use crate::reader::virtual_store::{is_virtualizarr_store, VirtualStoreAdapter};
 
 /// Cached remote store info (store, prefix, metadata)
 pub type CachedRemoteStore = Option<(AsyncReadableListableStorage, ObjectPath, ZarrStoreMeta)>;
@@ -120,6 +121,70 @@ impl ZarrTable {
     pub fn path(&self) -> &str {
         &self.path
     }
+
+    /// Decide this scan's output partitions.
+    ///
+    /// Returns an EMPTY vec to mean "single unpartitioned read" — used for
+    /// remote/VirtualiZarr stores (their read paths don't take a range yet) and
+    /// when we lack the metadata to slice safely.
+    fn plan_scan_partitions(
+        &self,
+        state: &dyn Session,
+        limit: Option<usize>,
+    ) -> Vec<PartitionSpec> {
+        // Guard 0: a LIMIT is a GLOBAL row cap, but it gets pushed into each
+        // partition's read independently — which is unsound across multiple
+        // partitions (each would return its own first-N rows). Until per-
+        // partition fetch is handled by a global limit above the scan, keep
+        // limited queries single-partition (where pushdown stays correct).
+        if limit.is_some() {
+            return Vec::new();
+        }
+
+        // Guard 1: local and remote stores partition; VirtualiZarr does not yet
+        // (its async read path ignores `partition_range`).
+        if is_virtualizarr_store(&self.path) {
+            return Vec::new();
+        }
+
+        // Guard 2: we need metadata and a data variable to size the outer axis.
+        let Some(meta) = &self.store_meta else {
+            return Vec::new();
+        };
+        let Some(data_var) = meta.data_vars.first() else {
+            return Vec::new();
+        };
+        // The reader maps the partition slice to the coordinate whose size equals
+        // the data var's outer-axis length (`shape[0]`). If no such coordinate
+        // exists we can't slice safely, so don't partition (the FILL 5a lookup
+        // would fall back to no-slicing and produce duplicated reads).
+        let outer_axis_len = data_var.shape.first().copied();
+        let outer_coord_exists = outer_axis_len
+            .map(|len| {
+                meta.coords
+                    .iter()
+                    .any(|c| c.shape.first().copied() == Some(len))
+            })
+            .unwrap_or(false);
+        if !outer_coord_exists {
+            return Vec::new();
+        }
+
+        // FILL 6a: the engine's desired parallelism.
+        let target_partitions: usize = state.config().target_partitions();
+
+        // FILL 6b: outer-dim length and chunk size from the data var's axis 0.
+        let outer_len: u64 = data_var.shape.first().copied().unwrap_or(0);
+        // Unknown chunking => treat the whole axis as one chunk (=> one partition).
+        let chunk_len: u64 = data_var
+            .chunks
+            .as_ref()
+            .and_then(|c| c.first().copied())
+            .unwrap_or(outer_len);
+
+        // FILL 6c: hand off to the pure planner.
+        plan_partitions(outer_len, chunk_len, target_partitions)
+    }
 }
 
 #[async_trait]
@@ -158,7 +223,7 @@ impl TableProvider for ZarrTable {
 
     async fn scan(
         &self,
-        _state: &dyn Session,
+        state: &dyn Session,
         projection: Option<&Vec<usize>>,
         filters: &[datafusion::logical_expr::Expr],
         limit: Option<usize>,
@@ -214,7 +279,14 @@ impl TableProvider for ZarrTable {
             None
         };
 
-        Ok(Arc::new(ZarrExec::new(
+        // ── Plan output partitions ────────────────────────────────────────
+        // Only LOCAL stores get real partitioning for now: the remote and
+        // VirtualiZarr read paths don't yet accept an outer-dim range (see the
+        // FILL 4 note in zarr_exec). We also need the outer dimension's name to
+        // map the slice back to a coordinate, so we require known `dimensions`.
+        let partitions = self.plan_scan_partitions(state, limit);
+
+        let exec = ZarrExec::new(
             self.schema.clone(),
             self.path.clone(),
             projection.cloned(),
@@ -222,7 +294,12 @@ impl TableProvider for ZarrTable {
             self.cached_remote.clone(),
             coord_filters,
             self.cached_virtualizarr.clone(),
-        )))
+        );
+
+        // FILL 6d: attach the planned slices (builder consumes & returns exec).
+        let exec = exec.with_partitions(partitions);
+
+        Ok(Arc::new(exec))
     }
 
     /// Return statistics for this table

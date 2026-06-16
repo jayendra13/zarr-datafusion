@@ -1,10 +1,11 @@
 //! Serialization support for [`ZarrExec`] so it can be shipped across a
-//! Ballista cluster.
+//! datafusion-distributed cluster.
 //!
-//! Ballista distributes physical plans to workers as bytes. Built-in operators
-//! are handled by DataFusion's protobuf codec, but custom `ExecutionPlan`s like
-//! [`ZarrExec`] need a [`PhysicalExtensionCodec`] that knows how to encode and
-//! decode them.
+//! datafusion-distributed ships physical stages from the head to workers as
+//! bytes. Built-in operators are handled by DataFusion's protobuf codec, but
+//! custom `ExecutionPlan`s like [`ZarrExec`] need a [`PhysicalExtensionCodec`]
+//! that knows how to encode and decode them. [`ZarrPhysicalCodec`] is registered
+//! on both sides via `configure_distributed_builder` (see `crate::distributed`).
 //!
 //! Only the *logical* inputs of `ZarrExec` are serialized: `schema`, `path`,
 //! `projection`, `limit`, and `coord_filters`. The live store caches
@@ -29,6 +30,7 @@ use prost::Message;
 use serde::{Deserialize, Serialize};
 
 use crate::datasource::zarr::ZarrTable;
+use crate::physical_plan::partition::PartitionSpec;
 use crate::physical_plan::zarr_exec::ZarrExec;
 use crate::reader::filter::{CoordFilterKind, CoordFilters};
 use crate::reader::schema_inference::ZarrStoreMeta;
@@ -135,6 +137,12 @@ struct ZarrExecDto {
     projection: Option<Vec<usize>>,
     limit: Option<usize>,
     coord_filters: Option<HashMap<String, CoordFilterKindDto>>,
+    /// Per-task partition slices. MUST be carried: each worker decodes a
+    /// distinct subset and reads only those chunks. If dropped, every worker
+    /// re-scans the whole store. `serde(default)` keeps old payloads decodable
+    /// as an empty (single-partition) list.
+    #[serde(default)]
+    partitions: Vec<PartitionSpec>,
 }
 
 impl ZarrExecDto {
@@ -155,6 +163,7 @@ impl ZarrExecDto {
             projection: exec.projection().cloned(),
             limit: exec.limit(),
             coord_filters,
+            partitions: exec.partitions().to_vec(),
         })
     }
 
@@ -173,6 +182,8 @@ impl ZarrExecDto {
             .transpose()?;
 
         // Caches are dropped on the wire; execute() re-creates the store from `path`.
+        // Reattach the partition slices so the decoded exec reports the right
+        // partition count and execute() reads only this task's chunks.
         Ok(ZarrExec::new(
             schema,
             self.path,
@@ -181,7 +192,8 @@ impl ZarrExecDto {
             None,
             coord_filters,
             None,
-        ))
+        )
+        .with_partitions(self.partitions))
     }
 }
 
@@ -189,9 +201,9 @@ impl ZarrExecDto {
 // PhysicalExtensionCodec
 // =============================================================================
 
-/// Encodes/decodes [`ZarrExec`] for Ballista. Register this with the Ballista
-/// `SessionContext` / scheduler so the driver and workers agree on the wire
-/// format.
+/// Encodes/decodes [`ZarrExec`] for datafusion-distributed. Register this on the
+/// head and every worker (via `with_distributed_user_codec`) so both sides agree
+/// on the wire format.
 #[derive(Debug, Default)]
 pub struct ZarrPhysicalCodec;
 
@@ -225,21 +237,26 @@ impl PhysicalExtensionCodec for ZarrPhysicalCodec {
 
 /// Serializable mirror of the reconstructable subset of [`ZarrTable`].
 ///
-/// The Arrow schema is *not* serialized here — Ballista passes it separately to
-/// `try_decode_table_provider`. The live store caches (`cached_remote`,
-/// `cached_virtualizarr`) are dropped; the scheduler rebuilds them lazily and
-/// the executor re-creates them from `path`. `store_meta` is carried so the
-/// scheduler can do statistics-based optimization and filter-pushdown parsing
-/// without re-opening the store.
+/// The Arrow schema is *not* serialized here — the framework passes it
+/// separately to `try_decode_table_provider`. The live store caches
+/// (`cached_remote`, `cached_virtualizarr`) are dropped; they are re-created
+/// from `path` on use. `store_meta` is carried so the decoder can do
+/// statistics-based optimization and filter-pushdown parsing without re-opening
+/// the store.
 #[derive(Serialize, Deserialize)]
 struct ZarrTableDto {
     path: String,
     store_meta: Option<ZarrStoreMeta>,
 }
 
-/// Encodes/decodes [`ZarrTable`] for Ballista so a `TableScan` over a Zarr store
-/// can travel from the client to the scheduler. Companion to
-/// [`ZarrPhysicalCodec`]; bundle both into a `BallistaCodec`.
+/// Encodes/decodes [`ZarrTable`] so a `TableScan` over a Zarr store can travel
+/// from a client to a planner. Companion to [`ZarrPhysicalCodec`].
+///
+/// NOTE: this logical codec is currently unused by the live datafusion-distributed
+/// path — the head keeps the `TableProvider` local and ships only the physical
+/// `ZarrExec`, so only [`ZarrPhysicalCodec`] is registered. It is retained (and
+/// unit-tested) for round-tripping a full `TableScan`, e.g. if logical-plan
+/// distribution is needed later.
 #[derive(Debug, Default)]
 pub struct ZarrLogicalCodec;
 
@@ -397,6 +414,79 @@ mod tests {
             }
             other => panic!("unexpected: {other:?}"),
         }
+    }
+
+    #[test]
+    fn roundtrip_preserves_partitions() {
+        use crate::physical_plan::partition::PartitionSpec;
+
+        let schema = sample_schema();
+        let specs = vec![
+            PartitionSpec {
+                outer_start: 0,
+                outer_end: 3,
+            },
+            PartitionSpec {
+                outer_start: 3,
+                outer_end: 7,
+            },
+        ];
+        let exec = ZarrExec::new(
+            schema.clone(),
+            "/tmp/local.zarr".to_string(),
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .with_partitions(specs.clone());
+
+        // Sanity: the exec advertises 2 output partitions before the round trip.
+        assert_eq!(exec.partitions(), specs.as_slice());
+        assert_eq!(exec.properties().partitioning.partition_count(), 2);
+
+        let codec = ZarrPhysicalCodec;
+        let ctx = TaskContext::default();
+        let mut buf = Vec::new();
+        codec
+            .try_encode(Arc::new(exec) as Arc<dyn ExecutionPlan>, &mut buf)
+            .unwrap();
+        let decoded = codec.try_decode(&buf, &[], &ctx).unwrap();
+        let decoded = decoded.downcast_ref::<ZarrExec>().unwrap();
+
+        // The slices AND the derived partition count must survive the wire,
+        // else workers would each re-scan the whole store.
+        assert_eq!(decoded.partitions(), specs.as_slice());
+        assert_eq!(decoded.properties().partitioning.partition_count(), 2);
+    }
+
+    #[test]
+    fn roundtrip_empty_partitions_stays_single() {
+        // A non-partitioned exec must decode as single-partition (legacy path).
+        let schema = sample_schema();
+        let exec = ZarrExec::new(
+            schema,
+            "/tmp/local.zarr".to_string(),
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
+        assert!(exec.partitions().is_empty());
+
+        let codec = ZarrPhysicalCodec;
+        let ctx = TaskContext::default();
+        let mut buf = Vec::new();
+        codec
+            .try_encode(Arc::new(exec) as Arc<dyn ExecutionPlan>, &mut buf)
+            .unwrap();
+        let decoded = codec.try_decode(&buf, &[], &ctx).unwrap();
+        let decoded = decoded.downcast_ref::<ZarrExec>().unwrap();
+
+        assert!(decoded.partitions().is_empty());
+        assert_eq!(decoded.properties().partitioning.partition_count(), 1);
     }
 
     #[test]
