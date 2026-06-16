@@ -485,47 +485,24 @@ fn restrict_to_partition(
             .collect()
     });
 
-    // Narrow the outer coordinate's selection to this partition's selection.
-    sels[outer_coord_idx] = intersect_selections(&sels[outer_coord_idx], partition_sel);
+    // REPLACE the outer coordinate's selection with this partition's selection.
+    // The partition selection is the head-resolved surviving sub-set for this
+    // partition (a subset of the full filter result), so it is authoritative —
+    // there is a single resolution site (the head), and the worker's own
+    // re-resolution of the outer filter, if any, is discarded here. For the
+    // unfiltered geometry case the partition selection is the partition's axis
+    // slice, which is likewise exactly what this partition should read.
+    sels[outer_coord_idx] = partition_sel.clone();
 
     Some(sels)
-}
-
-/// Intersect a filter-derived selection with a partition's selection on the same
-/// axis. The partition can only *narrow* the filter result; when the two don't
-/// overlap the outer coordinate becomes empty (this partition yields no rows and
-/// the others cover them). Generalizes over both `Range` and scattered `Indices`.
-fn intersect_selections(filter_sel: &CoordSelection, part_sel: &CoordSelection) -> CoordSelection {
-    match part_sel {
-        CoordSelection::Range(ps, pe) => match filter_sel {
-            CoordSelection::Range(s, e) => {
-                let start = (*s).max(*ps);
-                let end = (*e).min(*pe).max(start);
-                CoordSelection::Range(start, end)
-            }
-            CoordSelection::Indices(v) => CoordSelection::Indices(
-                v.iter().copied().filter(|&i| i >= *ps && i < *pe).collect(),
-            ),
-        },
-        CoordSelection::Indices(pv) => {
-            let pset: std::collections::HashSet<usize> = pv.iter().copied().collect();
-            let kept: Vec<usize> = match filter_sel {
-                CoordSelection::Range(s, e) => (*s..*e).filter(|i| pset.contains(i)).collect(),
-                CoordSelection::Indices(v) => {
-                    v.iter().copied().filter(|i| pset.contains(i)).collect()
-                }
-            };
-            CoordSelection::Indices(kept)
-        }
-    }
 }
 
 /// Narrow `coord_ranges` to a partition's outer-dimension slice, if any.
 ///
 /// Maps the data var's axis-0 to its coordinate by size (coords are ordered to
 /// match the axes, so the outer coordinate is the first whose size == data var
-/// `shape[0]`) and intersects the slice in via [`restrict_to_partition`]. Shared
-/// by the sync ([`read_zarr`]) and async ([`read_zarr_async`]) readers.
+/// `shape[0]`) and applies the partition selection via [`restrict_to_partition`].
+/// Shared by the sync ([`read_zarr`]) and async ([`read_zarr_async`]) readers.
 fn apply_partition_selection(
     coord_ranges: Option<Vec<CoordSelection>>,
     partition_selection: Option<CoordSelection>,
