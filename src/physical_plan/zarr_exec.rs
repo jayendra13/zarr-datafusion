@@ -1,3 +1,4 @@
+use crate::physical_plan::partition::PartitionSpec;
 use crate::reader::filter::CoordFilters;
 use crate::reader::schema_inference::ZarrStoreMeta;
 use crate::reader::stats::{SharedIoStats, ZarrIoStats};
@@ -35,6 +36,11 @@ pub struct ZarrExec {
     coord_filters: Option<CoordFilters>,
     /// Cached VirtualiZarr adapter for remote VirtualiZarr stores
     cached_virtualizarr: CachedVirtualiZarrAdapter,
+    /// Outer-dimension slices, one per output partition.
+    /// EMPTY means "single unpartitioned read" (legacy behavior) — that keeps
+    /// every existing `ZarrExec::new` caller (codec, tests) working unchanged.
+    /// Populated by `with_partitions` from the planner in `ZarrTable::scan`.
+    partitions: Vec<PartitionSpec>,
 }
 
 impl std::fmt::Debug for ZarrExec {
@@ -94,24 +100,8 @@ impl ZarrExec {
         coord_filters: Option<CoordFilters>,
         cached_virtualizarr: CachedVirtualiZarrAdapter,
     ) -> Self {
-        // Compute projected schema for plan properties
-        let projected_schema = if let Some(ref indices) = projection {
-            Arc::new(Schema::new(
-                indices
-                    .iter()
-                    .map(|&i| schema.field(i).clone())
-                    .collect::<Vec<_>>(),
-            ))
-        } else {
-            schema.clone()
-        };
-
-        let properties = Arc::new(PlanProperties::new(
-            EquivalenceProperties::new(projected_schema),
-            Partitioning::UnknownPartitioning(1),
-            EmissionType::Incremental,
-            Boundedness::Bounded,
-        ));
+        // Start with a single, unpartitioned read (empty `partitions`).
+        let properties = Self::build_properties(&schema, projection.as_ref(), 1);
         Self {
             schema,
             path,
@@ -122,7 +112,54 @@ impl ZarrExec {
             cached_remote,
             coord_filters,
             cached_virtualizarr,
+            partitions: Vec::new(),
         }
+    }
+
+    /// Build the `PlanProperties` for a given output partition count.
+    ///
+    /// Shared by `new` (count = 1) and `with_partitions` (count = number of
+    /// slices). `&SchemaRef` / `Option<&Vec<usize>>` are *borrows* — this only
+    /// reads them to derive the projected schema, it doesn't take ownership.
+    fn build_properties(
+        schema: &SchemaRef,
+        projection: Option<&Vec<usize>>,
+        num_partitions: usize,
+    ) -> Arc<PlanProperties> {
+        // Compute projected schema for plan properties
+        let projected_schema = if let Some(indices) = projection {
+            Arc::new(Schema::new(
+                indices
+                    .iter()
+                    .map(|&i| schema.field(i).clone())
+                    .collect::<Vec<_>>(),
+            ))
+        } else {
+            schema.clone()
+        };
+
+        Arc::new(PlanProperties::new(
+            EquivalenceProperties::new(projected_schema),
+            Partitioning::UnknownPartitioning(num_partitions),
+            EmissionType::Incremental,
+            Boundedness::Bounded,
+        ))
+    }
+
+    /// Attach the planner's partition slices and re-derive `PlanProperties` so
+    /// the plan advertises `partitions.len()` output partitions.
+    ///
+    /// Takes `self` by value (`mut self`) and returns it — the builder idiom:
+    /// `ZarrExec::new(..).with_partitions(specs)`.
+    pub fn with_partitions(mut self, partitions: Vec<PartitionSpec>) -> Self {
+        // ▢ FILL 2: how many output partitions should we advertise?
+        // An empty `partitions` must still mean ONE partition (legacy single
+        // read), so floor the count at 1. Hint: `.len().max(1)`.
+        let num_partitions = partitions.len().max(1);
+        self.properties =
+            Self::build_properties(&self.schema, self.projection.as_ref(), num_partitions);
+        self.partitions = partitions;
+        self
     }
 
     /// Get I/O statistics collected during execution
@@ -155,6 +192,13 @@ impl ZarrExec {
         self.coord_filters.as_ref()
     }
 
+    /// Get this scan's partition slices (empty == single unpartitioned read).
+    /// Used by the distributed codec (to ship them) and the `TaskEstimator`
+    /// (to split them across worker tasks).
+    pub fn partitions(&self) -> &[PartitionSpec] {
+        &self.partitions
+    }
+
     /// Create a new ZarrExec with the given limit
     pub fn with_limit(&self, limit: Option<usize>) -> Self {
         Self::new(
@@ -166,6 +210,10 @@ impl ZarrExec {
             self.coord_filters.clone(),
             self.cached_virtualizarr.clone(),
         )
+        // `new` resets partitions to empty; re-attach ours so a limited copy
+        // keeps the same output partitioning. `.clone()` because `self` is
+        // borrowed (`&self`) and we can't move the Vec out of it.
+        .with_partitions(self.partitions.clone())
     }
 }
 impl ExecutionPlan for ZarrExec {
@@ -190,11 +238,28 @@ impl ExecutionPlan for ZarrExec {
 
     fn execute(
         &self,
-        _partition: usize,
+        partition: usize,
         _context: std::sync::Arc<datafusion::execution::TaskContext>,
     ) -> datafusion::error::Result<datafusion::execution::SendableRecordBatchStream> {
+        // Translate the requested partition index into an outer-dimension range.
+        // Empty `partitions` => legacy whole-store read (`None`).
+        //
+        // ▢ FILL 3: when `self.partitions` is non-empty, look up the slice for
+        // this `partition` and turn it into `Some(start..end)`. Hint:
+        //   let spec = &self.partitions[partition];
+        //   Some(spec.outer_start..spec.outer_end)
+        // Otherwise `None`. `std::ops::Range` is half-open, matching PartitionSpec.
+        let partition_range: Option<std::ops::Range<u64>> = if self.partitions.is_empty() {
+            None
+        } else {
+            let spec = &self.partitions[partition];
+            Some(spec.outer_start..spec.outer_end)
+        };
+
         info!(
             path = %self.path,
+            partition,
+            partition_range = ?partition_range,
             limit = ?self.limit,
             projection = ?self.projection,
             has_cached_remote = self.cached_remote.is_some(),
@@ -236,6 +301,7 @@ impl ExecutionPlan for ZarrExec {
                 self.io_stats.clone(),
                 self.cached_remote.clone(),
                 self.coord_filters.clone(),
+                partition_range,
             )
         } else {
             info!("Using local (sync) execution path");
@@ -246,6 +312,7 @@ impl ExecutionPlan for ZarrExec {
                 self.limit,
                 Some(self.io_stats.clone()),
                 self.coord_filters.clone(),
+                partition_range,
             )
         }
     }
@@ -280,6 +347,8 @@ struct AsyncReadParams {
     limit: Option<usize>,
     stats: SharedIoStats,
     coord_filters: Option<CoordFilters>,
+    /// Outer-dim slice for this partition; `None` => whole store.
+    partition_range: Option<std::ops::Range<u64>>,
 }
 
 /// Execute an async read with the given store setup function.
@@ -326,6 +395,7 @@ where
             Some(params.stats),
             cached_meta,
             params.coord_filters,
+            params.partition_range,
         )
         .await?;
 
@@ -345,6 +415,7 @@ where
 }
 
 /// Execute read from remote object store
+#[allow(clippy::too_many_arguments)]
 fn execute_remote(
     path: String,
     schema: SchemaRef,
@@ -353,6 +424,7 @@ fn execute_remote(
     stats: SharedIoStats,
     cached_remote: CachedRemoteStore,
     coord_filters: Option<CoordFilters>,
+    partition_range: Option<std::ops::Range<u64>>,
 ) -> datafusion::error::Result<datafusion::execution::SendableRecordBatchStream> {
     use crate::reader::storage::create_async_store;
 
@@ -364,6 +436,7 @@ fn execute_remote(
         limit,
         stats,
         coord_filters,
+        partition_range,
     };
 
     execute_async_read(
@@ -407,6 +480,8 @@ fn execute_virtualizarr(
         limit,
         stats,
         coord_filters,
+        // VirtualiZarr stays single-partition for now (scan() doesn't partition it).
+        partition_range: None,
     };
 
     execute_async_read(
@@ -439,6 +514,7 @@ fn execute_virtualizarr_with_adapter(
         limit,
         stats,
         coord_filters,
+        partition_range: None,
     };
 
     execute_async_read(

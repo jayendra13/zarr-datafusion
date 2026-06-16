@@ -1,0 +1,49 @@
+# Local datafusion-distributed cluster: 3 workers + an on-demand head.
+#
+#   docker compose -f docker/docker-compose.yml up -d --build      # start workers
+#   docker compose -f docker/docker-compose.yml run --rm head \
+#     "SELECT lat, AVG(temperature) FROM weather GROUP BY lat" --show-plan
+#   docker compose -f docker/docker-compose.yml down
+#
+# Workers are named individually (worker1/2/3) rather than scaled replicas so
+# each gets a distinct hostname: the planner caps tasks-per-stage at the number
+# of resolver URLs, and one shared name would look like a single worker.
+name: zarr-distributed
+
+x-worker: &worker
+  build:
+    context: ..
+    dockerfile: docker/Dockerfile
+  image: zarr-datafusion-dist
+  environment:
+    PORT: "8080"
+    RUST_LOG: "info"
+  volumes:
+    # Shared read-only data so every worker resolves the ZarrExec path identically.
+    - ../data:/data:ro
+  restart: unless-stopped
+
+services:
+  worker1: { <<: *worker }
+  worker2: { <<: *worker }
+  worker3: { <<: *worker }
+
+  # On-demand runner. Not started by `up` (profiles); invoke with `run --rm head`.
+  head:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    image: zarr-datafusion-dist
+    entrypoint: ["head"]
+    environment:
+      WORKER_URLS: "http://worker1:8080,http://worker2:8080,http://worker3:8080"
+      STORE_PATH: "/data/synthetic_v3.zarr"
+      RUST_LOG: "info"
+    volumes:
+      - ../data:/data:ro
+    depends_on:
+      - worker1
+      - worker2
+      - worker3
+    profiles:
+      - head

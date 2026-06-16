@@ -31,6 +31,15 @@ datafusion-proto = "54.0.0"
 prost = "0.14.4"
 serde = { version = "1.0.228", features = ["derive"] }
 
+# Distributed execution (datafusion-distributed). Optional: only pulled in by the
+# `distributed` feature, which also gates the `worker` and `head` binaries.
+datafusion-distributed = { version = "2", optional = true }
+tonic = { version = "0.14", optional = true }
+
+[features]
+# Enables the datafusion-distributed worker/head binaries.
+distributed = ["dep:datafusion-distributed", "dep:tonic"]
+
 [[example]]
 name = "query_era5"
 path = "examples/query_era5.rs"
@@ -42,6 +51,16 @@ path = "examples/query_synthetic.rs"
 [[bin]]
 name = "zarr-cli"
 path = "src/bin/zarr_cli/main.rs"
+
+[[bin]]
+name = "worker"
+path = "src/bin/worker.rs"
+required-features = ["distributed"]
+
+[[bin]]
+name = "head"
+path = "src/bin/head.rs"
+required-features = ["distributed"]
 
 [dependencies.rustyline]
 version = "15"

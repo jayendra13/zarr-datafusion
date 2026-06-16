@@ -178,14 +178,23 @@ async fn test_dictionary_values_correct() {
         .downcast_ref::<DictionaryArray<Int16Type>>()
         .expect("Should be DictionaryArray<Int16Type>");
 
-    // Values array should have 10 unique lat values (0-9)
+    // lat must carry the 10 distinct values 0..=9. We assert the DISTINCT
+    // logical values rather than the dictionary buffer length: a partitioned
+    // scan emits one dictionary per partition, and concatenating the result
+    // batches stacks those dictionaries (e.g. 4 partitions -> 40 buffer
+    // entries) without changing the logical values.
     let values = dict_array
         .values()
         .as_any()
         .downcast_ref::<Int64Array>()
         .expect("Values should be Int64Array");
 
-    assert_eq!(values.len(), 10);
+    let distinct: std::collections::BTreeSet<i64> = values.iter().flatten().collect();
+    assert_eq!(
+        distinct.into_iter().collect::<Vec<_>>(),
+        (0..10).collect::<Vec<_>>(),
+        "lat should have the 10 distinct values 0..=9"
+    );
 }
 
 #[tokio::test]
