@@ -24,19 +24,26 @@ not run our physical plan.)
       each worker reads a disjoint `partition_range`. Verified end-to-end on a
       3-worker cluster (local `GROUP BY` and remote GCS Niño 3.4), results match
       the xarray reference.
-- [x] **Remote (GCS) partitioning** — `partition_range` threaded through the async
+- [x] **Remote (GCS) partitioning** — partition selection threaded through the async
       path; `head` registers `gs://`/`s3://` stores and workers rebuild them.
+- [x] **Surviving-set partitioning** — the head resolves the outer-axis filter to the
+      surviving index set (`resolve_outer_selection`, reads only the outer coord) and
+      splits THAT across partitions (`split_selection`); workers REPLACE their outer
+      selection with the head-resolved slice (single resolution site, no divergence).
+      Partitions carry a `CoordSelection` (`Range` or scattered `Indices`). Verified
+      e2e: `nino34_day.sql` (single day = 24 chunks) now spreads across all 3 workers
+      (was: one worker, rest idle), result unchanged (28.55 °C).
 
 ## Next
 
-- [ ] **Load balance narrow filters** — a single-day filter clusters all surviving
-      chunks into one partition of the full axis, so only one worker does real
-      work. Partition the *surviving* chunk set, not the full axis.
-- [ ] **Resolve filter indices on the head** and ship them — workers each read the
-      full (~10 MB) time coord to resolve date-part filters independently.
+- [ ] **Eliminate the redundant outer-coord read on workers** — workers still read the
+      full (~10 MB) outer coord and re-resolve the filter, only for `restrict_to_partition`
+      to discard it (REPLACE). Read only the shipped slice instead.
 - [ ] **LIMIT + partitioning soundness** — currently falls back to a single
       partition (per-partition limit is unsound).
-- [ ] **VirtualiZarr partitioning** — excluded for now (passes `partition_range: None`).
+- [ ] **VirtualiZarr partitioning** — excluded for now (passes no partition selection).
+- [ ] **Inner-axis / multi-axis partitioning** — only axis 0 is split, so a single
+      timestep over the full global grid stays on one worker.
 
 ## Open questions / risks
 
