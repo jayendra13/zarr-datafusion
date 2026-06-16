@@ -29,5 +29,8 @@
   "attributes": {},
   "zarr_format": 3,
   "node_type": "array",
-  "storage_transformers": []
+  "storage_transformers": [],
+  "dimension_names": [
+    "lat"
+  ]
 }

@@ -85,23 +85,36 @@ def generate_synthetic(
         else:
             compressors = None
 
-        # Create coordinate arrays
-        root.create_array("lat", data=np.arange(nlat), compressors=compressors)
-        root.create_array("lon", data=np.arange(nlon), compressors=compressors)
-        root.create_array("time", data=np.arange(ntime), compressors=compressors)
+        # Create coordinate arrays (each 1D array's dim is its own name)
+        root.create_array(
+            "lat", data=np.arange(nlat), compressors=compressors,
+            dimension_names=("lat",),
+        )
+        root.create_array(
+            "lon", data=np.arange(nlon), compressors=compressors,
+            dimension_names=("lon",),
+        )
+        root.create_array(
+            "time", data=np.arange(ntime), compressors=compressors,
+            dimension_names=("time",),
+        )
 
-        # Create data variables
+        # Create data variables.
+        # dimension_names is the Zarr v3 equivalent of v2's _ARRAY_DIMENSIONS;
+        # xarray requires it to map array axes to coordinate names.
         temperature = root.create_array(
             "temperature",
             chunks=(1, nlat, nlon),
             data=np.random.randint(-50, 60, (ntime, nlat, nlon)),
             compressors=compressors,
+            dimension_names=("time", "lat", "lon"),
         )
         humidity = root.create_array(
             "humidity",
             chunks=(1, nlat, nlon),
             data=np.random.randint(10, 80, (ntime, nlat, nlon)),
             compressors=compressors,
+            dimension_names=("time", "lat", "lon"),
         )
     else:
         # Zarr v2
