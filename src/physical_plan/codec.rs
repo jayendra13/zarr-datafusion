@@ -453,6 +453,48 @@ mod tests {
     }
 
     #[test]
+    fn roundtrip_preserves_indices_partitions() {
+        // A partition can carry a scattered Indices selection (produced once a
+        // resolved date-part filter is split). It must survive the wire intact —
+        // a worker that decoded it as a Range or dropped it would read the wrong
+        // chunks. This covers the variant the geometry-only path never exercises.
+        use crate::physical_plan::partition::PartitionSpec;
+        use crate::reader::filter::CoordSelection;
+
+        let schema = sample_schema();
+        let specs = vec![
+            PartitionSpec {
+                outer: CoordSelection::Indices(vec![3, 17, 41]),
+            },
+            PartitionSpec {
+                outer: CoordSelection::Indices(vec![58, 90]),
+            },
+        ];
+        let exec = ZarrExec::new(
+            schema,
+            "/tmp/local.zarr".to_string(),
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .with_partitions(specs.clone());
+
+        let codec = ZarrPhysicalCodec;
+        let ctx = TaskContext::default();
+        let mut buf = Vec::new();
+        codec
+            .try_encode(Arc::new(exec) as Arc<dyn ExecutionPlan>, &mut buf)
+            .unwrap();
+        let decoded = codec.try_decode(&buf, &[], &ctx).unwrap();
+        let decoded = decoded.downcast_ref::<ZarrExec>().unwrap();
+
+        assert_eq!(decoded.partitions(), specs.as_slice());
+        assert_eq!(decoded.properties().partitioning.partition_count(), 2);
+    }
+
+    #[test]
     fn roundtrip_empty_partitions_stays_single() {
         // A non-partitioned exec must decode as single-partition (legacy path).
         let schema = sample_schema();
