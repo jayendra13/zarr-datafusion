@@ -24,7 +24,8 @@ use super::coord::{
 };
 use super::filter::{
     calculate_coord_ranges, calculate_filtered_rows, determine_effective_coords,
-    match_ranges_to_data_var, CoordFilters, CoordSelection, CoordValuesRef,
+    match_ranges_to_data_var, resolve_coord_selection, CoordFilters, CoordSelection,
+    CoordValuesRef,
 };
 use super::schema_inference::discover_arrays;
 use super::stats::SharedIoStats;
@@ -548,6 +549,105 @@ fn apply_partition_selection(
         // defensive and fall back to no slicing.
         None => coord_ranges,
     }
+}
+
+/// Identify the OUTER coordinate (axis-0 of the first data var) by size-match.
+/// Returns its index into `store_meta.coords`, or `None` if no coord matches.
+fn identify_outer_coord(store_meta: &ZarrStoreMeta) -> Option<usize> {
+    let outer_axis_len = store_meta
+        .data_vars
+        .first()
+        .and_then(|dv| dv.shape.first())
+        .copied()?;
+    store_meta
+        .coords
+        .iter()
+        .position(|c| c.shape.first().copied() == Some(outer_axis_len))
+}
+
+/// Outcome of resolving the outer-axis filter on the head, used to decide how to
+/// partition the scan (see `split_selection`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum OuterSelection {
+    /// The outer filter resolved to this selection; partition by splitting it.
+    Resolved(CoordSelection),
+    /// A *present* outer filter matched no values — the scan yields nothing.
+    Empty,
+    /// No identifiable outer coordinate, or no filter on it. Fall back to
+    /// whole-axis geometry partitioning; NO coordinate is read in this case.
+    Unfiltered,
+}
+
+/// Read ONLY the outer coordinate from a LOCAL store and resolve its filter to a
+/// selection on the outer axis. Run on the head at plan time so partitions can be
+/// drawn around the *surviving* set instead of the full axis.
+///
+/// Reads nothing when there is no outer filter (returns `Unfiltered`), so
+/// unfiltered scans keep paying zero plan-time I/O.
+pub fn resolve_outer_selection(
+    store_path: &str,
+    store_meta: &ZarrStoreMeta,
+    coord_filters: Option<&CoordFilters>,
+) -> Result<OuterSelection> {
+    let Some(idx) = identify_outer_coord(store_meta) else {
+        return Ok(OuterSelection::Unfiltered);
+    };
+    let coord = &store_meta.coords[idx];
+    let Some(filter) = coord_filters.and_then(|f| f.get(&coord.name)) else {
+        return Ok(OuterSelection::Unfiltered);
+    };
+
+    // Read just this one coordinate's values (the whole axis).
+    let store = Arc::new(FilesystemStore::new(store_path).map_err(zarr_err)?);
+    let arr = Array::open(store, &format!("/{}", coord.name)).map_err(zarr_err)?;
+    let subset = ArraySubset::new_with_shape(arr.shape().to_vec());
+    let raw = read_coord_values!(sync, arr, &subset, coord.data_type.as_str());
+    let values = apply_cf_time_conversion(raw, coord.cf_time_attrs.as_ref(), &coord.name);
+
+    let refs = coord_values_to_refs(std::slice::from_ref(&values));
+    Ok(
+        match resolve_coord_selection(&coord.name, Some(filter), &refs[0]) {
+            Some(sel) => OuterSelection::Resolved(sel),
+            None => OuterSelection::Empty,
+        },
+    )
+}
+
+/// Async (remote-store) variant of [`resolve_outer_selection`]. Reads only the
+/// outer coordinate over the network when an outer filter is present.
+pub async fn resolve_outer_selection_async(
+    store: AsyncReadableListableStorage,
+    prefix: &ObjectPath,
+    store_meta: &ZarrStoreMeta,
+    coord_filters: Option<&CoordFilters>,
+) -> Result<OuterSelection> {
+    let Some(idx) = identify_outer_coord(store_meta) else {
+        return Ok(OuterSelection::Unfiltered);
+    };
+    let coord = &store_meta.coords[idx];
+    let Some(filter) = coord_filters.and_then(|f| f.get(&coord.name)) else {
+        return Ok(OuterSelection::Unfiltered);
+    };
+
+    let array_path = if prefix.as_ref().is_empty() {
+        format!("/{}", coord.name)
+    } else {
+        format!("/{}/{}", prefix, coord.name)
+    };
+    let arr = Array::async_open(store, &array_path)
+        .await
+        .map_err(zarr_err)?;
+    let subset = ArraySubset::new_with_shape(arr.shape().to_vec());
+    let raw = read_coord_values!(async, arr, &subset, coord.data_type.as_str());
+    let values = apply_cf_time_conversion(raw, coord.cf_time_attrs.as_ref(), &coord.name);
+
+    let refs = coord_values_to_refs(std::slice::from_ref(&values));
+    Ok(
+        match resolve_coord_selection(&coord.name, Some(filter), &refs[0]) {
+            Some(sel) => OuterSelection::Resolved(sel),
+            None => OuterSelection::Empty,
+        },
+    )
 }
 
 pub fn read_zarr(
@@ -1150,4 +1250,57 @@ pub async fn read_zarr_async(
         projected_schema,
         stream,
     )))
+}
+
+#[cfg(test)]
+mod resolve_outer_tests {
+    use super::*;
+    use crate::reader::filter::{CoordFilterKind, CoordFilters};
+    use datafusion::common::ScalarValue;
+
+    // Synthetic v3 store: time(7), lat(10), lon(10); temperature/humidity shape
+    // [7,10,10]. The outer axis (7) size-matches `time`, so it is the outer coord.
+    const STORE: &str = "data/synthetic_v3.zarr";
+
+    fn one_filter(coord: &str, value: i64) -> CoordFilters {
+        let mut f = CoordFilters::new();
+        f.filters.insert(
+            coord.to_string(),
+            CoordFilterKind::Eq(ScalarValue::Int64(Some(value))),
+        );
+        f
+    }
+
+    #[test]
+    fn unfiltered_when_filter_is_only_on_inner_coord() {
+        let meta = discover_arrays(STORE).unwrap();
+        // A filter on lat (inner) leaves the outer (time) unconstrained -> no read.
+        let filters = one_filter("lat", 3);
+        let out = resolve_outer_selection(STORE, &meta, Some(&filters)).unwrap();
+        assert_eq!(out, OuterSelection::Unfiltered);
+    }
+
+    #[test]
+    fn unfiltered_when_no_filters_at_all() {
+        let meta = discover_arrays(STORE).unwrap();
+        let out = resolve_outer_selection(STORE, &meta, None).unwrap();
+        assert_eq!(out, OuterSelection::Unfiltered);
+    }
+
+    #[test]
+    fn resolves_outer_time_equality_to_range() {
+        let meta = discover_arrays(STORE).unwrap();
+        // time values are 0..=6; time = 3 -> the single index range [3, 4).
+        let filters = one_filter("time", 3);
+        let out = resolve_outer_selection(STORE, &meta, Some(&filters)).unwrap();
+        assert_eq!(out, OuterSelection::Resolved(CoordSelection::Range(3, 4)));
+    }
+
+    #[test]
+    fn empty_when_outer_filter_matches_nothing() {
+        let meta = discover_arrays(STORE).unwrap();
+        let filters = one_filter("time", 999);
+        let out = resolve_outer_selection(STORE, &meta, Some(&filters)).unwrap();
+        assert_eq!(out, OuterSelection::Empty);
+    }
 }
