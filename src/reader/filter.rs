@@ -1377,12 +1377,10 @@ pub fn match_ranges_to_data_var(
         let mut found = false;
         for (coord_idx, &coord_size) in coord_sizes.iter().enumerate() {
             if coord_size == dim_size_usize {
-                if matched_ranges.len() == matched_ranges.iter().filter(|_| true).count() {
-                    let (start, end) = ranges[coord_idx];
-                    matched_ranges.push((start as u64)..(end as u64));
-                    found = true;
-                    break;
-                }
+                let (start, end) = ranges[coord_idx];
+                matched_ranges.push((start as u64)..(end as u64));
+                found = true;
+                break;
             }
         }
 
