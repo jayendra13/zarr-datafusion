@@ -1,5 +1,5 @@
 use crate::physical_plan::partition::PartitionSpec;
-use crate::reader::filter::CoordFilters;
+use crate::reader::filter::{CoordFilters, CoordSelection};
 use crate::reader::schema_inference::ZarrStoreMeta;
 use crate::reader::stats::{SharedIoStats, ZarrIoStats};
 use crate::reader::storage::is_remote_url;
@@ -241,25 +241,19 @@ impl ExecutionPlan for ZarrExec {
         partition: usize,
         _context: std::sync::Arc<datafusion::execution::TaskContext>,
     ) -> datafusion::error::Result<datafusion::execution::SendableRecordBatchStream> {
-        // Translate the requested partition index into an outer-dimension range.
-        // Empty `partitions` => legacy whole-store read (`None`).
-        //
-        // ▢ FILL 3: when `self.partitions` is non-empty, look up the slice for
-        // this `partition` and turn it into `Some(start..end)`. Hint:
-        //   let spec = &self.partitions[partition];
-        //   Some(spec.outer_start..spec.outer_end)
-        // Otherwise `None`. `std::ops::Range` is half-open, matching PartitionSpec.
-        let partition_range: Option<std::ops::Range<u64>> = if self.partitions.is_empty() {
+        // Look up this partition's outer-axis selection. Empty `partitions` =>
+        // legacy whole-store read (`None`). The selection is intersected with the
+        // filter-derived ranges inside the reader.
+        let partition_selection: Option<CoordSelection> = if self.partitions.is_empty() {
             None
         } else {
-            let spec = &self.partitions[partition];
-            Some(spec.outer_start..spec.outer_end)
+            Some(self.partitions[partition].outer.clone())
         };
 
         info!(
             path = %self.path,
             partition,
-            partition_range = ?partition_range,
+            partition_selection = ?partition_selection,
             limit = ?self.limit,
             projection = ?self.projection,
             has_cached_remote = self.cached_remote.is_some(),
@@ -301,7 +295,7 @@ impl ExecutionPlan for ZarrExec {
                 self.io_stats.clone(),
                 self.cached_remote.clone(),
                 self.coord_filters.clone(),
-                partition_range,
+                partition_selection,
             )
         } else {
             info!("Using local (sync) execution path");
@@ -312,7 +306,7 @@ impl ExecutionPlan for ZarrExec {
                 self.limit,
                 Some(self.io_stats.clone()),
                 self.coord_filters.clone(),
-                partition_range,
+                partition_selection,
             )
         }
     }
@@ -347,8 +341,8 @@ struct AsyncReadParams {
     limit: Option<usize>,
     stats: SharedIoStats,
     coord_filters: Option<CoordFilters>,
-    /// Outer-dim slice for this partition; `None` => whole store.
-    partition_range: Option<std::ops::Range<u64>>,
+    /// Outer-axis selection for this partition; `None` => whole store.
+    partition_selection: Option<CoordSelection>,
 }
 
 /// Execute an async read with the given store setup function.
@@ -395,7 +389,7 @@ where
             Some(params.stats),
             cached_meta,
             params.coord_filters,
-            params.partition_range,
+            params.partition_selection,
         )
         .await?;
 
@@ -424,7 +418,7 @@ fn execute_remote(
     stats: SharedIoStats,
     cached_remote: CachedRemoteStore,
     coord_filters: Option<CoordFilters>,
-    partition_range: Option<std::ops::Range<u64>>,
+    partition_selection: Option<CoordSelection>,
 ) -> datafusion::error::Result<datafusion::execution::SendableRecordBatchStream> {
     use crate::reader::storage::create_async_store;
 
@@ -436,7 +430,7 @@ fn execute_remote(
         limit,
         stats,
         coord_filters,
-        partition_range,
+        partition_selection,
     };
 
     execute_async_read(
@@ -481,7 +475,7 @@ fn execute_virtualizarr(
         stats,
         coord_filters,
         // VirtualiZarr stays single-partition for now (scan() doesn't partition it).
-        partition_range: None,
+        partition_selection: None,
     };
 
     execute_async_read(
@@ -514,7 +508,7 @@ fn execute_virtualizarr_with_adapter(
         limit,
         stats,
         coord_filters,
-        partition_range: None,
+        partition_selection: None,
     };
 
     execute_async_read(
