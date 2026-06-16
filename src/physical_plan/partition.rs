@@ -1,3 +1,5 @@
+use crate::reader::filter::CoordSelection;
+
 // Serialize/Deserialize so the distributed codec can ship per-task partition
 // subsets to workers. PartitionSpec is plain u64s, so serde handles it directly
 // (no byte-DTO mirror needed, unlike ScalarValue-bearing types).
@@ -43,6 +45,87 @@ pub fn plan_partitions(
     }
 
     specs
+}
+
+/// Split a *resolved* coordinate selection (the surviving index set on the outer
+/// axis, after the filter has been applied) into up to `target` contiguous,
+/// chunk-aware pieces — one per output partition.
+///
+/// This is the surviving-set analogue of [`plan_partitions`]: instead of slicing
+/// the full axis `[0, outer_len)` blind to the filter, it slices only what
+/// survived, so a narrow filter (e.g. a single day out of 124 years) still fans
+/// out across the cluster instead of collapsing onto one worker.
+///
+/// Invariants: the pieces are disjoint, their union equals `sel`, at least one
+/// piece is returned, and — for the `Range` case — no underlying chunk is split
+/// across two pieces (internal boundaries are chunk-aligned, so no chunk is read
+/// twice). An empty selection yields a single empty piece.
+///
+/// NOTE: parallelism is capped by the number of surviving *chunks*, not `target`
+/// — you can't split below a chunk without double-reading it. A surviving range
+/// that lands in a single chunk yields a single piece regardless of `target`.
+pub fn split_selection(
+    sel: &CoordSelection,
+    chunk_len: u64,
+    target: usize,
+) -> Vec<CoordSelection> {
+    match sel {
+        CoordSelection::Range(s, e) => split_range(*s, *e, chunk_len, target)
+            .into_iter()
+            .map(|(s, e)| CoordSelection::Range(s, e))
+            .collect(),
+        // Scattered positions (date-part filters): balanced contiguous groups by
+        // count. chunk_len is ignored here — scattered indices that share a chunk
+        // could land in different pieces (a double read), which is wasteful but
+        // not incorrect. For the common hourly case (chunk_len == 1) it's moot.
+        CoordSelection::Indices(v) => split_indices(v, target)
+            .into_iter()
+            .map(CoordSelection::Indices)
+            .collect(),
+    }
+}
+
+/// Slice the surviving contiguous range `[s, e)` into chunk-aligned pieces.
+///
+/// Pieces break only on chunk boundaries (multiples of `chunk_len`) so a chunk is
+/// never read by two workers; the first/last pieces are clipped to `[s, e)`.
+fn split_range(s: usize, e: usize, chunk_len: u64, target: usize) -> Vec<(usize, usize)> {
+    if e <= s {
+        return vec![(s, s)];
+    }
+    // Unknown chunking => can't slice safely, so emit the whole range as one piece.
+    if chunk_len == 0 {
+        return vec![(s, e)];
+    }
+    let chunk_len = chunk_len as usize;
+
+    let first_chunk = s / chunk_len;
+    let last_chunk = (e - 1) / chunk_len;
+    let n_chunks = last_chunk - first_chunk + 1;
+
+    let p = target.min(n_chunks).max(1);
+    let chunk_per_part = n_chunks.div_ceil(p);
+
+    let mut out = Vec::with_capacity(p);
+    let mut c = first_chunk;
+    while c <= last_chunk {
+        let c_end = (c + chunk_per_part).min(last_chunk + 1);
+        let start = (c * chunk_len).max(s);
+        let end = (c_end * chunk_len).min(e);
+        out.push((start, end));
+        c = c_end;
+    }
+    out
+}
+
+/// Split a sorted index list into up to `target` balanced contiguous groups.
+fn split_indices(v: &[usize], target: usize) -> Vec<Vec<usize>> {
+    if v.is_empty() {
+        return vec![Vec::new()];
+    }
+    let p = target.min(v.len()).max(1);
+    let per = v.len().div_ceil(p);
+    v.chunks(per).map(|c| c.to_vec()).collect()
 }
 
 /// An empty slice `[0, 0)` — reads nothing. Used to pad task groups so every
@@ -291,5 +374,133 @@ mod tests {
         let specs = plan_partitions(10, 1, 0);
         assert_eq!(specs.len(), 1);
         assert_covers(&specs, 10);
+    }
+
+    // ── split_selection ────────────────────────────────────────────────────
+
+    fn range(s: usize, e: usize) -> CoordSelection {
+        CoordSelection::Range(s, e)
+    }
+    fn indices(v: &[usize]) -> CoordSelection {
+        CoordSelection::Indices(v.to_vec())
+    }
+
+    /// The split of a `Range(s, e)` must be disjoint, cover exactly `[s, e)`, and
+    /// break only on chunk boundaries (no chunk read by two pieces).
+    fn assert_range_split(pieces: &[CoordSelection], s: usize, e: usize, chunk_len: usize) {
+        assert!(!pieces.is_empty(), "must emit at least one piece");
+        let rs: Vec<(usize, usize)> = pieces.iter().map(|p| p.as_range().unwrap()).collect();
+        assert_eq!(rs.first().unwrap().0, s, "must start at s");
+        assert_eq!(rs.last().unwrap().1, e, "must reach e");
+        for w in rs.windows(2) {
+            assert_eq!(w[0].1, w[1].0, "gap or overlap between pieces");
+            assert_eq!(w[0].1 % chunk_len, 0, "internal boundary must be chunk-aligned");
+        }
+    }
+
+    #[test]
+    fn split_range_hourly_even() {
+        // 24 hourly chunks across 3 workers -> 8 each. The single-day fix.
+        let pieces = split_selection(&range(0, 24), 1, 3);
+        assert_eq!(pieces, vec![range(0, 8), range(8, 16), range(16, 24)]);
+        assert_range_split(&pieces, 0, 24, 1);
+    }
+
+    #[test]
+    fn split_range_offset_window() {
+        // A day deep into the axis (e.g. 2023 in an hours-since-1900 store).
+        let pieces = split_selection(&range(1_086_000, 1_086_024), 1, 3);
+        assert_eq!(pieces.len(), 3);
+        assert_range_split(&pieces, 1_086_000, 1_086_024, 1);
+    }
+
+    #[test]
+    fn split_range_clipped_to_chunk_boundaries() {
+        // [13, 47) over chunk_len 10 touches chunks 1..=4. Pieces clip at the
+        // ends (13, 47) but break only at 20/30/40.
+        let pieces = split_selection(&range(13, 47), 10, 4);
+        assert_eq!(
+            pieces,
+            vec![range(13, 20), range(20, 30), range(30, 40), range(40, 47)]
+        );
+        assert_range_split(&pieces, 13, 47, 10);
+    }
+
+    #[test]
+    fn split_range_single_chunk_cannot_split() {
+        // 24 indices but chunk_len 100 => one chunk => one piece, regardless of
+        // target. Documents the chunk-granularity parallelism ceiling.
+        let pieces = split_selection(&range(0, 24), 100, 3);
+        assert_eq!(pieces, vec![range(0, 24)]);
+    }
+
+    #[test]
+    fn split_range_fewer_chunks_than_target() {
+        // 3 surviving chunks, 8 workers => never more than 3 pieces.
+        let pieces = split_selection(&range(0, 3), 1, 8);
+        assert_eq!(pieces, vec![range(0, 1), range(1, 2), range(2, 3)]);
+    }
+
+    #[test]
+    fn split_range_empty_yields_one_empty() {
+        let pieces = split_selection(&range(5, 5), 1, 3);
+        assert_eq!(pieces, vec![range(5, 5)]);
+    }
+
+    #[test]
+    fn split_range_unknown_chunk_is_one_piece() {
+        // chunk_len 0 ("unknown") => whole surviving range treated as one chunk.
+        let pieces = split_selection(&range(10, 40), 0, 4);
+        assert_eq!(pieces, vec![range(10, 40)]);
+    }
+
+    #[test]
+    fn split_range_target_zero_yields_one_piece() {
+        let pieces = split_selection(&range(0, 10), 1, 0);
+        assert_eq!(pieces, vec![range(0, 10)]);
+    }
+
+    #[test]
+    fn split_indices_even() {
+        let pieces = split_selection(&indices(&[0, 5, 10, 15, 20, 25]), 1, 3);
+        assert_eq!(
+            pieces,
+            vec![indices(&[0, 5]), indices(&[10, 15]), indices(&[20, 25])]
+        );
+    }
+
+    #[test]
+    fn split_indices_remainder() {
+        // 5 indices across 3 -> ceil(5/3)=2 per group -> [2,2,1].
+        let pieces = split_selection(&indices(&[1, 2, 3, 4, 5]), 1, 3);
+        assert_eq!(pieces, vec![indices(&[1, 2]), indices(&[3, 4]), indices(&[5])]);
+    }
+
+    #[test]
+    fn split_indices_fewer_than_target() {
+        let pieces = split_selection(&indices(&[7]), 1, 4);
+        assert_eq!(pieces, vec![indices(&[7])]);
+    }
+
+    #[test]
+    fn split_indices_empty_yields_one_empty() {
+        let pieces = split_selection(&indices(&[]), 1, 3);
+        assert_eq!(pieces, vec![indices(&[])]);
+    }
+
+    /// The union of all pieces must reconstruct the input exactly — the
+    /// disjoint+complete contract the distributed scan relies on.
+    #[test]
+    fn split_indices_union_equals_input() {
+        let input = [2usize, 9, 14, 27, 30, 41, 55];
+        let pieces = split_selection(&indices(&input), 1, 3);
+        let rebuilt: Vec<usize> = pieces
+            .iter()
+            .flat_map(|p| match p {
+                CoordSelection::Indices(v) => v.clone(),
+                _ => panic!("expected Indices"),
+            })
+            .collect();
+        assert_eq!(rebuilt, input);
     }
 }
