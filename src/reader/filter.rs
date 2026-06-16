@@ -605,56 +605,71 @@ pub fn calculate_coord_ranges(
     let mut selections = Vec::with_capacity(coord_names.len());
 
     for (i, name) in coord_names.iter().enumerate() {
-        let values = &coord_values[i];
-        let selection = if let Some(filter) = filters.get(name) {
-            match filter {
-                CoordFilterKind::DatePart { field, value } => {
-                    let indices = find_date_part_indices(values, field, *value);
-                    if indices.is_empty() {
-                        warn!(
-                            coord = %name,
-                            field = %field,
-                            value = %value,
-                            "DatePart filter matched no coordinate values"
-                        );
-                        return None;
-                    }
-                    debug!(
-                        coord = %name,
-                        field = %field,
-                        value = %value,
-                        count = indices.len(),
-                        "DatePart filter matched indices"
-                    );
-                    CoordSelection::Indices(indices)
-                }
-                _ => {
-                    if let Some((start, end)) = find_filter_range(values, filter) {
-                        debug!(
-                            coord = %name,
-                            filter = %filter,
-                            start,
-                            end,
-                            "Found filter range"
-                        );
-                        CoordSelection::Range(start, end)
-                    } else {
-                        warn!(
-                            coord = %name,
-                            filter = %filter,
-                            "Filter did not match any values - query will return no results"
-                        );
-                        return None;
-                    }
-                }
-            }
-        } else {
-            CoordSelection::Range(0, values.len())
-        };
+        let selection = resolve_coord_selection(name, filters.get(name), &coord_values[i])?;
         selections.push(selection);
     }
 
     Some(selections)
+}
+
+/// Resolve a single coordinate's filter into a [`CoordSelection`] over its values.
+///
+/// - `None` filter => the full range `[0, len)` (coordinate is unconstrained).
+/// - `DatePart`    => the scattered `Indices` of matching values.
+/// - other filters => the contiguous `Range` of matching values.
+///
+/// Returns `None` when a *present* filter matches no values — i.e. the query
+/// yields an empty result for this coordinate. (A `None` filter never yields
+/// `None`; it is always satisfiable as the full range.)
+pub fn resolve_coord_selection(
+    name: &str,
+    filter: Option<&CoordFilterKind>,
+    values: &CoordValuesRef<'_>,
+) -> Option<CoordSelection> {
+    let Some(filter) = filter else {
+        return Some(CoordSelection::Range(0, values.len()));
+    };
+    match filter {
+        CoordFilterKind::DatePart { field, value } => {
+            let indices = find_date_part_indices(values, field, *value);
+            if indices.is_empty() {
+                warn!(
+                    coord = %name,
+                    field = %field,
+                    value = %value,
+                    "DatePart filter matched no coordinate values"
+                );
+                return None;
+            }
+            debug!(
+                coord = %name,
+                field = %field,
+                value = %value,
+                count = indices.len(),
+                "DatePart filter matched indices"
+            );
+            Some(CoordSelection::Indices(indices))
+        }
+        _ => {
+            if let Some((start, end)) = find_filter_range(values, filter) {
+                debug!(
+                    coord = %name,
+                    filter = %filter,
+                    start,
+                    end,
+                    "Found filter range"
+                );
+                Some(CoordSelection::Range(start, end))
+            } else {
+                warn!(
+                    coord = %name,
+                    filter = %filter,
+                    "Filter did not match any values - query will return no results"
+                );
+                None
+            }
+        }
+    }
 }
 
 /// Reference to coordinate values for searching
@@ -1603,6 +1618,35 @@ pub fn determine_effective_coords(
 mod tests {
     use super::*;
     use datafusion::prelude::*;
+
+    #[test]
+    fn resolve_coord_selection_no_filter_is_full_range() {
+        let vals = vec![0i64, 1, 2, 3];
+        let r = CoordValuesRef::Int64(&vals);
+        assert_eq!(
+            resolve_coord_selection("time", None, &r),
+            Some(CoordSelection::Range(0, 4))
+        );
+    }
+
+    #[test]
+    fn resolve_coord_selection_eq_matches_single_index() {
+        let vals = vec![10i64, 20, 30, 40];
+        let r = CoordValuesRef::Int64(&vals);
+        let f = CoordFilterKind::Eq(ScalarValue::Int64(Some(30)));
+        assert_eq!(
+            resolve_coord_selection("c", Some(&f), &r),
+            Some(CoordSelection::Range(2, 3))
+        );
+    }
+
+    #[test]
+    fn resolve_coord_selection_no_match_is_none() {
+        let vals = vec![10i64, 20, 30];
+        let r = CoordValuesRef::Int64(&vals);
+        let f = CoordFilterKind::Eq(ScalarValue::Int64(Some(999)));
+        assert_eq!(resolve_coord_selection("c", Some(&f), &r), None);
+    }
 
     #[test]
     fn test_parse_simple_equality() {
