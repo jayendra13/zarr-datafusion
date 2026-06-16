@@ -86,7 +86,7 @@ impl std::fmt::Display for CoordFilterKind {
 ///
 /// `Range` covers a contiguous slice (equality / BETWEEN / comparison filters).
 /// `Indices` covers a scattered set of positions (EXTRACT date-part filters).
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum CoordSelection {
     /// Contiguous slice `[start, end)` — existing fast path
     Range(usize, usize),

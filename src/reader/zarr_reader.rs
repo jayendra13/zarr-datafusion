@@ -473,7 +473,7 @@ fn apply_limit_to_arrays(
 fn restrict_to_partition(
     coord_ranges: Option<Vec<CoordSelection>>,
     outer_coord_idx: usize,
-    partition_range: std::ops::Range<u64>,
+    partition_sel: &CoordSelection,
     coord_sizes: &[usize],
 ) -> Option<Vec<CoordSelection>> {
     // FILL 5b: existing selections, or one full-range selection per coordinate.
@@ -484,31 +484,39 @@ fn restrict_to_partition(
             .collect()
     });
 
-    let p_start = partition_range.start as usize;
-    let p_end = partition_range.end as usize;
-
-    // FILL 5c: intersect the outer coordinate's selection with [p_start, p_end).
-    let restricted = match &sels[outer_coord_idx] {
-        // Contiguous slice: clamp both ends into the partition window. When the
-        // filter's selection and this partition's window don't overlap, `start`
-        // would exceed `end`; clamp to an EMPTY range `[start, start)` so this
-        // partition simply yields no rows (other partitions cover those rows).
-        CoordSelection::Range(s, e) => {
-            let start = (*s).max(p_start);
-            let end = (*e).min(p_end).max(start);
-            CoordSelection::Range(start, end)
-        }
-        // Scattered positions: keep only those that fall in the window.
-        CoordSelection::Indices(v) => CoordSelection::Indices(
-            v.iter()
-                .copied()
-                .filter(|&i| i >= p_start && i < p_end)
-                .collect(),
-        ),
-    };
-    sels[outer_coord_idx] = restricted;
+    // Narrow the outer coordinate's selection to this partition's selection.
+    sels[outer_coord_idx] = intersect_selections(&sels[outer_coord_idx], partition_sel);
 
     Some(sels)
+}
+
+/// Intersect a filter-derived selection with a partition's selection on the same
+/// axis. The partition can only *narrow* the filter result; when the two don't
+/// overlap the outer coordinate becomes empty (this partition yields no rows and
+/// the others cover them). Generalizes over both `Range` and scattered `Indices`.
+fn intersect_selections(filter_sel: &CoordSelection, part_sel: &CoordSelection) -> CoordSelection {
+    match part_sel {
+        CoordSelection::Range(ps, pe) => match filter_sel {
+            CoordSelection::Range(s, e) => {
+                let start = (*s).max(*ps);
+                let end = (*e).min(*pe).max(start);
+                CoordSelection::Range(start, end)
+            }
+            CoordSelection::Indices(v) => CoordSelection::Indices(
+                v.iter().copied().filter(|&i| i >= *ps && i < *pe).collect(),
+            ),
+        },
+        CoordSelection::Indices(pv) => {
+            let pset: std::collections::HashSet<usize> = pv.iter().copied().collect();
+            let kept: Vec<usize> = match filter_sel {
+                CoordSelection::Range(s, e) => (*s..*e).filter(|i| pset.contains(i)).collect(),
+                CoordSelection::Indices(v) => {
+                    v.iter().copied().filter(|i| pset.contains(i)).collect()
+                }
+            };
+            CoordSelection::Indices(kept)
+        }
+    }
 }
 
 /// Narrow `coord_ranges` to a partition's outer-dimension slice, if any.
@@ -517,13 +525,13 @@ fn restrict_to_partition(
 /// match the axes, so the outer coordinate is the first whose size == data var
 /// `shape[0]`) and intersects the slice in via [`restrict_to_partition`]. Shared
 /// by the sync ([`read_zarr`]) and async ([`read_zarr_async`]) readers.
-fn apply_partition_range(
+fn apply_partition_selection(
     coord_ranges: Option<Vec<CoordSelection>>,
-    partition_range: Option<std::ops::Range<u64>>,
+    partition_selection: Option<CoordSelection>,
     store_meta: &super::schema_inference::ZarrStoreMeta,
     coord_sizes: &[usize],
 ) -> Option<Vec<CoordSelection>> {
-    let Some(range) = partition_range else {
+    let Some(sel) = partition_selection else {
         return coord_ranges;
     };
     let outer_axis_len = store_meta
@@ -534,7 +542,7 @@ fn apply_partition_range(
     let outer_coord_idx =
         outer_axis_len.and_then(|len| coord_sizes.iter().position(|&s| s as u64 == len));
     match outer_coord_idx {
-        Some(idx) => restrict_to_partition(coord_ranges, idx, range, coord_sizes),
+        Some(idx) => restrict_to_partition(coord_ranges, idx, &sel, coord_sizes),
         // Can't identify the outer coordinate => can't safely slice. scan() only
         // partitions when the dim is known, so this shouldn't happen; stay
         // defensive and fall back to no slicing.
@@ -549,10 +557,10 @@ pub fn read_zarr(
     limit: Option<usize>,
     stats: Option<SharedIoStats>,
     coord_filters: Option<CoordFilters>,
-    // Outer-dimension index slice for this partition (half-open `[start, end)`).
-    // `None` => read the whole (filtered) store, the legacy single-partition path.
-    // (Plain `//` not `///`: doc comments aren't allowed on fn parameters.)
-    partition_range: Option<std::ops::Range<u64>>,
+    // Outer-axis selection for this partition (intersected with the filter
+    // selection). `None` => read the whole (filtered) store, the legacy
+    // single-partition path. (Plain `//`: doc comments aren't allowed on params.)
+    partition_selection: Option<CoordSelection>,
 ) -> Result<SendableRecordBatchStream> {
     let fs_store = Arc::new(FilesystemStore::new(store_path).map_err(zarr_err)?);
 
@@ -635,7 +643,7 @@ pub fn read_zarr(
 
     // Narrow the read to this partition's outer-dimension slice, if any.
     let coord_ranges =
-        apply_partition_range(coord_ranges, partition_range, &store_meta, &coord_sizes);
+        apply_partition_selection(coord_ranges, partition_selection, &store_meta, &coord_sizes);
 
     // Calculate effective sizes based on filters
     let (effective_coord_sizes, effective_rows) =
@@ -814,8 +822,8 @@ pub async fn read_zarr_async(
     stats: Option<SharedIoStats>,
     cached_meta: Option<ZarrStoreMeta>,
     coord_filters: Option<CoordFilters>,
-    // Outer-dimension index slice for this partition; `None` => whole store.
-    partition_range: Option<std::ops::Range<u64>>,
+    // Outer-axis selection for this partition; `None` => whole store.
+    partition_selection: Option<CoordSelection>,
 ) -> Result<SendableRecordBatchStream> {
     info!("Starting async Zarr read");
 
@@ -919,7 +927,7 @@ pub async fn read_zarr_async(
 
     // Narrow the read to this partition's outer-dimension slice, if any.
     let coord_ranges =
-        apply_partition_range(coord_ranges, partition_range, &store_meta, &coord_sizes);
+        apply_partition_selection(coord_ranges, partition_selection, &store_meta, &coord_sizes);
 
     // Calculate effective sizes based on filters
     let (effective_coord_sizes, rows_after_filter) =

@@ -1,12 +1,33 @@
 use crate::reader::filter::CoordSelection;
 
 // Serialize/Deserialize so the distributed codec can ship per-task partition
-// subsets to workers. PartitionSpec is plain u64s, so serde handles it directly
-// (no byte-DTO mirror needed, unlike ScalarValue-bearing types).
+// subsets to workers. `CoordSelection` is plain ints, so serde handles it
+// directly (no byte-DTO mirror needed, unlike ScalarValue-bearing types).
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct PartitionSpec {
-    pub outer_start: u64,
-    pub outer_end: u64,
+    /// The selection this partition reads on the OUTER (axis-0) coordinate.
+    /// Today the planner only emits chunk-aligned `Range`s; `Indices` becomes
+    /// reachable once a resolved date-part selection is split across partitions.
+    pub outer: CoordSelection,
+}
+
+impl PartitionSpec {
+    /// A contiguous half-open `[start, end)` slice on the outer axis.
+    pub fn range(start: u64, end: u64) -> Self {
+        Self {
+            outer: CoordSelection::Range(start as usize, end as usize),
+        }
+    }
+
+    /// True when this partition reads nothing (used for uniform-length padding).
+    pub fn is_empty(&self) -> bool {
+        self.outer.is_empty()
+    }
+
+    /// `(start, end)` if the outer selection is a contiguous range.
+    pub fn as_range(&self) -> Option<(usize, usize)> {
+        self.outer.as_range()
+    }
 }
 
 pub fn plan_partitions(
@@ -15,10 +36,7 @@ pub fn plan_partitions(
     target_partitions: usize,
 ) -> Vec<PartitionSpec> {
     if outer_len == 0 {
-        return vec![PartitionSpec {
-            outer_start: 0,
-            outer_end: 0,
-        }];
+        return vec![PartitionSpec::range(0, 0)];
     }
 
     let chunk_len = if chunk_len == 0 { outer_len } else { chunk_len };
@@ -37,10 +55,7 @@ pub fn plan_partitions(
         let outer_start = chunk_start * chunk_len;
         let outer_end = (chunk_end * chunk_len).min(outer_len);
 
-        specs.push(PartitionSpec {
-            outer_start,
-            outer_end,
-        });
+        specs.push(PartitionSpec::range(outer_start, outer_end));
         chunk_start = chunk_end;
     }
 
@@ -64,11 +79,7 @@ pub fn plan_partitions(
 /// NOTE: parallelism is capped by the number of surviving *chunks*, not `target`
 /// — you can't split below a chunk without double-reading it. A surviving range
 /// that lands in a single chunk yields a single piece regardless of `target`.
-pub fn split_selection(
-    sel: &CoordSelection,
-    chunk_len: u64,
-    target: usize,
-) -> Vec<CoordSelection> {
+pub fn split_selection(sel: &CoordSelection, chunk_len: u64, target: usize) -> Vec<CoordSelection> {
     match sel {
         CoordSelection::Range(s, e) => split_range(*s, *e, chunk_len, target)
             .into_iter()
@@ -131,10 +142,7 @@ fn split_indices(v: &[usize], target: usize) -> Vec<Vec<usize>> {
 /// An empty slice `[0, 0)` — reads nothing. Used to pad task groups so every
 /// group has the same length.
 fn empty_spec() -> PartitionSpec {
-    PartitionSpec {
-        outer_start: 0,
-        outer_end: 0,
-    }
+    PartitionSpec::range(0, 0)
 }
 
 /// Distribute `specs` across `task_count` distributed worker tasks.
@@ -184,15 +192,17 @@ mod tests {
     /// This *is* the correctness contract the whole feature rests on.
     fn assert_covers(specs: &[PartitionSpec], outer_len: u64) {
         assert!(!specs.is_empty(), "must emit at least one partition");
-        assert_eq!(specs[0].outer_start, 0, "must start at 0");
+        let r = |s: &PartitionSpec| s.as_range().expect("planner emits ranges");
+        assert_eq!(r(&specs[0]).0, 0, "must start at 0");
         assert_eq!(
-            specs.last().unwrap().outer_end,
-            outer_len,
+            r(specs.last().unwrap()).1,
+            outer_len as usize,
             "must reach the end"
         );
         for w in specs.windows(2) {
             assert_eq!(
-                w[0].outer_end, w[1].outer_start,
+                r(&w[0]).1,
+                r(&w[1]).0,
                 "gap or overlap between adjacent partitions"
             );
         }
@@ -220,7 +230,7 @@ mod tests {
         let real: Vec<PartitionSpec> = groups
             .iter()
             .flatten()
-            .filter(|s| s.outer_end > s.outer_start)
+            .filter(|s| !s.is_empty())
             .cloned()
             .collect();
         assert_eq!(real, input, "real specs must equal the input, in order");
@@ -274,13 +284,7 @@ mod tests {
         // 8 chunks of size 1, want 4 partitions -> 2 chunks each.
         let specs = plan_partitions(8, 1, 4);
         assert_eq!(specs.len(), 4);
-        assert_eq!(
-            specs[0],
-            PartitionSpec {
-                outer_start: 0,
-                outer_end: 2
-            }
-        );
+        assert_eq!(specs[0], PartitionSpec::range(0, 2));
         assert_covers(&specs, 8);
     }
 
@@ -292,7 +296,10 @@ mod tests {
         assert_eq!(
             specs
                 .iter()
-                .map(|s| s.outer_end - s.outer_start)
+                .map(|s| {
+                    let (a, b) = s.as_range().unwrap();
+                    b - a
+                })
                 .collect::<Vec<_>>(),
             vec![2, 2, 2, 1]
         );
@@ -314,16 +321,7 @@ mod tests {
         assert_eq!(specs.len(), 2);
         assert_eq!(
             specs,
-            vec![
-                PartitionSpec {
-                    outer_start: 0,
-                    outer_end: 5
-                },
-                PartitionSpec {
-                    outer_start: 5,
-                    outer_end: 10
-                },
-            ]
+            vec![PartitionSpec::range(0, 5), PartitionSpec::range(5, 10)]
         );
         assert_covers(&specs, 10);
     }
@@ -332,20 +330,14 @@ mod tests {
     fn partial_last_chunk_is_clamped() {
         // 7 elems, chunk 2 -> 4 chunks, last is half-full. End must clamp to 7, not 8.
         let specs = plan_partitions(7, 2, 4);
-        assert_eq!(specs.last().unwrap().outer_end, 7);
+        assert_eq!(specs.last().unwrap().as_range().unwrap().1, 7);
         assert_covers(&specs, 7);
     }
 
     #[test]
     fn single_partition_when_target_is_one() {
         let specs = plan_partitions(100, 10, 1);
-        assert_eq!(
-            specs,
-            vec![PartitionSpec {
-                outer_start: 0,
-                outer_end: 100
-            }]
-        );
+        assert_eq!(specs, vec![PartitionSpec::range(0, 100)]);
     }
 
     #[test]
@@ -359,13 +351,7 @@ mod tests {
     #[test]
     fn empty_array_yields_one_empty_partition() {
         let specs = plan_partitions(0, 1, 4);
-        assert_eq!(
-            specs,
-            vec![PartitionSpec {
-                outer_start: 0,
-                outer_end: 0
-            }]
-        );
+        assert_eq!(specs, vec![PartitionSpec::range(0, 0)]);
     }
 
     #[test]
@@ -394,7 +380,11 @@ mod tests {
         assert_eq!(rs.last().unwrap().1, e, "must reach e");
         for w in rs.windows(2) {
             assert_eq!(w[0].1, w[1].0, "gap or overlap between pieces");
-            assert_eq!(w[0].1 % chunk_len, 0, "internal boundary must be chunk-aligned");
+            assert_eq!(
+                w[0].1 % chunk_len,
+                0,
+                "internal boundary must be chunk-aligned"
+            );
         }
     }
 
@@ -473,7 +463,10 @@ mod tests {
     fn split_indices_remainder() {
         // 5 indices across 3 -> ceil(5/3)=2 per group -> [2,2,1].
         let pieces = split_selection(&indices(&[1, 2, 3, 4, 5]), 1, 3);
-        assert_eq!(pieces, vec![indices(&[1, 2]), indices(&[3, 4]), indices(&[5])]);
+        assert_eq!(
+            pieces,
+            vec![indices(&[1, 2]), indices(&[3, 4]), indices(&[5])]
+        );
     }
 
     #[test]

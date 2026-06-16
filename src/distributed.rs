@@ -156,12 +156,7 @@ mod tests {
             Field::new("lat", DataType::Int64, false),
             Field::new("temperature", DataType::Int64, true),
         ]));
-        let specs: Vec<PartitionSpec> = (0..n)
-            .map(|i| PartitionSpec {
-                outer_start: i,
-                outer_end: i + 1,
-            })
-            .collect();
+        let specs: Vec<PartitionSpec> = (0..n).map(|i| PartitionSpec::range(i, i + 1)).collect();
         Arc::new(
             ZarrExec::new(
                 schema,
@@ -235,17 +230,12 @@ mod tests {
                     .expect("variant is a ZarrExec")
                     .partitions()
                     .iter()
-                    .filter(|s| s.outer_end > s.outer_start)
+                    .filter(|s| !s.is_empty())
                     .cloned()
                     .collect::<Vec<_>>()
             })
             .collect();
-        let expected: Vec<PartitionSpec> = (0..7)
-            .map(|i| PartitionSpec {
-                outer_start: i,
-                outer_end: i + 1,
-            })
-            .collect();
+        let expected: Vec<PartitionSpec> = (0..7).map(|i| PartitionSpec::range(i, i + 1)).collect();
         assert_eq!(real, expected);
     }
 

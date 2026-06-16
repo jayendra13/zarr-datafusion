@@ -421,16 +421,7 @@ mod tests {
         use crate::physical_plan::partition::PartitionSpec;
 
         let schema = sample_schema();
-        let specs = vec![
-            PartitionSpec {
-                outer_start: 0,
-                outer_end: 3,
-            },
-            PartitionSpec {
-                outer_start: 3,
-                outer_end: 7,
-            },
-        ];
+        let specs = vec![PartitionSpec::range(0, 3), PartitionSpec::range(3, 7)];
         let exec = ZarrExec::new(
             schema.clone(),
             "/tmp/local.zarr".to_string(),
