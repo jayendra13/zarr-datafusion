@@ -1,0 +1,76 @@
+# Standalone Iris cluster config for running datafusion-distributed on GCP CPU VMs.
+#
+# This is deliberately Marin-free: the only Marin-specific call in Iris's launch
+# path is `marin_temp_bucket()`, used *only* by `cluster start-smoke`. We use the
+# real `cluster start` command, which reads `storage.remote_state_dir` straight
+# from this file, so that call never runs. The `marin-*` deps (rigging/finelog)
+# are generic utility libs pulled from PyPI — nothing to strip out.
+#
+# Launch:
+#   iris --config=deploy/iris/my-cluster.yaml cluster start
+#   iris --config=deploy/iris/my-cluster.yaml cluster status
+#   iris --config=deploy/iris/my-cluster.yaml cluster stop
+#
+# Replace every value tagged  # <-- EDIT
+# (project id, service accounts, zone, bucket, registry/image).
+
+platform:
+  label_prefix: zarr-dist
+  gcp:
+    project_id: YOUR_PROJECT                                   # <-- EDIT
+
+defaults:
+  ssh:
+    # SA the controller impersonates to SSH/bootstrap worker VMs.
+    impersonate_service_account: iris-controller@YOUR_PROJECT.iam.gserviceaccount.com  # <-- EDIT
+  autoscaler:
+    evaluation_interval:   { milliseconds: 10000 }
+    scale_up_delay:        { milliseconds: 30000 }
+    scale_down_delay:      { milliseconds: 300000 }   # reap idle workers after 5 min
+  worker:
+    # Public Iris worker/agent image — runs the task container, not your code.
+    docker_image: ghcr.io/marin-community/iris-worker:latest
+    # Default image for tasks if a job doesn't override --task-image. We set the
+    # zarr image here so worker/head jobs need no per-submit image flag.
+    default_task_image: YOUR_REGISTRY/zarr-dist:latest         # <-- EDIT
+    port: 10001
+
+storage:
+  # Iris cluster state (job/endpoint registry, checkpoints). Any GCS bucket the
+  # controller + worker SAs can read/write. Replaces marin_temp_bucket().
+  remote_state_dir: gs://YOUR_BUCKET/iris/state                # <-- EDIT
+
+worker_provider: {}
+
+controller:
+  image: ghcr.io/marin-community/iris-controller:latest
+  gcp:
+    service_account: iris-controller@YOUR_PROJECT.iam.gserviceaccount.com  # <-- EDIT
+    zone: us-central1-a                                        # <-- EDIT (keep near your data bucket)
+    machine_type: e2-standard-4
+    port: 10000
+
+# No tpu_pools — this is a CPU-only deployment.
+
+scale_groups:
+  # One CPU VM per worker replica. num_vms/max_slices bound the pool; the
+  # autoscaler grows it on demand and reaps idle VMs after scale_down_delay.
+  # Each VM hosts exactly one zarr-distributed worker (one task -> fixed port 8080,
+  # no port collisions).
+  zarr_cpu_workers:
+    zones: [us-central1-a]                                     # <-- EDIT (co-locate with bucket region)
+    num_vms: 0                                                 # start at 0; autoscaler scales up
+    resources:
+      cpu: 8
+      ram: 32GB
+      disk: 200GB           # local scratch; SST is read from gs:// directly
+      device_type: cpu
+      capacity_type: on-demand   # use 'preemptible' to cut cost for batch runs
+    buffer_slices: 0
+    max_slices: 16          # <-- max worker replicas (fan-out width)
+    priority: 1000
+    slice_template:
+      gcp:
+        service_account: iris-worker@YOUR_PROJECT.iam.gserviceaccount.com  # <-- EDIT (needs access to the state bucket; ERA5 data store is public)
+        mode: GCP_SLICE_MODE_VM
+        machine_type: e2-standard-8

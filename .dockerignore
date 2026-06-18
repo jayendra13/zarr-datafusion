@@ -1,0 +1,15 @@
+# Keep the Docker build context small: the image only needs Cargo.toml/Cargo.lock,
+# src/, and deploy/iris/*.py. Everything below is large or irrelevant to the build.
+.git
+target
+data
+*.zarr
+*.parq
+*.csv
+*.log
+*.pid
+examples
+tests
+docs
+scripts
+.claude
