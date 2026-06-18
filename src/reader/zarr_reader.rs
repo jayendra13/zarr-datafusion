@@ -542,6 +542,83 @@ fn identify_outer_coord(store_meta: &ZarrStoreMeta) -> Option<usize> {
         .position(|c| c.shape.first().copied() == Some(outer_axis_len))
 }
 
+/// Plan a worker-side read of *only* this partition's slice of the outer coord.
+///
+/// The head ships the surviving outer-axis selection, so a worker never needs the
+/// full (~10 MB) outer coordinate: it reads one contiguous window and gathers its
+/// slice from that. Returns `(read_start, read_end, extract_sel)` where
+/// `[read_start, read_end)` is the half-open window to fetch on the outer axis and
+/// `extract_sel` is the selection *relative to that window* used to pull out the
+/// surviving values.
+///
+/// - `Range(s, e)` => read exactly `[s, e)`; extract is the identity `Range(0, e-s)`.
+/// - `Indices(v)`  => read the bounding window `[min, max+1)` in one request, then
+///   gather with offsets shifted into the window. One bounding read is never worse
+///   than the old full-axis read and is far cheaper when the indices cluster;
+///   reading each scattered index separately would be thousands of tiny requests.
+///
+/// An empty selection reads nothing (`read_start == read_end`).
+fn plan_outer_coord_read(sel: &CoordSelection) -> (u64, u64, CoordSelection) {
+    match sel {
+        CoordSelection::Range(s, e) => (
+            *s as u64,
+            *e as u64,
+            CoordSelection::Range(0, e.saturating_sub(*s)),
+        ),
+        CoordSelection::Indices(v) => {
+            let (Some(&lo), Some(&hi)) = (v.iter().min(), v.iter().max()) else {
+                return (0, 0, CoordSelection::Indices(Vec::new()));
+            };
+            let rel: Vec<usize> = v.iter().map(|&i| i - lo).collect();
+            (lo as u64, (hi + 1) as u64, CoordSelection::Indices(rel))
+        }
+    }
+}
+
+/// A view of `filters` with the outer coord's filter removed, when that coord's
+/// selection is supplied by the partition (and so resolved on the head).
+///
+/// Re-resolving the outer filter on the worker would be both wasteful and unsound:
+/// the worker only holds a partial slice of the outer coord, so `calculate_coord_ranges`
+/// could mis-resolve (or wrongly return "no match") against it. Its selection is
+/// REPLACED by [`apply_partition_selection`] regardless, so we drop it here.
+/// Returns a borrow when there is nothing to strip (the common path).
+fn filters_without_outer<'a>(
+    filters: &'a CoordFilters,
+    outer_idx: Option<usize>,
+    coord_names: &[String],
+) -> std::borrow::Cow<'a, CoordFilters> {
+    match outer_idx {
+        Some(i) if filters.filters.contains_key(&coord_names[i]) => {
+            let mut f = filters.clone();
+            f.filters.remove(&coord_names[i]);
+            std::borrow::Cow::Owned(f)
+        }
+        _ => std::borrow::Cow::Borrowed(filters),
+    }
+}
+
+/// Build the selections used to extract coordinate *values* from what was read.
+///
+/// Identical to `coord_ranges` (the absolute, data-var-read selections) except at
+/// the outer coord, where we only read a window and so must extract with the
+/// window-relative selection. Returns `coord_ranges` unchanged when the outer
+/// coord was not sliced (no partitioning, or unidentifiable outer coord).
+fn make_extract_selections(
+    coord_ranges: &Option<Vec<CoordSelection>>,
+    outer_idx: Option<usize>,
+    outer_extract_sel: &Option<CoordSelection>,
+) -> Option<Vec<CoordSelection>> {
+    match (coord_ranges, outer_idx, outer_extract_sel) {
+        (Some(sels), Some(oi), Some(esel)) => {
+            let mut e = sels.clone();
+            e[oi] = esel.clone();
+            Some(e)
+        }
+        _ => coord_ranges.clone(),
+    }
+}
+
 /// Outcome of resolving the outer-axis filter on the head, used to decide how to
 /// partition the scan (see `split_selection`).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -663,26 +740,50 @@ pub fn read_zarr(
         .map(|c| c.data_type.clone())
         .collect();
 
+    // When this partition supplies the outer-axis selection, we read ONLY that
+    // slice of the outer coord (not the whole axis). `None` => no partitioning,
+    // or the outer coord can't be identified => read everything as before.
+    let outer_slice_idx = partition_selection
+        .as_ref()
+        .and_then(|_| identify_outer_coord(&store_meta));
+    // The selection (relative to the slice we read) used to extract the outer
+    // coord's surviving values; set while reading the outer coord below.
+    let mut outer_extract_sel: Option<CoordSelection> = None;
+
     // Load coordinate arrays and get their sizes
     let mut coord_sizes: Vec<usize> = Vec::new();
     let mut coord_values: Vec<CoordValues> = Vec::new();
 
-    for (coord, dtype) in store_meta.coords.iter().zip(coord_types.iter()) {
+    for (i, (coord, dtype)) in store_meta.coords.iter().zip(coord_types.iter()).enumerate() {
         let read_start = Instant::now();
         let arr = Array::open(store.clone(), &format!("/{}", coord.name)).map_err(zarr_err)?;
         let size = arr.shape()[0] as usize;
         coord_sizes.push(size);
 
-        let subset = ArraySubset::new_with_shape(arr.shape().to_vec());
         let element_bytes = dtype_to_bytes(dtype);
-        let raw_values = read_coord_values!(sync, arr, &subset, dtype.as_str());
+        let (raw_values, read_len) = if Some(i) == outer_slice_idx {
+            // Read only this partition's window of the outer coord.
+            let sel = partition_selection
+                .as_ref()
+                .expect("outer_slice_idx implies Some");
+            let (rs, re, extract_sel) = plan_outer_coord_read(sel);
+            outer_extract_sel = Some(extract_sel);
+            let subset = ArraySubset::new_with_ranges(std::slice::from_ref(&(rs..re)));
+            (
+                read_coord_values!(sync, arr, &subset, dtype.as_str()),
+                (re - rs) as usize,
+            )
+        } else {
+            let subset = ArraySubset::new_with_shape(arr.shape().to_vec());
+            (read_coord_values!(sync, arr, &subset, dtype.as_str()), size)
+        };
 
         // Apply CF time conversion using helper function
         let values =
             apply_cf_time_conversion(raw_values, coord.cf_time_attrs.as_ref(), &coord.name);
 
         if let Some(ref s) = stats {
-            let bytes = size as u64 * element_bytes;
+            let bytes = read_len as u64 * element_bytes;
             s.record_coord(bytes, read_start.elapsed());
         }
         coord_values.push(values);
@@ -694,8 +795,11 @@ pub fn read_zarr(
     // Calculate coordinate ranges based on filters
     let coord_ranges = if let Some(ref filters) = coord_filters {
         let coord_refs = coord_values_to_refs(&coord_values);
+        // Skip re-resolving the outer filter when this partition supplied its
+        // (head-resolved) selection — we only hold a slice of that coord here.
+        let filters = filters_without_outer(filters, outer_slice_idx, &coord_names);
 
-        match calculate_coord_ranges(filters, &coord_names, &coord_refs) {
+        match calculate_coord_ranges(&filters, &coord_names, &coord_refs) {
             Some(ranges) => {
                 let filtered_rows = calculate_filtered_rows(&ranges);
                 let reduction_pct = 100.0 * (1.0 - (filtered_rows as f64 / total_rows as f64));
@@ -718,7 +822,9 @@ pub fn read_zarr(
         None
     };
 
-    // Narrow the read to this partition's outer-dimension slice, if any.
+    // Narrow the read to this partition's outer-dimension slice, if any. These
+    // selections carry ABSOLUTE outer-axis indices (they drive the data-var
+    // reads), so keep them distinct from the relative `extract_selections` below.
     let coord_ranges =
         apply_partition_selection(coord_ranges, partition_selection, &store_meta, &coord_sizes);
 
@@ -726,8 +832,12 @@ pub fn read_zarr(
     let (effective_coord_sizes, effective_rows) =
         calculate_effective_sizes(&coord_sizes, &coord_ranges);
 
-    // Extract filtered coordinate values
-    let filtered_coord_values = extract_filtered_coords(coord_values, &coord_ranges);
+    // Extract filtered coordinate values. The outer coord was read as a partial
+    // window, so it is extracted with a window-relative selection rather than the
+    // absolute one used for the data-var reads.
+    let extract_selections =
+        make_extract_selections(&coord_ranges, outer_slice_idx, &outer_extract_sel);
+    let filtered_coord_values = extract_filtered_coords(coord_values, &extract_selections);
 
     let total_columns = schema.fields().len();
     let projected_indices = projection.unwrap_or_else(|| (0..total_columns).collect());
@@ -942,11 +1052,19 @@ pub async fn read_zarr_async(
     // Total rows = product of all coordinate sizes (before filtering)
     let total_rows: usize = coord_sizes.iter().product();
 
+    // When this partition supplies the outer-axis selection, read ONLY that slice
+    // of the outer coord over the network instead of the whole axis (see the sync
+    // path for the rationale). `None` => no partitioning / unidentifiable outer.
+    let outer_slice_idx = partition_selection
+        .as_ref()
+        .and_then(|_| identify_outer_coord(&store_meta));
+    let mut outer_extract_sel: Option<CoordSelection> = None;
+
     // First, load all coordinate values (needed for filter matching)
     debug!("Loading coordinate values for filter matching");
     let mut all_coord_values: Vec<CoordValues> = Vec::new();
 
-    for (coord, dtype) in store_meta.coords.iter().zip(coord_types.iter()) {
+    for (i, (coord, dtype)) in store_meta.coords.iter().zip(coord_types.iter()).enumerate() {
         let read_start = Instant::now();
         let array_path = if prefix.as_ref().is_empty() {
             format!("/{}", coord.name)
@@ -958,9 +1076,25 @@ pub async fn read_zarr_async(
             .await
             .map_err(zarr_err)?;
 
-        let subset = ArraySubset::new_with_shape(arr.shape().to_vec());
         let element_bytes = dtype_to_bytes(dtype);
-        let raw_values = read_coord_values!(async, arr, &subset, dtype.as_str());
+        let (raw_values, read_len) = if Some(i) == outer_slice_idx {
+            let sel = partition_selection
+                .as_ref()
+                .expect("outer_slice_idx implies Some");
+            let (rs, re, extract_sel) = plan_outer_coord_read(sel);
+            outer_extract_sel = Some(extract_sel);
+            let subset = ArraySubset::new_with_ranges(std::slice::from_ref(&(rs..re)));
+            (
+                read_coord_values!(async, arr, &subset, dtype.as_str()),
+                (re - rs) as usize,
+            )
+        } else {
+            let subset = ArraySubset::new_with_shape(arr.shape().to_vec());
+            (
+                read_coord_values!(async, arr, &subset, dtype.as_str()),
+                coord.shape[0] as usize,
+            )
+        };
 
         // Apply CF time conversion using helper function
         let values =
@@ -968,7 +1102,7 @@ pub async fn read_zarr_async(
 
         debug!(path = %array_path, "Coordinate values loaded");
         if let Some(ref s) = stats {
-            let bytes = coord.shape[0] * element_bytes;
+            let bytes = read_len as u64 * element_bytes;
             s.record_coord(bytes, read_start.elapsed());
         }
         all_coord_values.push(values);
@@ -977,8 +1111,11 @@ pub async fn read_zarr_async(
     // Calculate coordinate ranges based on filters
     let coord_ranges = if let Some(ref filters) = coord_filters {
         let coord_refs = coord_values_to_refs(&all_coord_values);
+        // Skip re-resolving the outer filter when this partition supplied its
+        // (head-resolved) selection — we only hold a slice of that coord here.
+        let filters = filters_without_outer(filters, outer_slice_idx, &coord_names);
 
-        match calculate_coord_ranges(filters, &coord_names, &coord_refs) {
+        match calculate_coord_ranges(&filters, &coord_names, &coord_refs) {
             Some(ranges) => {
                 let filtered_rows = calculate_filtered_rows(&ranges);
                 let reduction_pct = 100.0 * (1.0 - (filtered_rows as f64 / total_rows as f64));
@@ -1002,7 +1139,9 @@ pub async fn read_zarr_async(
     };
     debug!(?coord_ranges, "Coordinate ranges calculated");
 
-    // Narrow the read to this partition's outer-dimension slice, if any.
+    // Narrow the read to this partition's outer-dimension slice, if any. These
+    // selections carry ABSOLUTE outer-axis indices (they drive the data-var
+    // reads), so keep them distinct from the relative `extract_selections` below.
     let coord_ranges =
         apply_partition_selection(coord_ranges, partition_selection, &store_meta, &coord_sizes);
 
@@ -1010,8 +1149,12 @@ pub async fn read_zarr_async(
     let (effective_coord_sizes, rows_after_filter) =
         calculate_effective_sizes(&coord_sizes, &coord_ranges);
 
-    // Extract filtered coordinate values
-    let filtered_coord_values = extract_filtered_coords(all_coord_values, &coord_ranges);
+    // Extract filtered coordinate values. The outer coord was read as a partial
+    // window, so it is extracted with a window-relative selection rather than the
+    // absolute one used for the data-var reads.
+    let extract_selections =
+        make_extract_selections(&coord_ranges, outer_slice_idx, &outer_extract_sel);
+    let filtered_coord_values = extract_filtered_coords(all_coord_values, &extract_selections);
 
     // Apply limit (after filter reduction)
     let effective_rows = limit
@@ -1279,5 +1422,107 @@ mod resolve_outer_tests {
         let filters = one_filter("time", 999);
         let out = resolve_outer_selection(STORE, &meta, Some(&filters)).unwrap();
         assert_eq!(out, OuterSelection::Empty);
+    }
+}
+
+#[cfg(test)]
+mod outer_read_tests {
+    use super::*;
+
+    // ── plan_outer_coord_read (pure window/offset math) ──────────────────────
+
+    #[test]
+    fn range_reads_exact_window_identity_extract() {
+        // A contiguous slice is read verbatim; extraction is the identity range.
+        let (rs, re, ext) = plan_outer_coord_read(&CoordSelection::Range(8, 16));
+        assert_eq!((rs, re), (8, 16));
+        assert_eq!(ext, CoordSelection::Range(0, 8));
+    }
+
+    #[test]
+    fn empty_range_reads_nothing() {
+        let (rs, re, ext) = plan_outer_coord_read(&CoordSelection::Range(5, 5));
+        assert_eq!((rs, re), (5, 5));
+        assert_eq!(ext, CoordSelection::Range(0, 0));
+    }
+
+    #[test]
+    fn indices_read_bounding_window_with_shifted_offsets() {
+        // Scattered indices => one bounding read [min, max+1) and offsets shifted
+        // into that window, so a later gather reconstructs the exact positions.
+        let (rs, re, ext) = plan_outer_coord_read(&CoordSelection::Indices(vec![3, 5, 8]));
+        assert_eq!((rs, re), (3, 9));
+        assert_eq!(ext, CoordSelection::Indices(vec![0, 2, 5]));
+    }
+
+    #[test]
+    fn empty_indices_read_nothing() {
+        let (rs, re, ext) = plan_outer_coord_read(&CoordSelection::Indices(vec![]));
+        assert_eq!((rs, re), (0, 0));
+        assert_eq!(ext, CoordSelection::Indices(vec![]));
+    }
+
+    // ── end-to-end: partitioned read == full read (against real data) ────────
+    //
+    // Synthetic v3: time(7) × lat(10) × lon(10) = 700 rows, time is the outer
+    // coord. The flattening is Cartesian with time most-significant, so time `t`
+    // occupies rows [t*100, (t+1)*100).
+
+    use crate::reader::schema_inference::infer_schema;
+    use arrow::compute::concat_batches;
+    use arrow::record_batch::RecordBatch;
+    use futures::executor::block_on;
+    use futures::TryStreamExt;
+
+    const STORE: &str = "data/synthetic_v3.zarr";
+
+    fn read(partition: Option<CoordSelection>) -> RecordBatch {
+        let schema = Arc::new(infer_schema(STORE).unwrap());
+        let stream = read_zarr(STORE, schema.clone(), None, None, None, None, partition).unwrap();
+        let batches: Vec<RecordBatch> = block_on(stream.try_collect()).unwrap();
+        concat_batches(&batches[0].schema(), &batches).unwrap()
+    }
+
+    #[test]
+    fn full_axis_partition_matches_unpartitioned() {
+        let full = read(None);
+        // A single partition spanning the whole outer axis must be identical.
+        let whole = read(Some(CoordSelection::Range(0, 7)));
+        assert_eq!(full, whole);
+    }
+
+    #[test]
+    fn complementary_range_partitions_reconstruct_full() {
+        let full = read(None);
+        let p0 = read(Some(CoordSelection::Range(0, 3))); // time 0..3 -> 300 rows
+        let p1 = read(Some(CoordSelection::Range(3, 7))); // time 3..7 -> 400 rows
+        assert_eq!(p0.num_rows(), 300);
+        assert_eq!(p1.num_rows(), 400);
+        let rebuilt = concat_batches(&full.schema(), &[p0, p1]).unwrap();
+        assert_eq!(full, rebuilt);
+    }
+
+    #[test]
+    fn scattered_indices_partition_matches_those_time_blocks() {
+        let full = read(None);
+        // Read only time {1, 3, 5} via the bounding-window + gather path.
+        let got = read(Some(CoordSelection::Indices(vec![1, 3, 5])));
+        assert_eq!(got.num_rows(), 300);
+        // Expected: full rows for time 1, then 3, then 5 (100 rows each).
+        let expected = concat_batches(
+            &full.schema(),
+            &[
+                full.slice(100, 100),
+                full.slice(300, 100),
+                full.slice(500, 100),
+            ],
+        )
+        .unwrap();
+        assert_eq!(got, expected);
+    }
+
+    #[test]
+    fn empty_partition_yields_no_rows() {
+        assert_eq!(read(Some(CoordSelection::Range(2, 2))).num_rows(), 0);
     }
 }
