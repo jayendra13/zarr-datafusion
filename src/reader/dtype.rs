@@ -82,11 +82,37 @@ pub fn zarr_dtype_to_arrow(dtype: &str) -> DataType {
     }
 }
 
-/// Convert Zarr dtype to Arrow Dictionary type for coordinates
-/// Uses Int16 keys (supports up to 32K unique values) with the value type from Zarr
-pub fn zarr_dtype_to_arrow_dictionary(dtype: &str) -> DataType {
+/// Pick the narrowest signed-integer dictionary key type that can index a
+/// coordinate of `cardinality` distinct values without overflow.
+///
+/// Dictionary keys are non-negative indices `0..cardinality`, so the largest key
+/// is `cardinality - 1`. We step up Int16 → Int32 → Int64 as the coordinate grows:
+///
+/// - `Int16` for up to `i16::MAX + 1` (32,768) values
+/// - `Int32` for up to `i32::MAX + 1` (~2.1 billion) values
+/// - `Int64` beyond that
+///
+/// This avoids the silent `as i16` wraparound that previously panicked Arrow's
+/// `DictionaryArray::new` once a coordinate exceeded 32,767 distinct values.
+pub fn dictionary_key_type_for_cardinality(cardinality: usize) -> DataType {
+    if cardinality <= (i16::MAX as usize) + 1 {
+        DataType::Int16
+    } else if cardinality <= (i32::MAX as usize) + 1 {
+        DataType::Int32
+    } else {
+        DataType::Int64
+    }
+}
+
+/// Convert Zarr dtype to Arrow Dictionary type for coordinates.
+///
+/// The key width is chosen from `cardinality` (the number of distinct coordinate
+/// values) via [`dictionary_key_type_for_cardinality`]; the value type comes from
+/// the Zarr dtype.
+pub fn zarr_dtype_to_arrow_dictionary(dtype: &str, cardinality: usize) -> DataType {
     let value_type = zarr_dtype_to_arrow(dtype);
-    DataType::Dictionary(Box::new(DataType::Int16), Box::new(value_type))
+    let key_type = dictionary_key_type_for_cardinality(cardinality);
+    DataType::Dictionary(Box::new(key_type), Box::new(value_type))
 }
 
 #[cfg(test)]
@@ -138,5 +164,42 @@ mod tests {
         assert_eq!(zarr_dtype_to_arrow("float64"), DataType::Float64);
         assert_eq!(zarr_dtype_to_arrow("bool"), DataType::Boolean);
         assert_eq!(zarr_dtype_to_arrow("unknown"), DataType::Utf8);
+    }
+
+    #[test]
+    fn test_dictionary_key_type_steps_int16_int32_int64() {
+        // Int16 range: 0..=i16::MAX (max key 32767, i.e. 32768 distinct values)
+        assert_eq!(dictionary_key_type_for_cardinality(0), DataType::Int16);
+        assert_eq!(dictionary_key_type_for_cardinality(1), DataType::Int16);
+        assert_eq!(dictionary_key_type_for_cardinality(32_767), DataType::Int16);
+        assert_eq!(dictionary_key_type_for_cardinality(32_768), DataType::Int16);
+
+        // Just past the Int16 ceiling -> Int32 (this is the old panic case)
+        assert_eq!(dictionary_key_type_for_cardinality(32_769), DataType::Int32);
+        assert_eq!(dictionary_key_type_for_cardinality(65_748), DataType::Int32);
+        assert_eq!(
+            dictionary_key_type_for_cardinality(i32::MAX as usize + 1),
+            DataType::Int32
+        );
+
+        // Past the Int32 ceiling -> Int64
+        assert_eq!(
+            dictionary_key_type_for_cardinality(i32::MAX as usize + 2),
+            DataType::Int64
+        );
+    }
+
+    #[test]
+    fn test_zarr_dtype_to_arrow_dictionary_picks_key_width() {
+        // Small coordinate -> Int16 keys
+        assert_eq!(
+            zarr_dtype_to_arrow_dictionary("float64", 100),
+            DataType::Dictionary(Box::new(DataType::Int16), Box::new(DataType::Float64))
+        );
+        // Large coordinate -> Int32 keys, value type preserved
+        assert_eq!(
+            zarr_dtype_to_arrow_dictionary("int64", 100_000),
+            DataType::Dictionary(Box::new(DataType::Int32), Box::new(DataType::Int64))
+        );
     }
 }

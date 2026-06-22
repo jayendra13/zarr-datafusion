@@ -35,7 +35,10 @@ use std::path::Path;
 use tracing::{debug, info, instrument};
 
 use super::cf_time::CFTimeAttrs;
-use super::dtype::{parse_v2_dtype, zarr_dtype_to_arrow, zarr_dtype_to_arrow_dictionary};
+use super::dtype::{
+    dictionary_key_type_for_cardinality, parse_v2_dtype, zarr_dtype_to_arrow,
+    zarr_dtype_to_arrow_dictionary,
+};
 
 /// Zarr format version
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -63,6 +66,9 @@ pub fn build_schema_from_store_meta(meta: &ZarrStoreMeta) -> Schema {
     // Coordinates use Dictionary encoding for memory efficiency
     // CF time coordinates use Dictionary with Timestamp values
     for coord in &meta.coords {
+        // Number of distinct coordinate values determines the dictionary key width
+        // (Int16 -> Int32 -> Int64) so large axes don't overflow the keys.
+        let cardinality = coord.shape.first().copied().unwrap_or(0) as usize;
         let data_type = if coord
             .cf_time_attrs
             .as_ref()
@@ -70,14 +76,14 @@ pub fn build_schema_from_store_meta(meta: &ZarrStoreMeta) -> Schema {
         {
             // CF time coordinate: Dictionary with Timestamp(Microsecond, UTC) values
             DataType::Dictionary(
-                Box::new(DataType::Int16),
+                Box::new(dictionary_key_type_for_cardinality(cardinality)),
                 Box::new(DataType::Timestamp(
                     TimeUnit::Microsecond,
                     Some("UTC".into()),
                 )),
             )
         } else {
-            zarr_dtype_to_arrow_dictionary(&coord.data_type)
+            zarr_dtype_to_arrow_dictionary(&coord.data_type, cardinality)
         };
         fields.push(Field::new(&coord.name, data_type, false));
     }
