@@ -13,21 +13,23 @@ A Rust library that integrates [Zarr](https://zarr.dev/) (v2 and v3) array stora
 ## Quick Start
 
 ```bash
-# Install the prebuilt CLI from the latest GitHub release (no toolchain needed).
+# Install the prebuilt CLI from a GitHub release (no Rust toolchain needed).
 # The Linux build is a static musl binary, so it runs on any x86_64 Linux
 # regardless of the system glibc version — ideal for deploying to a VM.
-curl -fsSL https://raw.githubusercontent.com/jayendra13/zarr-datafusion/main/install.sh | bash
+# The current build is a preview prerelease, so pin the version explicitly:
+curl -fsSL https://raw.githubusercontent.com/jayendra13/zarr-datafusion/main/install.sh \
+  | VERSION=v0.1.0-test bash
 zarr-cli --version
 
-# Or install via cargo (builds from source)
-cargo install zarr-datafusion
-
-# Or run from source
+# Or run from source (requires the Rust toolchain)
 cargo run --bin zarr-cli
 ```
 
-> `install.sh` honours `VERSION=v0.1.0` to pin a release and `INSTALL_DIR=/usr/local/bin`
-> to change the install location (defaults to `~/.local/bin`).
+> Release: <https://github.com/jayendra13/zarr-datafusion/releases/tag/v0.1.0-test>
+>
+> `install.sh` honours `VERSION=<tag>` to pin a release and `INSTALL_DIR=/usr/local/bin`
+> to change the install location (defaults to `~/.local/bin`). A `cargo install
+> zarr-datafusion` path will be available once the crate is published to crates.io.
 
 ```sql
 -- Load a Zarr store (local or cloud)
@@ -105,12 +107,17 @@ synthetic_v2.zarr/
 
 - **Zarr v2 and v3 support** via the [zarrs](https://crates.io/crates/zarrs) crate
 - **Schema inference**: Automatically infers Arrow schema from Zarr metadata
-- **Projection pushdown**: Only reads arrays that are needed for the query
-- **Filter pushdown**: Coordinate equality filters reduce data reads
+- **Projection & limit pushdown**: Only reads the arrays a query needs, and stops early on `LIMIT`
+- **Filter pushdown**: Coordinate equality, range (`BETWEEN`, `>=`), and date-part filters (e.g. `day`, `month`) prune chunks before reading
+- **Optimizer rules**: `MIN`/`MAX`/`COUNT` answered from statistics, skipping the data scan
+- **Chunk-level parallelism**: The scan is split into partitions read concurrently
+- **Distributed execution** (optional): Multi-node querying via [datafusion-distributed](https://crates.io/crates/datafusion-distributed) (`worker`/`head` binaries, `distributed` feature)
+- **VirtualiZarr support**: Reads virtual reference stores (Parquet chunk refs → NetCDF/GRIB byte ranges)
 - **Memory efficient coordinates**: Uses Arrow DictionaryArray for coordinate columns (~75% memory savings)
 - **SQL interface**: Full DataFusion SQL support (filtering, aggregation, joins, etc.)
 - **Cloud storage**: Read directly from GCS and S3 buckets
 - **Interactive CLI**: SQL shell with syntax highlighting, history, and I/O statistics
+- **Prebuilt binaries**: Static musl `zarr-cli` from GitHub releases (no toolchain needed)
 
 ## Prerequisites
 
@@ -349,28 +356,86 @@ ORDER BY avg_temp DESC
 LIMIT 10;
 ```
 
+## Cookbook
+
+End-to-end, reproducible recipes live under [`cookbook/`](cookbook/):
+
+- **[El Niño / La Niña — ONI from ERA5](cookbook/el-nino-oni/)** — compute the
+  Oceanic Niño Index for every overlapping 3-month season from 1950 to present
+  with a single SQL query over public ERA5 on GCS, classify each season as El Niño
+  / La Niña / Neutral, and validate against NOAA's official ONI table (MAE 0.14 °C
+  in the satellite era, Pearson r 0.96, class-agreement weighted κ 0.85).
+
+## Distributed Execution
+
+For larger scans, `zarr-datafusion` can run as a multi-node cluster via
+[datafusion-distributed](https://crates.io/crates/datafusion-distributed): a `head`
+node plans the query and runs the top stage locally, fanning out scan stages to
+`worker` nodes. Both binaries are gated behind the `distributed` feature.
+
+The quickest way to try it locally is the helper script, which builds and runs a
+cluster of plain cargo processes:
+
+```bash
+scripts/cluster.sh up                                  # build + start workers
+scripts/cluster.sh query "SELECT COUNT(*) FROM weather"
+scripts/cluster.sh query "SELECT ..." --show-plan      # print the distributed plan
+scripts/cluster.sh down                                # stop workers
+
+# Tunables (env vars): WORKERS=3  BASE_PORT=9090  STORE_PATH=...  TABLE=weather
+```
+
+Or run the binaries directly:
+
+```bash
+# Worker — repeat on each node (PORT defaults to 8080)
+PORT=8080 cargo run --features distributed --bin worker
+
+# Head — point it at the workers + a store, then run SQL
+WORKER_URLS=http://localhost:8080,http://localhost:8081 \
+  cargo run --features distributed --bin head -- \
+  --store data/synthetic_v3.zarr --table weather \
+  "SELECT time, AVG(temperature) FROM weather GROUP BY time"
+```
+
 ## Architecture
 
 ```
 src/
-├── bin/zarr_cli/
-│   ├── main.rs              # Interactive SQL shell (REPL)
-│   └── highlight.rs         # SQL syntax highlighting
+├── lib.rs                       # Crate root; module exports
+├── bin/
+│   ├── zarr_cli/
+│   │   ├── main.rs              # Interactive SQL shell (REPL) + script runner
+│   │   └── highlight.rs         # SQL syntax highlighting
+│   ├── worker.rs                # Distributed worker node   (feature = "distributed")
+│   └── head.rs                  # Distributed head/coordinator (feature = "distributed")
 ├── reader/
-│   ├── schema_inference.rs  # Infer Arrow schema from Zarr metadata
-│   ├── zarr_reader.rs       # Zarr reading and Arrow conversion
-│   ├── filter.rs            # Filter pushdown for coordinates
-│   ├── storage.rs           # Storage backends (local, GCS, S3)
-│   └── stats.rs             # I/O statistics tracking
+│   ├── schema_inference.rs      # Infer Arrow schema from Zarr metadata
+│   ├── zarr_reader.rs           # Zarr reading, nD→2D flattening, Arrow conversion
+│   ├── filter.rs                # Coordinate filter pushdown (equality, range, date-part)
+│   ├── coord.rs                 # Coordinate handling
+│   ├── dtype.rs                 # Zarr → Arrow dtype conversion
+│   ├── cf_time.rs               # CF time-units decoding ("hours since 1900-01-01")
+│   ├── storage.rs               # Storage backends (local, GCS, S3)
+│   ├── tracked_store.rs         # I/O-tracking store wrapper (sync)
+│   ├── async_tracked_store.rs   # I/O-tracking store wrapper (async)
+│   ├── virtual_store.rs         # VirtualiZarr reference-store adapter
+│   ├── parquet_refs.rs          # VirtualiZarr Parquet chunk-reference reader
+│   └── stats.rs                 # I/O statistics tracking
 ├── datasource/
-│   ├── zarr.rs              # DataFusion TableProvider implementation
-│   └── factory.rs           # TableProviderFactory for CREATE EXTERNAL TABLE
+│   ├── zarr.rs                  # ZarrTable: DataFusion TableProvider
+│   └── factory.rs               # TableProviderFactory for CREATE EXTERNAL TABLE
 ├── optimizer/
-│   ├── minmax_optimization.rs  # MIN/MAX → constant folding
-│   └── count_optimization.rs   # COUNT(*) → constant folding
+│   ├── minmax_optimization.rs   # MIN/MAX → constant folding from stats
+│   ├── count_optimization.rs    # COUNT(*) → constant folding from stats
+│   └── limit_pushdown.rs        # Push LIMIT into the Zarr scan
 ├── physical_plan/
-│   └── zarr_exec.rs         # DataFusion ExecutionPlan for scanning
-└── udtf.rs                  # zarr_describe() table function
+│   ├── zarr_exec.rs             # ZarrExec: partitioned scan ExecutionPlan
+│   ├── partition.rs             # Scan partitioning / chunk selection
+│   └── codec.rs                 # Physical-plan codec for distributed execution
+├── distributed.rs               # datafusion-distributed wiring (worker/head)
+├── udfs/                        # Scalar + aggregate UDFs (rmse, mae, ...)
+└── udtf.rs                      # zarr_describe() table function
 ```
 
 ## Dependencies
@@ -392,15 +457,18 @@ src/
 - [x] Read from cloud storage (GCS/S3) via `object_store` crate
 - [x] Extended DESCRIBE with Zarr metadata (`zarr_describe()` UDTF)
 - [x] MIN/MAX/COUNT optimizer rules (use statistics, skip data scan)
+- [x] Distributed execution across `worker`/`head` nodes (datafusion-distributed)
+- [x] VirtualiZarr reference stores (Parquet chunk references)
+- [x] Prebuilt static-musl `zarr-cli` binaries via GitHub releases
 
 ### Pushdown Optimizations
 - [x] Projection pushdown (only read requested columns)
 - [x] Limit pushdown (slice results to limit)
 - [x] Filter pushdown for coordinate equality (`WHERE lat = 5`)
-- [ ] Filter pushdown (advanced)
-  - [ ] Coordinate range (`WHERE time BETWEEN 2 AND 4`)
-  - [ ] Partition pruning (skip chunks based on coordinate ranges)
-  - [ ] Data variable filter (`WHERE temperature > 20`)
+- [x] Coordinate range filters (`WHERE time BETWEEN 2 AND 4`, `>=`)
+- [x] Date-part coordinate filters (`WHERE extract(month FROM time) IN (...)`)
+- [x] Partition pruning (skip chunks outside the coordinate selection)
+- [ ] Data variable filter pushdown (`WHERE temperature > 20`)
 - [ ] Aggregate pushdown (push `SUM/AVG/COUNT` to chunk level)
 - [ ] Top-K optimization (`ORDER BY x LIMIT k` without full sort)
 
@@ -416,10 +484,10 @@ src/
 - [ ] Pager support for large results (less/more)
 
 ### Performance
-- [ ] Chunk-level parallelism (read chunks concurrently)
+- [x] Chunk-level parallelism (partitioned scan, chunks read concurrently)
 - [ ] Streaming RecordBatch output (multiple batches instead of one)
 - [ ] Zero-copy reads with memory-mapped I/O
-- [ ] Statistics-based chunk pruning
+- [ ] Statistics-based chunk pruning (data-variable min/max)
 
 ### Data Types
 - [ ] Additional numeric types (uint8/16/32, int8/16/32, float16)
@@ -435,7 +503,7 @@ src/
 
 ### Interoperability
 - [ ] Integrate [icechunk](https://github.com/earth-mover/icechunk) for transactional Zarr reads
-- [ ] [Kerchunk](https://github.com/fsspec/kerchunk)/VirtualiZarr support (virtual references to NetCDF/HDF5)
+- [x] [Kerchunk](https://github.com/fsspec/kerchunk)/VirtualiZarr support — VirtualiZarr Parquet references to NetCDF/GRIB
 - [ ] Integrate with [xarray-sql](https://github.com/xarray-contrib/xarray-sql)
 - [ ] Python bindings via PyO3
 - [ ] Arrow Flight server
