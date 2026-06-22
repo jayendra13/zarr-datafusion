@@ -1,6 +1,6 @@
 mod highlight;
 
-use std::io::{self, IsTerminal, Write};
+use std::io::{self, IsTerminal, Read, Write};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -33,6 +33,144 @@ fn get_history_path() -> PathBuf {
         .join(HISTORY_FILE)
 }
 
+/// Parsed command-line arguments.
+struct CliArgs {
+    /// `.sql` files to execute (positional args or `-f`/`--file`), in order.
+    files: Vec<String>,
+    /// Inline statements (`-c`/`--command`) run before any files.
+    commands: Vec<String>,
+    /// Show usage and exit.
+    help: bool,
+}
+
+/// Parse argv into [`CliArgs`]. Bare positional args are treated as file paths.
+fn parse_cli_args() -> Result<CliArgs, String> {
+    let mut files = Vec::new();
+    let mut commands = Vec::new();
+    let mut help = false;
+
+    let mut it = std::env::args().skip(1);
+    while let Some(arg) = it.next() {
+        match arg.as_str() {
+            "-h" | "--help" => help = true,
+            "-f" | "--file" => {
+                let p = it
+                    .next()
+                    .ok_or_else(|| format!("{arg} requires a path argument"))?;
+                files.push(p);
+            }
+            "-c" | "--command" => {
+                let s = it
+                    .next()
+                    .ok_or_else(|| format!("{arg} requires a SQL argument"))?;
+                commands.push(s);
+            }
+            s if s.starts_with('-') && s.len() > 1 => {
+                return Err(format!("Unknown option: {s} (try --help)"));
+            }
+            // Anything else is a positional file path.
+            _ => files.push(arg),
+        }
+    }
+
+    Ok(CliArgs {
+        files,
+        commands,
+        help,
+    })
+}
+
+fn print_usage() {
+    println!(
+        r#"Zarr-DataFusion CLI
+
+USAGE:
+    zarr-cli                       Start the interactive SQL REPL
+    zarr-cli [OPTIONS] [FILE...]   Run SQL from files / commands, then exit
+    zarr-cli < script.sql          Run SQL piped from stdin, then exit
+
+OPTIONS:
+    -f, --file <PATH>     Execute statements from a .sql file (repeatable)
+    -c, --command <SQL>   Run an inline SQL statement before any files (repeatable)
+    -h, --help            Show this help
+
+NOTES:
+    Files and stdin may hold multiple `;`-separated statements that span
+    several lines and contain `--` line comments. Tables must be registered
+    before they are queried, e.g.:
+
+        zarr-cli -c "CREATE EXTERNAL TABLE era5 STORED AS ZARR LOCATION 'data/era5_sst_local.zarr';" \
+                 sql/oni_djf2025_extract.sql"#
+    );
+}
+
+/// Split a SQL script into individual statements.
+///
+/// Handles the cases that tripped up a naive `readline`-per-line loop:
+/// strips `--` line comments, collapses newlines, and splits on `;` while
+/// respecting single-quoted strings and double-quoted identifiers (so a `;`
+/// or `--` inside a literal does not split or truncate a statement).
+fn split_sql_statements(input: &str) -> Vec<String> {
+    let mut stmts = Vec::new();
+    let mut cur = String::new();
+    let mut in_squote = false; // '...' string literal
+    let mut in_dquote = false; // "..." quoted identifier
+
+    let mut chars = input.chars().peekable();
+    while let Some(c) = chars.next() {
+        if in_squote {
+            cur.push(c);
+            if c == '\'' {
+                in_squote = false;
+            }
+            continue;
+        }
+        if in_dquote {
+            cur.push(c);
+            if c == '"' {
+                in_dquote = false;
+            }
+            continue;
+        }
+
+        match c {
+            '\'' => {
+                in_squote = true;
+                cur.push(c);
+            }
+            '"' => {
+                in_dquote = true;
+                cur.push(c);
+            }
+            // `--` line comment: skip to end of line.
+            '-' if chars.peek() == Some(&'-') => {
+                while let Some(&nc) = chars.peek() {
+                    if nc == '\n' {
+                        break;
+                    }
+                    chars.next();
+                }
+                cur.push(' '); // keep tokens on either side separated
+            }
+            ';' => {
+                let s = cur.trim();
+                if !s.is_empty() {
+                    stmts.push(s.to_string());
+                }
+                cur.clear();
+            }
+            '\n' | '\r' | '\t' => cur.push(' '),
+            _ => cur.push(c),
+        }
+    }
+
+    let s = cur.trim();
+    if !s.is_empty() {
+        stmts.push(s.to_string());
+    }
+    stmts
+}
+
 // Why `Send + Sync` in the error type?
 //
 // Even though we don't explicitly spawn threads, errors must be `Send + Sync` because:
@@ -54,6 +192,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         .with_line_number(true)
         .init();
 
+    let args = match parse_cli_args() {
+        Ok(args) => args,
+        Err(e) => {
+            eprintln!("{e}");
+            std::process::exit(2);
+        }
+    };
+
+    if args.help {
+        print_usage();
+        return Ok(());
+    }
+
     let config = SessionConfig::new().with_information_schema(true);
     let state = SessionStateBuilder::new()
         .with_default_features()
@@ -71,6 +222,53 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // Register metric UDFs for weather evaluation
     register_metric_udfs(&ctx);
 
+    // Batch mode: run when files/commands are given, or when stdin is piped.
+    // Otherwise fall through to the interactive REPL.
+    let stdin_piped = !io::stdin().is_terminal();
+    let batch = !args.files.is_empty() || !args.commands.is_empty() || stdin_piped;
+    if batch {
+        run_batch(&ctx, &args, stdin_piped).await;
+        return Ok(());
+    }
+
+    run_repl(&ctx).await
+}
+
+/// Execute inline commands, then files, then piped stdin (when no files given).
+async fn run_batch(ctx: &SessionContext, args: &CliArgs, stdin_piped: bool) {
+    for cmd in &args.commands {
+        for stmt in split_sql_statements(cmd) {
+            execute_statement(ctx, &stmt).await;
+        }
+    }
+
+    for path in &args.files {
+        match std::fs::read_to_string(path) {
+            Ok(content) => {
+                for stmt in split_sql_statements(&content) {
+                    execute_statement(ctx, &stmt).await;
+                }
+            }
+            Err(e) => eprintln!("Error reading {path}: {e}"),
+        }
+    }
+
+    // Read piped stdin only when no explicit files were given (so `-f a.sql`
+    // plus a stray pipe doesn't double-run something unexpected).
+    if args.files.is_empty() && stdin_piped {
+        let mut buf = String::new();
+        if let Err(e) = io::stdin().read_to_string(&mut buf) {
+            eprintln!("Error reading stdin: {e}");
+        } else {
+            for stmt in split_sql_statements(&buf) {
+                execute_statement(ctx, &stmt).await;
+            }
+        }
+    }
+}
+
+/// Interactive REPL with history and syntax highlighting.
+async fn run_repl(ctx: &SessionContext) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     println!("Zarr-DataFusion CLI");
     println!("\nType SQL queries or 'help' for commands.\n");
 
@@ -101,112 +299,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                     continue;
                 }
 
-                if line.starts_with("\\d") || line.eq_ignore_ascii_case("show tables") {
-                    match ctx.sql("SHOW TABLES").await {
-                        Ok(df) => {
-                            if let Err(e) = df.show().await {
-                                eprintln!("Error: {e}");
-                            }
-                        }
-                        Err(e) => eprintln!("Error: {e}"),
-                    }
-                    continue;
-                }
-
-                // Custom DESCRIBE with extended Zarr metadata
-                if let Some(table_name) = parse_describe_query(line) {
-                    let query = format!("SELECT * FROM zarr_describe('{}')", table_name);
-                    match ctx.sql(&query).await {
-                        Ok(df) => {
-                            if let Err(e) = df.show().await {
-                                eprintln!("Error: {e}");
-                            }
-                        }
-                        Err(e) => eprintln!("Error: {e}"),
-                    }
-                    continue;
-                }
-
-                // Execute SQL with timing
-                let start = Instant::now();
-                match ctx.sql(line).await {
-                    Ok(df) => {
-                        // DDL statements return empty results - don't show the empty table
-                        let line_upper = line.to_uppercase();
-                        let is_ddl = line_upper.starts_with("CREATE ")
-                            || line_upper.starts_with("DROP ")
-                            || line_upper.starts_with("ALTER ");
-
-                        if is_ddl {
-                            // Execute DDL silently - only show errors
-                            if let Err(e) = df.collect().await {
-                                eprintln!("Error: {e}");
-                            } else {
-                                let elapsed = start.elapsed();
-                                println!("OK ({:.3}s)", elapsed.as_secs_f64());
-                            }
-                        } else {
-                            // Create physical plan to access ZarrExec for I/O stats
-                            match df.create_physical_plan().await {
-                                Ok(plan) => {
-                                    // Find ZarrExec in the plan tree to get I/O stats
-                                    let io_stats = find_zarr_exec_stats(&plan);
-
-                                    // Start live stats display if we have ZarrExec stats
-                                    // Only show live updates when stdout is a terminal
-                                    let stop_flag = Arc::new(AtomicBool::new(false));
-                                    let is_tty = io::stdout().is_terminal();
-                                    let live_task = if is_tty {
-                                        io_stats.as_ref().map(|stats| {
-                                            spawn_live_stats(stats.clone(), stop_flag.clone())
-                                        })
-                                    } else {
-                                        None
-                                    };
-
-                                    // Execute using the same plan (so stats are populated)
-                                    let task_ctx = ctx.task_ctx();
-                                    let result = collect(plan, task_ctx).await;
-
-                                    // Stop live stats display
-                                    stop_flag.store(true, Ordering::Relaxed);
-                                    if let Some(task) = live_task {
-                                        let _ = task.await;
-                                    }
-
-                                    match result {
-                                        Ok(batches) => {
-                                            let elapsed = start.elapsed();
-                                            let row_count: usize =
-                                                batches.iter().map(|b| b.num_rows()).sum();
-
-                                            // Clear the live stats line if we were showing it
-                                            if is_tty && io_stats.is_some() {
-                                                print!("\r\x1b[K");
-                                                let _ = io::stdout().flush();
-                                            }
-
-                                            // Print results table
-                                            if let Err(e) = print_batches(&batches) {
-                                                eprintln!("Error displaying results: {e}");
-                                            } else {
-                                                // Print compact stats line
-                                                print_stats_line(
-                                                    row_count,
-                                                    elapsed.as_secs_f64(),
-                                                    io_stats.as_ref(),
-                                                );
-                                            }
-                                        }
-                                        Err(e) => eprintln!("Error executing query: {e}"),
-                                    }
-                                }
-                                Err(e) => eprintln!("Error creating plan: {e}"),
-                            }
-                        }
-                    }
-                    Err(e) => eprintln!("SQL Error: {e}"),
-                }
+                execute_statement(ctx, line).await;
             }
             Err(ReadlineError::Interrupted) => {
                 println!("^C");
@@ -229,6 +322,123 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
     println!("Goodbye!");
     Ok(())
+}
+
+/// Execute one statement (a meta-command, DDL, or query) and print results.
+///
+/// Shared by both the interactive REPL and batch mode so behavior is identical.
+async fn execute_statement(ctx: &SessionContext, line: &str) {
+    let line = line.trim();
+    if line.is_empty() {
+        return;
+    }
+
+    // Meta-command: list tables.
+    if line.starts_with("\\d") || line.eq_ignore_ascii_case("show tables") {
+        match ctx.sql("SHOW TABLES").await {
+            Ok(df) => {
+                if let Err(e) = df.show().await {
+                    eprintln!("Error: {e}");
+                }
+            }
+            Err(e) => eprintln!("Error: {e}"),
+        }
+        return;
+    }
+
+    // Custom DESCRIBE with extended Zarr metadata.
+    if let Some(table_name) = parse_describe_query(line) {
+        let query = format!("SELECT * FROM zarr_describe('{}')", table_name);
+        match ctx.sql(&query).await {
+            Ok(df) => {
+                if let Err(e) = df.show().await {
+                    eprintln!("Error: {e}");
+                }
+            }
+            Err(e) => eprintln!("Error: {e}"),
+        }
+        return;
+    }
+
+    // Execute SQL with timing.
+    let start = Instant::now();
+    match ctx.sql(line).await {
+        Ok(df) => {
+            // DDL statements return empty results - don't show the empty table.
+            let line_upper = line.to_uppercase();
+            let is_ddl = line_upper.starts_with("CREATE ")
+                || line_upper.starts_with("DROP ")
+                || line_upper.starts_with("ALTER ");
+
+            if is_ddl {
+                // Execute DDL silently - only show errors.
+                if let Err(e) = df.collect().await {
+                    eprintln!("Error: {e}");
+                } else {
+                    let elapsed = start.elapsed();
+                    println!("OK ({:.3}s)", elapsed.as_secs_f64());
+                }
+            } else {
+                // Create physical plan to access ZarrExec for I/O stats.
+                match df.create_physical_plan().await {
+                    Ok(plan) => {
+                        // Find ZarrExec in the plan tree to get I/O stats.
+                        let io_stats = find_zarr_exec_stats(&plan);
+
+                        // Start live stats display if we have ZarrExec stats.
+                        // Only show live updates when stdout is a terminal.
+                        let stop_flag = Arc::new(AtomicBool::new(false));
+                        let is_tty = io::stdout().is_terminal();
+                        let live_task = if is_tty {
+                            io_stats
+                                .as_ref()
+                                .map(|stats| spawn_live_stats(stats.clone(), stop_flag.clone()))
+                        } else {
+                            None
+                        };
+
+                        // Execute using the same plan (so stats are populated).
+                        let task_ctx = ctx.task_ctx();
+                        let result = collect(plan, task_ctx).await;
+
+                        // Stop live stats display.
+                        stop_flag.store(true, Ordering::Relaxed);
+                        if let Some(task) = live_task {
+                            let _ = task.await;
+                        }
+
+                        match result {
+                            Ok(batches) => {
+                                let elapsed = start.elapsed();
+                                let row_count: usize = batches.iter().map(|b| b.num_rows()).sum();
+
+                                // Clear the live stats line if we were showing it.
+                                if is_tty && io_stats.is_some() {
+                                    print!("\r\x1b[K");
+                                    let _ = io::stdout().flush();
+                                }
+
+                                // Print results table.
+                                if let Err(e) = print_batches(&batches) {
+                                    eprintln!("Error displaying results: {e}");
+                                } else {
+                                    // Print compact stats line.
+                                    print_stats_line(
+                                        row_count,
+                                        elapsed.as_secs_f64(),
+                                        io_stats.as_ref(),
+                                    );
+                                }
+                            }
+                            Err(e) => eprintln!("Error executing query: {e}"),
+                        }
+                    }
+                    Err(e) => eprintln!("Error creating plan: {e}"),
+                }
+            }
+        }
+        Err(e) => eprintln!("SQL Error: {e}"),
+    }
 }
 
 fn print_help() {
