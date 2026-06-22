@@ -41,6 +41,8 @@ struct CliArgs {
     commands: Vec<String>,
     /// Show usage and exit.
     help: bool,
+    /// Show version and exit.
+    version: bool,
 }
 
 /// Parse argv into [`CliArgs`]. Bare positional args are treated as file paths.
@@ -48,11 +50,13 @@ fn parse_cli_args() -> Result<CliArgs, String> {
     let mut files = Vec::new();
     let mut commands = Vec::new();
     let mut help = false;
+    let mut version = false;
 
     let mut it = std::env::args().skip(1);
     while let Some(arg) = it.next() {
         match arg.as_str() {
             "-h" | "--help" => help = true,
+            "-V" | "--version" => version = true,
             "-f" | "--file" => {
                 let p = it
                     .next()
@@ -77,6 +81,7 @@ fn parse_cli_args() -> Result<CliArgs, String> {
         files,
         commands,
         help,
+        version,
     })
 }
 
@@ -93,6 +98,7 @@ OPTIONS:
     -f, --file <PATH>     Execute statements from a .sql file (repeatable)
     -c, --command <SQL>   Run an inline SQL statement before any files (repeatable)
     -h, --help            Show this help
+    -V, --version         Show version and exit
 
 NOTES:
     Files and stdin may hold multiple `;`-separated statements that span
@@ -199,6 +205,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             std::process::exit(2);
         }
     };
+
+    if args.version {
+        println!("zarr-cli {}", env!("ZARR_BUILD_VERSION"));
+        return Ok(());
+    }
 
     if args.help {
         print_usage();

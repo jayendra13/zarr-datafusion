@@ -68,6 +68,12 @@ jobs:
     strategy:
       matrix:
         include:
+          # Fully static musl build: runs on any x86_64 Linux regardless of the
+          # system glibc version (the binary VMs should download).
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-musl
+            artifact: zarr-cli
+            use_zig: true
           - os: ubuntu-latest
             target: x86_64-unknown-linux-gnu
             artifact: zarr-cli
@@ -98,7 +104,18 @@ jobs:
             target
           key: ${{ runner.os }}-${{ matrix.target }}-cargo-${{ hashFiles('**/Cargo.lock') }}
 
+      - name: Install cargo-zigbuild (musl)
+        if: matrix.use_zig
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-zigbuild
+
+      - name: Build release binary (zigbuild/musl)
+        if: matrix.use_zig
+        run: cargo zigbuild --release --bin zarr-cli --target ${{ matrix.target }}
+
       - name: Build release binary
+        if: ${{ !matrix.use_zig }}
         run: cargo build --release --bin zarr-cli --target ${{ matrix.target }}
 
       - name: Package binary (Unix)
@@ -106,6 +123,8 @@ jobs:
         run: |
           cd target/${{ matrix.target }}/release
           tar czvf ../../../zarr-cli-${{ matrix.target }}.tar.gz ${{ matrix.artifact }}
+          cd ../../..
+          sha256sum zarr-cli-${{ matrix.target }}.tar.gz > zarr-cli-${{ matrix.target }}.tar.gz.sha256
 
       - name: Package binary (Windows)
         if: matrix.os == 'windows-latest'

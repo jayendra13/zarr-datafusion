@@ -13,13 +13,21 @@ A Rust library that integrates [Zarr](https://zarr.dev/) (v2 and v3) array stora
 ## Quick Start
 
 ```bash
-# Install and run the CLI
+# Install the prebuilt CLI from the latest GitHub release (no toolchain needed).
+# The Linux build is a static musl binary, so it runs on any x86_64 Linux
+# regardless of the system glibc version — ideal for deploying to a VM.
+curl -fsSL https://raw.githubusercontent.com/jayendra13/zarr-datafusion/main/install.sh | bash
+zarr-cli --version
+
+# Or install via cargo (builds from source)
 cargo install zarr-datafusion
-zarr-cli
 
 # Or run from source
 cargo run --bin zarr-cli
 ```
+
+> `install.sh` honours `VERSION=v0.1.0` to pin a release and `INSTALL_DIR=/usr/local/bin`
+> to change the install location (defaults to `~/.local/bin`).
 
 ```sql
 -- Load a Zarr store (local or cloud)
