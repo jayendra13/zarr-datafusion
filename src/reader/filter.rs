@@ -54,6 +54,17 @@ pub enum CoordFilterKind {
         /// The integer value to match
         value: i32,
     },
+    /// Membership over raw coordinate values: `coord IN (v1, v2, ...)`.
+    /// Resolves to the union of the matching positions.
+    InList(Vec<ScalarValue>),
+    /// Date part membership: `EXTRACT(field FROM coord) IN (v1, v2, ...)`.
+    /// Resolves to the union of positions whose date part is in `values`.
+    DatePartSet {
+        /// The date part field, e.g. "MONTH"
+        field: String,
+        /// The set of integer values to match
+        values: Vec<i32>,
+    },
 }
 
 impl std::fmt::Display for CoordFilterKind {
@@ -77,6 +88,14 @@ impl std::fmt::Display for CoordFilterKind {
             },
             CoordFilterKind::DatePart { field, value } => {
                 write!(f, " EXTRACT({field})={value}")
+            }
+            CoordFilterKind::InList(values) => {
+                let vals: Vec<String> = values.iter().map(|v| v.to_string()).collect();
+                write!(f, " IN ({})", vals.join(", "))
+            }
+            CoordFilterKind::DatePartSet { field, values } => {
+                let vals: Vec<String> = values.iter().map(|v| v.to_string()).collect();
+                write!(f, " EXTRACT({field}) IN ({})", vals.join(", "))
             }
         }
     }
@@ -114,13 +133,44 @@ impl CoordSelection {
             CoordSelection::Indices(_) => None,
         }
     }
+
+    /// Intersect two position selections (AND-composition of two filters on the
+    /// same coordinate). Both operands are positions into the coordinate array, so
+    /// this is a plain set intersection — valid regardless of ascending/descending
+    /// order. `Indices` operands are assumed sorted ascending (they are produced
+    /// sorted), and the result preserves that ordering.
+    ///
+    /// `Range ∩ Range` stays a `Range`; any intersection involving `Indices`
+    /// collapses to `Indices` (possibly empty).
+    pub fn intersect(&self, other: &CoordSelection) -> CoordSelection {
+        use CoordSelection::*;
+        match (self, other) {
+            (Range(s1, e1), Range(s2, e2)) => {
+                let start = (*s1).max(*s2);
+                let end = (*e1).min(*e2).max(start);
+                Range(start, end)
+            }
+            (Range(s, e), Indices(v)) | (Indices(v), Range(s, e)) => {
+                Indices(v.iter().copied().filter(|&i| i >= *s && i < *e).collect())
+            }
+            (Indices(a), Indices(b)) => {
+                let set: std::collections::HashSet<usize> = a.iter().copied().collect();
+                Indices(b.iter().copied().filter(|i| set.contains(i)).collect())
+            }
+        }
+    }
 }
 
 /// Collection of coordinate filters extracted from a WHERE clause
+///
+/// Each coordinate maps to a *list* of filter kinds that are AND-composed: a row
+/// survives only if it satisfies every filter on that coordinate. This lets, e.g.,
+/// `EXTRACT(day FROM time)=15 AND EXTRACT(hour FROM time)=12` push both predicates
+/// down on `time`, and lets a range coexist with a date-part filter on one coord.
 #[derive(Debug, Clone, Default)]
 pub struct CoordFilters {
-    /// Map from coordinate name to filter kind (equality or range)
-    pub filters: HashMap<String, CoordFilterKind>,
+    /// Map from coordinate name to the AND-composed list of filter kinds.
+    pub filters: HashMap<String, Vec<CoordFilterKind>>,
 }
 
 impl CoordFilters {
@@ -135,12 +185,20 @@ impl CoordFilters {
         self.filters.is_empty()
     }
 
-    /// Get the filter for a coordinate, if any
-    pub fn get(&self, coord_name: &str) -> Option<&CoordFilterKind> {
+    /// Get the AND-composed filter list for a coordinate, if any
+    pub fn get(&self, coord_name: &str) -> Option<&Vec<CoordFilterKind>> {
         self.filters.get(coord_name)
     }
 
-    /// Number of coordinate filters
+    /// Append a filter kind to a coordinate's AND-composed list.
+    pub fn push(&mut self, coord_name: impl Into<String>, kind: CoordFilterKind) {
+        self.filters
+            .entry(coord_name.into())
+            .or_default()
+            .push(kind);
+    }
+
+    /// Number of coordinates carrying at least one filter
     pub fn len(&self) -> usize {
         self.filters.len()
     }
@@ -165,7 +223,7 @@ pub fn filter_satisfiable_by_bounds(
     filters: &CoordFilters,
     coord_meta: &[super::schema_inference::ZarrArrayMeta],
 ) -> bool {
-    for (coord_name, filter_kind) in &filters.filters {
+    for (coord_name, filter_kinds) in &filters.filters {
         // Find the coordinate metadata
         let coord = match coord_meta.iter().find(|c| &c.name == coord_name) {
             Some(c) => c,
@@ -178,46 +236,56 @@ pub fn filter_satisfiable_by_bounds(
             None => continue, // No bounds available, can't early-reject
         };
 
-        // Check if filter overlaps with coordinate bounds
-        let satisfiable = match filter_kind {
-            CoordFilterKind::DatePart { .. } => true,
-            CoordFilterKind::Eq(value) => {
-                // Equality filter: value must be within [min, max]
-                match scalar_to_f64(value) {
-                    Some(v) => v >= coord_min && v <= coord_max,
-                    None => true, // Can't check, assume satisfiable
+        // AND-composed filters: if ANY kind is outside the bounds, the whole
+        // coordinate (and query) is unsatisfiable.
+        for filter_kind in filter_kinds {
+            let satisfiable = match filter_kind {
+                CoordFilterKind::DatePart { .. } | CoordFilterKind::DatePartSet { .. } => true,
+                CoordFilterKind::Eq(value) => {
+                    // Equality filter: value must be within [min, max]
+                    match scalar_to_f64(value) {
+                        Some(v) => v >= coord_min && v <= coord_max,
+                        None => true, // Can't check, assume satisfiable
+                    }
                 }
-            }
-            CoordFilterKind::Range {
-                low,
-                high,
-                low_inclusive: _,
-                high_inclusive: _,
-            } => {
-                // Range filter: ranges must overlap
-                // Filter range [filter_low, filter_high] overlaps coord range [coord_min, coord_max]
-                // if filter_high >= coord_min AND filter_low <= coord_max
-                let filter_low = low.as_ref().and_then(scalar_to_f64);
-                let filter_high = high.as_ref().and_then(scalar_to_f64);
-
-                match (filter_low, filter_high) {
-                    (Some(fl), Some(fh)) => fh >= coord_min && fl <= coord_max,
-                    (Some(fl), None) => fl <= coord_max, // >= fl, check if fl <= max
-                    (None, Some(fh)) => fh >= coord_min, // <= fh, check if fh >= min
-                    (None, None) => true,                // Unbounded, always satisfiable
+                CoordFilterKind::InList(values) => {
+                    // Satisfiable if at least one listed value is within bounds.
+                    values.iter().any(|value| match scalar_to_f64(value) {
+                        Some(v) => v >= coord_min && v <= coord_max,
+                        None => true,
+                    })
                 }
-            }
-        };
+                CoordFilterKind::Range {
+                    low,
+                    high,
+                    low_inclusive: _,
+                    high_inclusive: _,
+                } => {
+                    // Range filter: ranges must overlap
+                    // Filter range [filter_low, filter_high] overlaps coord range [coord_min, coord_max]
+                    // if filter_high >= coord_min AND filter_low <= coord_max
+                    let filter_low = low.as_ref().and_then(scalar_to_f64);
+                    let filter_high = high.as_ref().and_then(scalar_to_f64);
 
-        if !satisfiable {
-            info!(
-                coord = %coord_name,
-                filter = %filter_kind,
-                coord_min,
-                coord_max,
-                "Early rejection: filter outside coordinate bounds"
-            );
-            return false;
+                    match (filter_low, filter_high) {
+                        (Some(fl), Some(fh)) => fh >= coord_min && fl <= coord_max,
+                        (Some(fl), None) => fl <= coord_max, // >= fl, check if fl <= max
+                        (None, Some(fh)) => fh >= coord_min, // <= fh, check if fh >= min
+                        (None, None) => true,                // Unbounded, always satisfiable
+                    }
+                }
+            };
+
+            if !satisfiable {
+                info!(
+                    coord = %coord_name,
+                    filter = %filter_kind,
+                    coord_min,
+                    coord_max,
+                    "Early rejection: filter outside coordinate bounds"
+                );
+                return false;
+            }
         }
     }
 
@@ -230,30 +298,40 @@ pub fn filter_satisfiable_by_bounds(
 /// into a single range filter.
 #[derive(Debug, Default)]
 struct PartialBounds {
-    /// Equality filter value (takes precedence over range)
+    /// Equality filter value
     eq: Option<ScalarValue>,
     /// Lower bound with inclusivity flag (value, inclusive)
     low: Option<(ScalarValue, bool)>,
     /// Upper bound with inclusivity flag (value, inclusive)
     high: Option<(ScalarValue, bool)>,
-    /// Date part filter: EXTRACT(field FROM coord) = value
-    date_part: Option<(String, i32)>,
+    /// Date part filters: EXTRACT(field FROM coord) = value. Multiple allowed
+    /// (e.g. day=15 AND hour=12), all AND-composed.
+    date_parts: Vec<(String, i32)>,
+    /// Membership over raw values: coord IN (...)
+    in_list: Option<Vec<ScalarValue>>,
+    /// Date part membership: EXTRACT(field FROM coord) IN (...)
+    date_part_sets: Vec<(String, Vec<i32>)>,
 }
 
 impl PartialBounds {
-    /// Convert partial bounds into a CoordFilterKind
-    fn into_filter(self) -> Option<CoordFilterKind> {
-        // Equality takes precedence
+    /// Convert partial bounds into the AND-composed list of filter kinds.
+    ///
+    /// Unlike the old fixed precedence (eq > range > date_part, which silently
+    /// dropped the losers), every collected predicate is emitted; the resolver
+    /// intersects their position sets so they all apply.
+    fn into_filters(self) -> Vec<CoordFilterKind> {
+        let mut out = Vec::new();
+
         if let Some(value) = self.eq {
-            return Some(CoordFilterKind::Eq(value));
+            out.push(CoordFilterKind::Eq(value));
         }
 
-        // Convert bounds to range filter if any bounds exist
+        // Convert bounds to a range filter if any bound exists
         if self.low.is_some() || self.high.is_some() {
             let (low, low_inclusive) = self.low.map(|(v, i)| (Some(v), i)).unwrap_or((None, true));
             let (high, high_inclusive) =
                 self.high.map(|(v, i)| (Some(v), i)).unwrap_or((None, true));
-            return Some(CoordFilterKind::Range {
+            out.push(CoordFilterKind::Range {
                 low,
                 high,
                 low_inclusive,
@@ -261,11 +339,19 @@ impl PartialBounds {
             });
         }
 
-        if let Some((field, value)) = self.date_part {
-            return Some(CoordFilterKind::DatePart { field, value });
+        for (field, value) in self.date_parts {
+            out.push(CoordFilterKind::DatePart { field, value });
         }
 
-        None
+        if let Some(values) = self.in_list {
+            out.push(CoordFilterKind::InList(values));
+        }
+
+        for (field, values) in self.date_part_sets {
+            out.push(CoordFilterKind::DatePartSet { field, values });
+        }
+
+        out
     }
 }
 
@@ -296,8 +382,9 @@ pub fn parse_coord_filters(filters: &[Expr], coord_names: &[String]) -> CoordFil
     // Convert partial bounds to final filter kinds
     let mut result = CoordFilters::new();
     for (coord_name, bounds) in partial_bounds {
-        if let Some(filter) = bounds.into_filter() {
-            result.filters.insert(coord_name, filter);
+        let kinds = bounds.into_filters();
+        if !kinds.is_empty() {
+            result.filters.insert(coord_name, kinds);
         }
     }
 
@@ -305,7 +392,10 @@ pub fn parse_coord_filters(filters: &[Expr], coord_names: &[String]) -> CoordFil
         let filter_info: Vec<_> = result
             .filters
             .iter()
-            .map(|(k, v)| format!("{}{}", k, v))
+            .map(|(k, v)| {
+                let joined: Vec<String> = v.iter().map(|f| f.to_string()).collect();
+                format!("{}: [{}]", k, joined.join(" AND "))
+            })
             .collect();
         info!(
             num_filters = result.len(),
@@ -359,7 +449,11 @@ fn extract_filters(
                         value = %value,
                         "Found date_part equality filter"
                     );
-                    partial_bounds.entry(col_name).or_default().date_part = Some((field, value));
+                    partial_bounds
+                        .entry(col_name)
+                        .or_default()
+                        .date_parts
+                        .push((field, value));
                 }
             }
         }
@@ -433,6 +527,50 @@ fn extract_filters(
                         let bounds = partial_bounds.entry(col_name).or_default();
                         bounds.low = Some((low_val, true));
                         bounds.high = Some((high_val, true));
+                    }
+                }
+            }
+        }
+
+        // Handle IN lists: `coord IN (v1, v2, ...)` or
+        // `EXTRACT(field FROM coord) IN (v1, v2, ...)`. Negated (NOT IN) is skipped.
+        Expr::InList(in_list) if !in_list.negated => {
+            // Case 1: raw coordinate column IN (literals)
+            if let Some(col_name) = extract_column_name(&in_list.expr) {
+                if coord_names.contains(&col_name) {
+                    let values: Option<Vec<ScalarValue>> =
+                        in_list.list.iter().map(extract_literal).collect();
+                    if let Some(values) = values {
+                        if !values.is_empty() {
+                            debug!(coord = %col_name, count = values.len(), "Found IN list filter");
+                            partial_bounds.entry(col_name).or_default().in_list = Some(values);
+                        }
+                    } else {
+                        trace!(coord = %col_name, "IN list has non-literal members, skipping");
+                    }
+                }
+            }
+            // Case 2: EXTRACT(field FROM coord) IN (int literals)
+            else if let Some((col_name, field)) = extract_date_part_call(&in_list.expr) {
+                if coord_names.contains(&col_name) {
+                    let values: Option<Vec<i32>> = in_list
+                        .list
+                        .iter()
+                        .map(|e| match extract_literal(e) {
+                            Some(ScalarValue::Int32(Some(v))) => Some(v),
+                            Some(ScalarValue::Int64(Some(v))) => Some(v as i32),
+                            _ => None,
+                        })
+                        .collect();
+                    if let Some(values) = values {
+                        if !values.is_empty() {
+                            debug!(coord = %col_name, field = %field, count = values.len(), "Found EXTRACT IN list filter");
+                            partial_bounds
+                                .entry(col_name)
+                                .or_default()
+                                .date_part_sets
+                                .push((field, values));
+                        }
                     }
                 }
             }
@@ -544,6 +682,25 @@ fn extract_date_part_eq(left: &Expr, right: &Expr) -> Option<(String, String, i3
     Some((col_name, field, value))
 }
 
+/// Extract `(coord_name, field)` from a bare `date_part(field, coord)` call.
+///
+/// This is the `EXTRACT(field FROM coord)` sub-expression without the `= value`
+/// part — used for `EXTRACT(field FROM coord) IN (...)`.
+fn extract_date_part_call(expr: &Expr) -> Option<(String, String)> {
+    let Expr::ScalarFunction(sf) = expr else {
+        return None;
+    };
+    if sf.func.name() != "date_part" || sf.args.len() != 2 {
+        return None;
+    }
+    let field = match extract_literal(&sf.args[0]) {
+        Some(ScalarValue::Utf8(Some(s))) => s,
+        _ => return None,
+    };
+    let col_name = extract_column_name(&sf.args[1])?;
+    Some((col_name, field))
+}
+
 /// Extract column name from expression, handling Cast wrappers
 fn extract_column_name(expr: &Expr) -> Option<String> {
     match expr {
@@ -605,60 +762,86 @@ pub fn calculate_coord_ranges(
     let mut selections = Vec::with_capacity(coord_names.len());
 
     for (i, name) in coord_names.iter().enumerate() {
-        let selection = resolve_coord_selection(name, filters.get(name), &coord_values[i])?;
+        let selection =
+            resolve_coord_selection(name, filters.get(name).map(Vec::as_slice), &coord_values[i])?;
         selections.push(selection);
     }
 
     Some(selections)
 }
 
-/// Resolve a single coordinate's filter into a [`CoordSelection`] over its values.
+/// Resolve a coordinate's AND-composed filter list into a single [`CoordSelection`].
 ///
-/// - `None` filter => the full range `[0, len)` (coordinate is unconstrained).
-/// - `DatePart`    => the scattered `Indices` of matching values.
-/// - other filters => the contiguous `Range` of matching values.
+/// - `None`/empty filters => the full range `[0, len)` (coordinate is unconstrained).
+/// - a single filter      => its matching positions (see [`resolve_single_filter`]).
+/// - multiple filters     => the intersection of each filter's positions.
 ///
-/// Returns `None` when a *present* filter matches no values — i.e. the query
-/// yields an empty result for this coordinate. (A `None` filter never yields
-/// `None`; it is always satisfiable as the full range.)
+/// Returns `None` when the composed selection matches no values — i.e. the query
+/// yields an empty result for this coordinate. (No filters never yields `None`;
+/// it is always satisfiable as the full range.)
 pub fn resolve_coord_selection(
     name: &str,
-    filter: Option<&CoordFilterKind>,
+    filters: Option<&[CoordFilterKind]>,
     values: &CoordValuesRef<'_>,
 ) -> Option<CoordSelection> {
-    let Some(filter) = filter else {
-        return Some(CoordSelection::Range(0, values.len()));
+    let filters = match filters {
+        Some(f) if !f.is_empty() => f,
+        _ => return Some(CoordSelection::Range(0, values.len())),
     };
+
+    let mut acc: Option<CoordSelection> = None;
+    for filter in filters {
+        let sel = resolve_single_filter(name, filter, values)?;
+        acc = Some(match acc {
+            None => sel,
+            Some(prev) => prev.intersect(&sel),
+        });
+        if acc.as_ref().is_some_and(CoordSelection::is_empty) {
+            warn!(
+                coord = %name,
+                "AND-composed filters matched no values - query will return no results"
+            );
+            return None;
+        }
+    }
+    acc
+}
+
+/// Resolve one filter kind into the positions it selects on the coordinate.
+///
+/// Returns `None` when this filter matches nothing. `DatePart`/`InList`/`DatePartSet`
+/// produce scattered `Indices`; `Eq`/`Range` produce a contiguous `Range`.
+fn resolve_single_filter(
+    name: &str,
+    filter: &CoordFilterKind,
+    values: &CoordValuesRef<'_>,
+) -> Option<CoordSelection> {
     match filter {
         CoordFilterKind::DatePart { field, value } => {
             let indices = find_date_part_indices(values, field, *value);
-            if indices.is_empty() {
-                warn!(
-                    coord = %name,
-                    field = %field,
-                    value = %value,
-                    "DatePart filter matched no coordinate values"
-                );
-                return None;
-            }
-            debug!(
-                coord = %name,
-                field = %field,
-                value = %value,
-                count = indices.len(),
-                "DatePart filter matched indices"
-            );
-            Some(CoordSelection::Indices(indices))
+            non_empty_indices(name, indices)
         }
-        _ => {
+        CoordFilterKind::DatePartSet { field, values: vs } => {
+            let mut indices: Vec<usize> = Vec::new();
+            for v in vs {
+                indices.extend(find_date_part_indices(values, field, *v));
+            }
+            indices.sort_unstable();
+            indices.dedup();
+            non_empty_indices(name, indices)
+        }
+        CoordFilterKind::InList(list) => {
+            let mut indices: Vec<usize> = list
+                .iter()
+                .filter_map(|v| find_value_index(values, v))
+                .collect();
+            indices.sort_unstable();
+            indices.dedup();
+            non_empty_indices(name, indices)
+        }
+        CoordFilterKind::Eq(_) | CoordFilterKind::Range { .. } => {
             if let Some((start, end)) = find_filter_range(values, filter) {
-                debug!(
-                    coord = %name,
-                    filter = %filter,
-                    start,
-                    end,
-                    "Found filter range"
-                );
+                debug!(coord = %name, filter = %filter, start, end, "Found filter range");
                 Some(CoordSelection::Range(start, end))
             } else {
                 warn!(
@@ -669,6 +852,17 @@ pub fn resolve_coord_selection(
                 None
             }
         }
+    }
+}
+
+/// Wrap matched positions as `Indices`, or `None` (with a warning) if empty.
+fn non_empty_indices(name: &str, indices: Vec<usize>) -> Option<CoordSelection> {
+    if indices.is_empty() {
+        warn!(coord = %name, "Filter matched no coordinate values");
+        None
+    } else {
+        debug!(coord = %name, count = indices.len(), "Filter matched indices");
+        Some(CoordSelection::Indices(indices))
     }
 }
 
@@ -1211,10 +1405,13 @@ fn find_filter_range(
                 None
             }
         }
-        // DatePart filters are not resolvable to a contiguous index range —
-        // they match scattered indices across the coordinate array.
-        // Callers that use find_filter_range must handle this case separately.
-        CoordFilterKind::DatePart { .. } => None,
+        // These filters are not resolvable to a contiguous index range — they
+        // match scattered indices across the coordinate array. Callers that use
+        // find_filter_range must handle these cases separately (see
+        // resolve_single_filter).
+        CoordFilterKind::DatePart { .. }
+        | CoordFilterKind::DatePartSet { .. }
+        | CoordFilterKind::InList(_) => None,
     }
 }
 
@@ -1635,7 +1832,7 @@ mod tests {
         let r = CoordValuesRef::Int64(&vals);
         let f = CoordFilterKind::Eq(ScalarValue::Int64(Some(30)));
         assert_eq!(
-            resolve_coord_selection("c", Some(&f), &r),
+            resolve_coord_selection("c", Some(std::slice::from_ref(&f)), &r),
             Some(CoordSelection::Range(2, 3))
         );
     }
@@ -1645,7 +1842,10 @@ mod tests {
         let vals = vec![10i64, 20, 30];
         let r = CoordValuesRef::Int64(&vals);
         let f = CoordFilterKind::Eq(ScalarValue::Int64(Some(999)));
-        assert_eq!(resolve_coord_selection("c", Some(&f), &r), None);
+        assert_eq!(
+            resolve_coord_selection("c", Some(std::slice::from_ref(&f)), &r),
+            None
+        );
     }
 
     #[test]
@@ -2218,10 +2418,7 @@ mod tests {
         }];
 
         let mut filters = CoordFilters::new();
-        filters.filters.insert(
-            "lat".to_string(),
-            CoordFilterKind::Eq(ScalarValue::Float64(Some(45.0))),
-        );
+        filters.push("lat", CoordFilterKind::Eq(ScalarValue::Float64(Some(45.0))));
 
         assert!(filter_satisfiable_by_bounds(&filters, &coords));
     }
@@ -2241,8 +2438,8 @@ mod tests {
         }];
 
         let mut filters = CoordFilters::new();
-        filters.filters.insert(
-            "lat".to_string(),
+        filters.push(
+            "lat",
             CoordFilterKind::Eq(ScalarValue::Float64(Some(100.0))),
         );
 
@@ -2264,8 +2461,8 @@ mod tests {
         }];
 
         let mut filters = CoordFilters::new();
-        filters.filters.insert(
-            "time".to_string(),
+        filters.push(
+            "time",
             CoordFilterKind::Range {
                 low: Some(ScalarValue::Int64(Some(50))),
                 high: Some(ScalarValue::Int64(Some(150))),
@@ -2293,8 +2490,8 @@ mod tests {
         }];
 
         let mut filters = CoordFilters::new();
-        filters.filters.insert(
-            "time".to_string(),
+        filters.push(
+            "time",
             CoordFilterKind::Range {
                 low: Some(ScalarValue::Int64(Some(200))),
                 high: Some(ScalarValue::Int64(Some(300))),
@@ -2322,8 +2519,8 @@ mod tests {
         }];
 
         let mut filters = CoordFilters::new();
-        filters.filters.insert(
-            "lat".to_string(),
+        filters.push(
+            "lat",
             CoordFilterKind::Eq(ScalarValue::Float64(Some(999.0))),
         );
 
@@ -2347,8 +2544,8 @@ mod tests {
 
         // Test >= 170 (overlaps with coord max 180)
         let mut filters = CoordFilters::new();
-        filters.filters.insert(
-            "lon".to_string(),
+        filters.push(
+            "lon",
             CoordFilterKind::Range {
                 low: Some(ScalarValue::Float64(Some(170.0))),
                 high: None,
@@ -2360,8 +2557,8 @@ mod tests {
 
         // Test >= 200 (completely outside)
         let mut filters = CoordFilters::new();
-        filters.filters.insert(
-            "lon".to_string(),
+        filters.push(
+            "lon",
             CoordFilterKind::Range {
                 low: Some(ScalarValue::Float64(Some(200.0))),
                 high: None,
@@ -2439,5 +2636,197 @@ mod tests {
         let values = CoordValuesRef::Float32(&floats);
         let indices = find_date_part_indices(&values, "MONTH", 12);
         assert!(indices.is_empty());
+    }
+
+    // ====================================================================
+    // Filter composition: multiple AND-composed filters per coordinate
+    // ====================================================================
+
+    use chrono::{TimeZone, Utc};
+
+    /// Hourly timestamps spanning two days so date-part filters scatter.
+    fn hourly_timestamps(days: i64) -> Vec<i64> {
+        let base = Utc
+            .with_ymd_and_hms(2026, 1, 14, 0, 0, 0)
+            .unwrap()
+            .timestamp_micros();
+        let hour = 3_600_000_000i64;
+        (0..(days * 24)).map(|i| base + i * hour).collect()
+    }
+
+    // -------- CoordSelection::intersect --------
+
+    #[test]
+    fn intersect_range_range() {
+        let a = CoordSelection::Range(2, 10);
+        let b = CoordSelection::Range(5, 20);
+        assert_eq!(a.intersect(&b), CoordSelection::Range(5, 10));
+    }
+
+    #[test]
+    fn intersect_range_range_disjoint_is_empty() {
+        let a = CoordSelection::Range(0, 3);
+        let b = CoordSelection::Range(5, 9);
+        let r = a.intersect(&b);
+        assert!(r.is_empty());
+    }
+
+    #[test]
+    fn intersect_range_indices_filters_to_window() {
+        let r = CoordSelection::Range(3, 8);
+        let idx = CoordSelection::Indices(vec![1, 4, 5, 9]);
+        assert_eq!(r.intersect(&idx), CoordSelection::Indices(vec![4, 5]));
+        // Order-independent
+        assert_eq!(idx.intersect(&r), CoordSelection::Indices(vec![4, 5]));
+    }
+
+    #[test]
+    fn intersect_indices_indices() {
+        let a = CoordSelection::Indices(vec![1, 3, 5, 7, 9]);
+        let b = CoordSelection::Indices(vec![3, 4, 5, 6, 9]);
+        assert_eq!(a.intersect(&b), CoordSelection::Indices(vec![3, 5, 9]));
+    }
+
+    // -------- AND-composition of two date parts (the headline fix) --------
+
+    #[test]
+    fn two_date_parts_and_compose() {
+        // EXTRACT(day FROM time)=15 AND EXTRACT(hour FROM time)=12
+        // Both must survive; old code kept only the last.
+        let coord_names = vec!["time".to_string()];
+        let filter = date_part_eq("DAY", 15).and(date_part_eq("HOUR", 12));
+
+        let parsed = parse_coord_filters(&[filter], &coord_names);
+        let kinds = parsed.get("time").expect("time has filters");
+        assert_eq!(kinds.len(), 2, "both date-part predicates retained");
+
+        // Resolve against 2 days of hourly data: exactly one position (day 15, 12:00).
+        let ts = hourly_timestamps(2);
+        let values = CoordValuesRef::TimestampMicros(&ts);
+        let sel = resolve_coord_selection("time", Some(kinds.as_slice()), &values).unwrap();
+        // Day 15 is the 2nd day (index 24..48); hour 12 within it => index 24+12 = 36.
+        assert_eq!(sel, CoordSelection::Indices(vec![36]));
+    }
+
+    #[test]
+    fn range_and_date_part_coexist() {
+        // time BETWEEN <day14-noon> AND <day15-end> AND EXTRACT(hour)=12
+        let ts = hourly_timestamps(2); // indices 0..48
+        let values = CoordValuesRef::TimestampMicros(&ts);
+
+        // Range covering indices 12..48 (from 2026-01-14 12:00 onward).
+        let low = ts[12];
+        let high = ts[47];
+        let kinds = vec![
+            CoordFilterKind::Range {
+                low: Some(ScalarValue::TimestampMicrosecond(
+                    Some(low),
+                    Some("UTC".into()),
+                )),
+                high: Some(ScalarValue::TimestampMicrosecond(
+                    Some(high),
+                    Some("UTC".into()),
+                )),
+                low_inclusive: true,
+                high_inclusive: true,
+            },
+            CoordFilterKind::DatePart {
+                field: "HOUR".to_string(),
+                value: 12,
+            },
+        ];
+        let sel = resolve_coord_selection("time", Some(&kinds), &values).unwrap();
+        // hour==12 positions are 12 and 36; both fall in [12,47] => both kept.
+        assert_eq!(sel, CoordSelection::Indices(vec![12, 36]));
+    }
+
+    #[test]
+    fn and_compose_empty_intersection_is_none() {
+        // hour=12 AND hour=13 can never both hold -> no rows.
+        let ts = hourly_timestamps(1);
+        let values = CoordValuesRef::TimestampMicros(&ts);
+        let kinds = vec![
+            CoordFilterKind::DatePart {
+                field: "HOUR".to_string(),
+                value: 12,
+            },
+            CoordFilterKind::DatePart {
+                field: "HOUR".to_string(),
+                value: 13,
+            },
+        ];
+        assert_eq!(resolve_coord_selection("time", Some(&kinds), &values), None);
+    }
+
+    // -------- IN lists --------
+
+    #[test]
+    fn parse_in_list_raw_values() {
+        let coord_names = vec!["level".to_string()];
+        let filter = col("level").in_list(vec![lit(500i64), lit(850i64)], false);
+        let parsed = parse_coord_filters(&[filter], &coord_names);
+        let kinds = parsed.get("level").expect("level filtered");
+        assert_eq!(kinds.len(), 1);
+        match &kinds[0] {
+            CoordFilterKind::InList(vals) => assert_eq!(vals.len(), 2),
+            other => panic!("expected InList, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn resolve_in_list_is_union_of_positions() {
+        let levels = vec![100i64, 200, 500, 850, 1000];
+        let values = CoordValuesRef::Int64(&levels);
+        let kinds = vec![CoordFilterKind::InList(vec![
+            ScalarValue::Int64(Some(850)),
+            ScalarValue::Int64(Some(200)),
+            ScalarValue::Int64(Some(9999)), // no match, ignored
+        ])];
+        let sel = resolve_coord_selection("level", Some(&kinds), &values).unwrap();
+        // Positions of 200 and 850, sorted ascending.
+        assert_eq!(sel, CoordSelection::Indices(vec![1, 3]));
+    }
+
+    #[test]
+    fn parse_extract_in_list_lowers_to_date_part_set() {
+        let coord_names = vec!["time".to_string()];
+        // EXTRACT(MONTH FROM time) IN (12, 1, 2)
+        let extract_month =
+            datafusion::functions::datetime::date_part().call(vec![lit("MONTH"), col("time")]);
+        let filter = extract_month.in_list(vec![lit(12i32), lit(1i32), lit(2i32)], false);
+        let parsed = parse_coord_filters(&[filter], &coord_names);
+        let kinds = parsed.get("time").expect("time filtered");
+        match &kinds[0] {
+            CoordFilterKind::DatePartSet { field, values } => {
+                assert_eq!(field, "MONTH");
+                assert_eq!(values, &vec![12, 1, 2]);
+            }
+            other => panic!("expected DatePartSet, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn resolve_date_part_set_unions_matching_positions() {
+        // Months: Jan, Feb, Jun, Dec -> DJF set {12,1,2} keeps Jan, Feb, Dec.
+        let to_micros = |m| {
+            Utc.with_ymd_and_hms(2026, m, 1, 0, 0, 0)
+                .unwrap()
+                .timestamp_micros()
+        };
+        let ts = vec![to_micros(1), to_micros(2), to_micros(6), to_micros(12)];
+        let values = CoordValuesRef::TimestampMicros(&ts);
+        let kinds = vec![CoordFilterKind::DatePartSet {
+            field: "MONTH".to_string(),
+            values: vec![12, 1, 2],
+        }];
+        let sel = resolve_coord_selection("time", Some(&kinds), &values).unwrap();
+        assert_eq!(sel, CoordSelection::Indices(vec![0, 1, 3]));
+    }
+
+    /// Build a `date_part(field, time) = value` expression like DataFusion lowers EXTRACT to.
+    fn date_part_eq(field: &str, value: i32) -> Expr {
+        datafusion::functions::datetime::date_part()
+            .call(vec![lit(field), col("time")])
+            .eq(lit(value))
     }
 }

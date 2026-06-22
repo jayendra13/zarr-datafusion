@@ -35,6 +35,17 @@ fn zarr_err(e: impl std::error::Error + Send + Sync + 'static) -> DataFusionErro
     DataFusionError::External(Box::new(e))
 }
 
+/// Extract the key type from a coordinate field's declared `Dictionary` type.
+///
+/// Falls back to `Int16` for non-dictionary fields (shouldn't happen for
+/// coordinates, but keeps the reader robust to schema surprises).
+fn dictionary_key_type(field_type: &DataType) -> &DataType {
+    match field_type {
+        DataType::Dictionary(key_type, _) => key_type,
+        _ => &DataType::Int16,
+    }
+}
+
 /// Get element size in bytes for a Zarr data type string
 fn dtype_to_bytes(dtype: &str) -> u64 {
     match dtype {
@@ -348,51 +359,187 @@ fn extract_filtered_coords(
     }
 }
 
-/// Expand coordinate selections into `ArraySubset`s for zarr chunk reading.
+/// Expand coordinate selections into [`ReadPlan`]s for zarr reading.
 ///
-/// All-Range selections produce a single subset (one read, existing behavior).
-/// A selection containing `Indices` produces one subset per index — each a
-/// single-step Range in that dimension — so scattered chunks are read individually
-/// and their results concatenated by the caller.
-fn build_read_subsets(
+/// All-Range selections produce a single plan (one read, `Keep::All`).
+///
+/// A selection containing scattered `Indices` (e.g. the surviving time positions
+/// from `EXTRACT(month..)=12 AND EXTRACT(day..)=15 ...`) is handled one of two
+/// ways:
+///
+/// - **Chunk-bucketed** (the heuristic): when the `Indices` coordinate maps to the
+///   *outer* data-var dimension (dim 0) and that dimension's chunk extent is known
+///   and > 1, the survivors are grouped per chunk via [`bucket_outer_indices`]. Each
+///   occupied chunk becomes one read of a tight window plus a `Keep::Offsets` mask
+///   that gathers the surviving rows. A chunk holding K survivors is read once
+///   instead of K times, and empty chunks are skipped.
+/// - **Per-index fallback** (previous behavior): otherwise, one single-step read
+///   per surviving index with `Keep::All`. Used when chunk geometry is unknown, the
+///   chunk length is 1, or the scattered dimension is not dim 0 (where the
+///   `Keep::Offsets` row layout would not hold).
+fn build_read_plans(
     selections: &[CoordSelection],
     coord_sizes: &[usize],
     data_var_shape: &[u64],
-) -> Vec<ArraySubset> {
+    data_var_chunks: Option<&[u64]>,
+) -> Vec<ReadPlan> {
+    // Build the ArraySubset for `selections` with coord `pos` replaced by `repl`.
+    let subset_for = |pos: usize, repl: CoordSelection| -> ArraySubset {
+        let expanded: Vec<CoordSelection> = selections
+            .iter()
+            .enumerate()
+            .map(|(i, s)| if i == pos { repl.clone() } else { s.clone() })
+            .collect();
+        let array_ranges = match_ranges_to_data_var(coord_sizes, &expanded, data_var_shape)
+            .unwrap_or_else(|| data_var_shape.iter().map(|&s| 0..s).collect());
+        ArraySubset::new_with_ranges(&array_ranges)
+    };
+
     let indices_pos = selections
         .iter()
         .position(|s| matches!(s, CoordSelection::Indices(_)));
 
-    match indices_pos {
+    let pos = match indices_pos {
         None => {
             let array_ranges = match_ranges_to_data_var(coord_sizes, selections, data_var_shape)
                 .unwrap_or_else(|| data_var_shape.iter().map(|&s| 0..s).collect());
-            vec![ArraySubset::new_with_ranges(&array_ranges)]
+            return vec![ReadPlan {
+                subset: ArraySubset::new_with_ranges(&array_ranges),
+                keep: Keep::All,
+            }];
         }
-        Some(pos) => {
-            let CoordSelection::Indices(ref indices) = selections[pos] else {
-                unreachable!()
-            };
-            indices
-                .iter()
-                .map(|&idx| {
-                    let expanded: Vec<CoordSelection> = selections
-                        .iter()
-                        .enumerate()
-                        .map(|(i, s)| {
-                            if i == pos {
-                                CoordSelection::Range(idx, idx + 1)
-                            } else {
-                                s.clone()
-                            }
-                        })
-                        .collect();
-                    let array_ranges =
-                        match_ranges_to_data_var(coord_sizes, &expanded, data_var_shape)
-                            .unwrap_or_else(|| data_var_shape.iter().map(|&s| 0..s).collect());
-                    ArraySubset::new_with_ranges(&array_ranges)
+        Some(pos) => pos,
+    };
+
+    let CoordSelection::Indices(ref indices) = selections[pos] else {
+        unreachable!()
+    };
+
+    // Chunk-bucketing applies only when the scattered coord is the OUTER data-var
+    // dimension (dim 0): the `Keep::Offsets` gather assumes each outer step is a
+    // contiguous inner block, which holds only when that step is the slowest-varying
+    // (row-major) axis. Map the coord to its data-var dim by size.
+    let outer_dim = data_var_shape
+        .iter()
+        .position(|&d| d as usize == coord_sizes[pos]);
+    let chunk_len = match (data_var_chunks, outer_dim) {
+        (Some(chunks), Some(0)) => chunks.first().copied().map(|c| c as usize),
+        _ => None,
+    };
+
+    if let Some(chunk_len) = chunk_len.filter(|&c| c > 1) {
+        let buckets = bucket_outer_indices(indices, chunk_len);
+        if !buckets.is_empty() {
+            return buckets
+                .into_iter()
+                .map(|(start, end, offsets)| ReadPlan {
+                    subset: subset_for(pos, CoordSelection::Range(start, end)),
+                    keep: Keep::Offsets {
+                        window_len: end - start,
+                        offsets,
+                    },
                 })
-                .collect()
+                .collect();
+        }
+    }
+
+    // Per-index fallback: one single-step read per surviving index.
+    indices
+        .iter()
+        .map(|&idx| ReadPlan {
+            subset: subset_for(pos, CoordSelection::Range(idx, idx + 1)),
+            keep: Keep::All,
+        })
+        .collect()
+}
+
+/// Group sorted outer-axis indices into chunk-aligned read windows.
+///
+/// Given surviving indices on the outer (chunked) dimension — e.g. the scattered
+/// time positions produced by `EXTRACT(month..)=12 AND EXTRACT(day..)=15 ...` —
+/// and the chunk extent `chunk_len` along that dimension, returns one bucket per
+/// chunk that contains at least one survivor.
+///
+/// Each bucket is `(window_start, window_end, offsets)`:
+/// - `[window_start, window_end)` is a half-open window that never crosses a chunk
+///   boundary (so reading it touches exactly one chunk), tightened to the span of
+///   survivors it covers; and
+/// - `offsets` are the survivors' positions *relative to `window_start`*, used to
+///   gather the surviving rows out of the window after the read.
+///
+/// This is what turns "one read per surviving index" into "one read per occupied
+/// chunk": a chunk holding K survivors is fetched/decompressed once instead of K
+/// times, and a chunk holding none is never touched. `indices` must be sorted
+/// ascending and de-duplicated (as produced by the filter resolver). Returns an
+/// empty vec when `chunk_len == 0` (caller should fall back to the per-index path).
+fn bucket_outer_indices(indices: &[usize], chunk_len: usize) -> Vec<(usize, usize, Vec<usize>)> {
+    let mut buckets: Vec<(usize, usize, Vec<usize>)> = Vec::new();
+    if chunk_len == 0 {
+        return buckets;
+    }
+    for &idx in indices {
+        match buckets.last_mut() {
+            // Same chunk as the open bucket: extend its window and record the offset.
+            Some((start, end, offsets)) if idx / chunk_len == *start / chunk_len => {
+                *end = idx + 1;
+                offsets.push(idx - *start);
+            }
+            // First survivor of a new chunk: open a fresh bucket.
+            _ => buckets.push((idx, idx + 1, vec![0])),
+        }
+    }
+    buckets
+}
+
+/// What to keep from the array returned for a single [`ReadPlan`] subset read.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Keep {
+    /// Keep the whole read (contiguous Range subsets, and the per-index fallback).
+    All,
+    /// The subset spans a chunk window of `window_len` outer steps; keep only the
+    /// survivors at these `offsets` (relative to the window start). Each offset
+    /// expands to a contiguous inner block of `len / window_len` rows.
+    Offsets {
+        window_len: usize,
+        offsets: Vec<usize>,
+    },
+}
+
+/// A single planned read: which `subset` to retrieve, and which rows to `keep`
+/// from the result (see [`Keep`]).
+struct ReadPlan {
+    subset: ArraySubset,
+    keep: Keep,
+}
+
+/// Gather the surviving rows from one subset's read result per its [`Keep`] rule.
+///
+/// For `Keep::All` the array is returned unchanged. For `Keep::Offsets` the array
+/// is a flattened row-major block of `window_len` outer steps; each kept offset
+/// selects the contiguous `inner = len / window_len` rows belonging to that outer
+/// step, and the kept blocks are concatenated in offset order. This is what makes
+/// a chunk-granular read produce exactly the per-index filter result.
+fn apply_keep(array: ArrayRef, keep: &Keep) -> Result<ArrayRef> {
+    match keep {
+        Keep::All => Ok(array),
+        Keep::Offsets {
+            window_len,
+            offsets,
+        } => {
+            let len = array.len();
+            // window_len always divides len (len = window_len * inner). Guard a
+            // zero window so a degenerate plan can't panic on divide-by-zero.
+            let inner = if *window_len == 0 {
+                0
+            } else {
+                len / *window_len
+            };
+            let parts: Vec<ArrayRef> = offsets
+                .iter()
+                .map(|&off| array.slice(off * inner, inner))
+                .collect();
+            let refs: Vec<&dyn arrow::array::Array> = parts.iter().map(|a| a.as_ref()).collect();
+            arrow::compute::concat(&refs).map_err(DataFusionError::from)
         }
     }
 }
@@ -660,7 +807,7 @@ pub fn resolve_outer_selection(
 
     let refs = coord_values_to_refs(std::slice::from_ref(&values));
     Ok(
-        match resolve_coord_selection(&coord.name, Some(filter), &refs[0]) {
+        match resolve_coord_selection(&coord.name, Some(filter.as_slice()), &refs[0]) {
             Some(sel) => OuterSelection::Resolved(sel),
             None => OuterSelection::Empty,
         },
@@ -697,7 +844,7 @@ pub async fn resolve_outer_selection_async(
 
     let refs = coord_values_to_refs(std::slice::from_ref(&values));
     Ok(
-        match resolve_coord_selection(&coord.name, Some(filter), &refs[0]) {
+        match resolve_coord_selection(&coord.name, Some(filter.as_slice()), &refs[0]) {
             Some(sel) => OuterSelection::Resolved(sel),
             None => OuterSelection::Empty,
         },
@@ -926,12 +1073,15 @@ pub fn read_zarr(
                 .position(|&i| i == coord_idx)
                 .unwrap();
 
-            // Create DictionaryArray for coordinate (memory efficient)
+            // Create DictionaryArray for coordinate (memory efficient).
+            // Key width comes from the schema field so the array matches the
+            // declared dictionary key type (Int16/Int32/Int64).
             let dict_array = create_coord_dictionary_typed(
                 &filtered_coord_values[coord_idx],
                 query_coord_idx,
                 &query_coord_sizes,
                 final_rows,
+                dictionary_key_type(field.data_type()),
             );
             result_arrays.push(dict_array);
         } else {
@@ -940,17 +1090,38 @@ pub fn read_zarr(
             let arr = Array::open(store.clone(), &format!("/{}", field_name)).map_err(zarr_err)?;
             let data_var_shape = arr.shape();
 
-            // Build subsets: one for all-Range filters, N for Indices (scattered chunks)
-            let subsets = if let Some(ref sels) = coord_ranges {
-                build_read_subsets(sels, &coord_sizes, data_var_shape)
-            } else {
-                vec![ArraySubset::new_with_shape(arr.shape().to_vec())]
-            };
-            let num_elements: u64 = subsets.iter().map(|s| s.num_elements()).sum();
+            // Chunk shape of this variable (from discovery metadata). Used by the
+            // chunk-bucketing heuristic to coalesce scattered outer-axis (e.g. time)
+            // reads onto chunk boundaries instead of one read per surviving index.
+            let data_var_chunks: Option<Vec<u64>> = store_meta
+                .data_vars
+                .iter()
+                .find(|v| v.name == *field_name)
+                .and_then(|v| v.chunks.clone());
+            debug!(field = %field_name, chunks = ?data_var_chunks, "Data variable chunk shape");
 
-            let mut parts: Vec<ArrayRef> = Vec::with_capacity(subsets.len());
-            for subset in &subsets {
-                parts.push(read_data_array!(sync, arr, subset, field.data_type()));
+            // Build read plans: one for all-Range filters; for scattered outer-axis
+            // (e.g. time) indices, one per occupied chunk with a keep-mask.
+            let plans = if let Some(ref sels) = coord_ranges {
+                build_read_plans(
+                    sels,
+                    &coord_sizes,
+                    data_var_shape,
+                    data_var_chunks.as_deref(),
+                )
+            } else {
+                vec![ReadPlan {
+                    subset: ArraySubset::new_with_shape(arr.shape().to_vec()),
+                    keep: Keep::All,
+                }]
+            };
+            // Elements actually fetched (chunk windows may include non-survivors).
+            let num_elements: u64 = plans.iter().map(|p| p.subset.num_elements()).sum();
+
+            let mut parts: Vec<ArrayRef> = Vec::with_capacity(plans.len());
+            for plan in &plans {
+                let raw = read_data_array!(sync, arr, &plan.subset, field.data_type());
+                parts.push(apply_keep(raw, &plan.keep)?);
             }
             let array: ArrayRef = if parts.len() == 1 {
                 parts.remove(0)
@@ -1260,12 +1431,14 @@ pub async fn read_zarr_async(
 
             debug!(field = %field_name, coord_idx, query_coord_idx, "Building dictionary array for coordinate");
             // Create DictionaryArray for coordinate (memory efficient)
-            // Use query_coord_idx for position within the effective coordinate set
+            // Use query_coord_idx for position within the effective coordinate set.
+            // Key width comes from the schema field's declared dictionary key type.
             let dict_array = create_coord_dictionary_typed(
                 &filtered_coord_values[coord_idx],
                 query_coord_idx,
                 &query_coord_sizes,
                 effective_rows,
+                dictionary_key_type(field.data_type()),
             );
             result_arrays.push(dict_array);
         } else {
@@ -1287,19 +1460,35 @@ pub async fn read_zarr_async(
             // Build subsets: one for all-Range filters, N for Indices (scattered chunks)
             let full_elements: u64 = arr.shape().iter().product();
             let data_var_shape = arr.shape();
-            let subsets = if let Some(ref sels) = coord_ranges {
-                let subsets = build_read_subsets(sels, &coord_sizes, data_var_shape);
-                let subset_elements: u64 = subsets.iter().map(|s| s.num_elements()).sum();
+
+            // Chunk shape of this variable (from discovery metadata). Used by the
+            // chunk-bucketing heuristic to coalesce scattered outer-axis (e.g. time)
+            // reads onto chunk boundaries instead of one read per surviving index.
+            let data_var_chunks: Option<Vec<u64>> = store_meta
+                .data_vars
+                .iter()
+                .find(|v| v.name == *field_name)
+                .and_then(|v| v.chunks.clone());
+            debug!(field = %field_name, chunks = ?data_var_chunks, "Data variable chunk shape");
+
+            let plans = if let Some(ref sels) = coord_ranges {
+                let plans = build_read_plans(
+                    sels,
+                    &coord_sizes,
+                    data_var_shape,
+                    data_var_chunks.as_deref(),
+                );
+                let subset_elements: u64 = plans.iter().map(|p| p.subset.num_elements()).sum();
                 let reduction_pct = 100.0 * (1.0 - (subset_elements as f64 / full_elements as f64));
                 info!(
                     field = %field_name,
                     subset_elements,
                     full_elements,
-                    num_subsets = subsets.len(),
+                    num_subsets = plans.len(),
                     reduction_pct = format!("{:.2}%", reduction_pct),
                     "Filter-based data subset optimization"
                 );
-                subsets
+                plans
             } else if effective_rows < total_rows {
                 let ranges = calculate_limited_subset(arr.shape(), effective_rows);
                 let limited_subset = ArraySubset::new_with_ranges(&ranges);
@@ -1312,16 +1501,24 @@ pub async fn read_zarr_async(
                     reduction_pct = format!("{:.2}%", reduction_pct),
                     "Limit-based data subset optimization"
                 );
-                vec![limited_subset]
+                vec![ReadPlan {
+                    subset: limited_subset,
+                    keep: Keep::All,
+                }]
             } else {
                 debug!(field = %field_name, full_elements, "Reading full array");
-                vec![ArraySubset::new_with_shape(arr.shape().to_vec())]
+                vec![ReadPlan {
+                    subset: ArraySubset::new_with_shape(arr.shape().to_vec()),
+                    keep: Keep::All,
+                }]
             };
-            let num_elements: u64 = subsets.iter().map(|s| s.num_elements()).sum();
+            // Elements actually fetched (chunk windows may include non-survivors).
+            let num_elements: u64 = plans.iter().map(|p| p.subset.num_elements()).sum();
 
-            let mut parts: Vec<ArrayRef> = Vec::with_capacity(subsets.len());
-            for subset in &subsets {
-                parts.push(read_data_array!(async, arr, subset, field.data_type()));
+            let mut parts: Vec<ArrayRef> = Vec::with_capacity(plans.len());
+            for plan in &plans {
+                let raw = read_data_array!(async, arr, &plan.subset, field.data_type());
+                parts.push(apply_keep(raw, &plan.keep)?);
             }
             let array: ArrayRef = if parts.len() == 1 {
                 parts.remove(0)
@@ -1373,6 +1570,205 @@ pub async fn read_zarr_async(
 }
 
 #[cfg(test)]
+mod bucket_tests {
+    use super::bucket_outer_indices;
+
+    #[test]
+    fn empty_indices_yield_no_buckets() {
+        assert!(bucket_outer_indices(&[], 10).is_empty());
+    }
+
+    #[test]
+    fn chunk_len_zero_falls_back_to_empty() {
+        // Caller treats empty as "no chunk geometry" and uses the per-index path.
+        assert!(bucket_outer_indices(&[1, 2, 3], 0).is_empty());
+    }
+
+    #[test]
+    fn chunk_len_one_is_one_bucket_per_index() {
+        // Degenerate chunking: per-chunk == per-index.
+        let got = bucket_outer_indices(&[3, 5, 8], 1);
+        assert_eq!(got, vec![(3, 4, vec![0]), (5, 6, vec![0]), (8, 9, vec![0])]);
+    }
+
+    #[test]
+    fn survivors_in_one_chunk_coalesce_into_a_tight_window() {
+        // 3 and 5 share chunk 0 (len 10): one read of [3,6), offsets 0 and 2.
+        let got = bucket_outer_indices(&[3, 5], 10);
+        assert_eq!(got, vec![(3, 6, vec![0, 2])]);
+    }
+
+    #[test]
+    fn survivors_across_chunks_split_per_chunk() {
+        // 3 -> chunk 0, 12 -> chunk 1: two separate single-element windows.
+        let got = bucket_outer_indices(&[3, 12], 10);
+        assert_eq!(got, vec![(3, 4, vec![0]), (12, 13, vec![0])]);
+    }
+
+    #[test]
+    fn survivors_straddling_a_boundary_are_split() {
+        // 8,9 in chunk 0; 10,11 in chunk 1. Windows never cross the boundary.
+        let got = bucket_outer_indices(&[8, 9, 10, 11], 10);
+        assert_eq!(got, vec![(8, 10, vec![0, 1]), (10, 12, vec![0, 1])]);
+    }
+}
+
+#[cfg(test)]
+mod plan_tests {
+    use super::{build_read_plans, Keep};
+    use crate::reader::filter::CoordSelection;
+
+    // (start, end_exclusive) ranges of a plan's subset, per dimension.
+    fn ranges(p: &super::ReadPlan) -> Vec<(u64, u64)> {
+        p.subset
+            .start()
+            .iter()
+            .zip(p.subset.end_exc())
+            .map(|(&s, e)| (s, e))
+            .collect()
+    }
+
+    #[test]
+    fn all_range_is_a_single_keep_all_plan() {
+        // No Indices anywhere -> one read, keep everything.
+        let sels = vec![
+            CoordSelection::Range(2, 5),
+            CoordSelection::Range(0, 2),
+            CoordSelection::Range(0, 3),
+        ];
+        let plans = build_read_plans(&sels, &[20, 2, 3], &[20, 2, 3], Some(&[10, 2, 3]));
+        assert_eq!(plans.len(), 1);
+        assert_eq!(plans[0].keep, Keep::All);
+        assert_eq!(ranges(&plans[0]), vec![(2, 5), (0, 2), (0, 3)]);
+    }
+
+    #[test]
+    fn outer_indices_bucketed_by_chunk_when_chunk_len_gt_1() {
+        // time=Indices([3,5,12]) on dim 0, chunk_len 10:
+        //   chunk 0 -> survivors 3,5 -> window [3,6), offsets [0,2]
+        //   chunk 1 -> survivor 12   -> window [12,13), offsets [0]
+        let sels = vec![
+            CoordSelection::Indices(vec![3, 5, 12]),
+            CoordSelection::Range(0, 2),
+            CoordSelection::Range(0, 3),
+        ];
+        let plans = build_read_plans(&sels, &[20, 2, 3], &[20, 2, 3], Some(&[10, 2, 3]));
+        assert_eq!(plans.len(), 2);
+
+        assert_eq!(ranges(&plans[0]), vec![(3, 6), (0, 2), (0, 3)]);
+        assert_eq!(
+            plans[0].keep,
+            Keep::Offsets {
+                window_len: 3,
+                offsets: vec![0, 2]
+            }
+        );
+
+        assert_eq!(ranges(&plans[1]), vec![(12, 13), (0, 2), (0, 3)]);
+        assert_eq!(
+            plans[1].keep,
+            Keep::Offsets {
+                window_len: 1,
+                offsets: vec![0]
+            }
+        );
+    }
+
+    #[test]
+    fn chunk_len_1_falls_back_to_one_plan_per_index() {
+        // Each time step is its own chunk -> per-index reads, keep all.
+        let sels = vec![
+            CoordSelection::Indices(vec![3, 5, 12]),
+            CoordSelection::Range(0, 2),
+            CoordSelection::Range(0, 3),
+        ];
+        let plans = build_read_plans(&sels, &[20, 2, 3], &[20, 2, 3], Some(&[1, 2, 3]));
+        assert_eq!(plans.len(), 3);
+        assert!(plans.iter().all(|p| p.keep == Keep::All));
+        assert_eq!(ranges(&plans[0]), vec![(3, 4), (0, 2), (0, 3)]);
+        assert_eq!(ranges(&plans[2]), vec![(12, 13), (0, 2), (0, 3)]);
+    }
+
+    #[test]
+    fn unknown_chunk_shape_falls_back_to_per_index() {
+        let sels = vec![
+            CoordSelection::Indices(vec![3, 5]),
+            CoordSelection::Range(0, 2),
+            CoordSelection::Range(0, 3),
+        ];
+        let plans = build_read_plans(&sels, &[20, 2, 3], &[20, 2, 3], None);
+        assert_eq!(plans.len(), 2);
+        assert!(plans.iter().all(|p| p.keep == Keep::All));
+    }
+
+    #[test]
+    fn indices_not_on_outer_dim_falls_back_to_per_index() {
+        // Indices on the middle coord (dim 1) -> Keep::Offsets layout would be
+        // wrong, so we keep the safe per-index path.
+        let sels = vec![
+            CoordSelection::Range(0, 20),
+            CoordSelection::Indices(vec![0, 1]),
+            CoordSelection::Range(0, 3),
+        ];
+        let plans = build_read_plans(&sels, &[20, 2, 3], &[20, 2, 3], Some(&[10, 1, 3]));
+        assert_eq!(plans.len(), 2);
+        assert!(plans.iter().all(|p| p.keep == Keep::All));
+    }
+}
+
+#[cfg(test)]
+mod keep_tests {
+    use super::{apply_keep, Keep};
+    use arrow::array::{Array, ArrayRef, Int32Array};
+    use std::sync::Arc;
+
+    fn arr(v: &[i32]) -> ArrayRef {
+        Arc::new(Int32Array::from(v.to_vec()))
+    }
+    fn vals(a: &ArrayRef) -> Vec<i32> {
+        let a = a.as_any().downcast_ref::<Int32Array>().unwrap();
+        a.iter().map(|x| x.unwrap()).collect()
+    }
+
+    #[test]
+    fn keep_all_returns_unchanged() {
+        let out = apply_keep(arr(&[1, 2, 3, 4]), &Keep::All).unwrap();
+        assert_eq!(vals(&out), vec![1, 2, 3, 4]);
+    }
+
+    #[test]
+    fn keep_offsets_gathers_inner_blocks() {
+        // window_len=3 outer steps, inner=2: [s0,s0, s1,s1, s2,s2].
+        // Keep offsets 0 and 2 -> first and third 2-row blocks.
+        let a = arr(&[10, 11, 20, 21, 30, 31]);
+        let out = apply_keep(
+            a,
+            &Keep::Offsets {
+                window_len: 3,
+                offsets: vec![0, 2],
+            },
+        )
+        .unwrap();
+        assert_eq!(vals(&out), vec![10, 11, 30, 31]);
+    }
+
+    #[test]
+    fn keep_offsets_scalar_inner() {
+        // inner == 1 (window_len == len): pick individual rows.
+        let a = arr(&[5, 6, 7, 8]);
+        let out = apply_keep(
+            a,
+            &Keep::Offsets {
+                window_len: 4,
+                offsets: vec![1, 3],
+            },
+        )
+        .unwrap();
+        assert_eq!(vals(&out), vec![6, 8]);
+    }
+}
+
+#[cfg(test)]
 mod resolve_outer_tests {
     use super::*;
     use crate::reader::filter::{CoordFilterKind, CoordFilters};
@@ -1384,10 +1780,7 @@ mod resolve_outer_tests {
 
     fn one_filter(coord: &str, value: i64) -> CoordFilters {
         let mut f = CoordFilters::new();
-        f.filters.insert(
-            coord.to_string(),
-            CoordFilterKind::Eq(ScalarValue::Int64(Some(value))),
-        );
+        f.push(coord, CoordFilterKind::Eq(ScalarValue::Int64(Some(value))));
         f
     }
 

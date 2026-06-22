@@ -83,6 +83,11 @@ enum CoordFilterKindDto {
         field: String,
         value: i32,
     },
+    InList(Vec<Vec<u8>>),
+    DatePartSet {
+        field: String,
+        values: Vec<i32>,
+    },
 }
 
 impl CoordFilterKindDto {
@@ -104,6 +109,16 @@ impl CoordFilterKindDto {
                 field: field.clone(),
                 value: *value,
             },
+            CoordFilterKind::InList(values) => CoordFilterKindDto::InList(
+                values
+                    .iter()
+                    .map(scalar_to_bytes)
+                    .collect::<Result<Vec<_>>>()?,
+            ),
+            CoordFilterKind::DatePartSet { field, values } => CoordFilterKindDto::DatePartSet {
+                field: field.clone(),
+                values: values.clone(),
+            },
         })
     }
 
@@ -124,6 +139,15 @@ impl CoordFilterKindDto {
             CoordFilterKindDto::DatePart { field, value } => {
                 CoordFilterKind::DatePart { field, value }
             }
+            CoordFilterKindDto::InList(byte_vals) => CoordFilterKind::InList(
+                byte_vals
+                    .iter()
+                    .map(|b| scalar_from_bytes(b))
+                    .collect::<Result<Vec<_>>>()?,
+            ),
+            CoordFilterKindDto::DatePartSet { field, values } => {
+                CoordFilterKind::DatePartSet { field, values }
+            }
         })
     }
 }
@@ -136,7 +160,7 @@ struct ZarrExecDto {
     path: String,
     projection: Option<Vec<usize>>,
     limit: Option<usize>,
-    coord_filters: Option<HashMap<String, CoordFilterKindDto>>,
+    coord_filters: Option<HashMap<String, Vec<CoordFilterKindDto>>>,
     /// Per-task partition slices. MUST be carried: each worker decodes a
     /// distinct subset and reads only those chunks. If dropped, every worker
     /// re-scans the whole store. `serde(default)` keeps old payloads decodable
@@ -152,7 +176,13 @@ impl ZarrExecDto {
             .map(|cf| {
                 cf.filters
                     .iter()
-                    .map(|(k, v)| Ok((k.clone(), CoordFilterKindDto::from_kind(v)?)))
+                    .map(|(k, kinds)| {
+                        let dtos = kinds
+                            .iter()
+                            .map(CoordFilterKindDto::from_kind)
+                            .collect::<Result<Vec<_>>>()?;
+                        Ok((k.clone(), dtos))
+                    })
                     .collect::<Result<HashMap<_, _>>>()
             })
             .transpose()?;
@@ -175,7 +205,13 @@ impl ZarrExecDto {
             .map(|map| {
                 let filters = map
                     .into_iter()
-                    .map(|(k, v)| Ok((k, v.into_kind()?)))
+                    .map(|(k, dtos)| {
+                        let kinds = dtos
+                            .into_iter()
+                            .map(|d| d.into_kind())
+                            .collect::<Result<Vec<_>>>()?;
+                        Ok((k, kinds))
+                    })
                     .collect::<Result<HashMap<_, _>>>()?;
                 Ok::<_, DataFusionError>(CoordFilters { filters })
             })
@@ -334,13 +370,18 @@ mod tests {
     }
 
     fn sample_filters() -> CoordFilters {
-        let mut filters = HashMap::new();
-        filters.insert(
-            "time".to_string(),
-            CoordFilterKind::Eq(ScalarValue::Int64(Some(42))),
+        let mut filters = CoordFilters::new();
+        // Two AND-composed filters on one coordinate exercises the Vec path.
+        filters.push("time", CoordFilterKind::Eq(ScalarValue::Int64(Some(42))));
+        filters.push(
+            "time",
+            CoordFilterKind::DatePartSet {
+                field: "HOUR".to_string(),
+                values: vec![0, 12],
+            },
         );
-        filters.insert(
-            "lat".to_string(),
+        filters.push(
+            "lat",
             CoordFilterKind::Range {
                 low: Some(ScalarValue::Float64(Some(10.0))),
                 high: Some(ScalarValue::Float64(Some(20.0))),
@@ -348,14 +389,21 @@ mod tests {
                 high_inclusive: false,
             },
         );
-        filters.insert(
-            "month".to_string(),
+        filters.push(
+            "month",
             CoordFilterKind::DatePart {
                 field: "MONTH".to_string(),
                 value: 12,
             },
         );
-        CoordFilters { filters }
+        filters.push(
+            "level",
+            CoordFilterKind::InList(vec![
+                ScalarValue::Int64(Some(500)),
+                ScalarValue::Int64(Some(850)),
+            ]),
+        );
+        filters
     }
 
     #[test]
@@ -388,12 +436,23 @@ mod tests {
         assert_eq!(decoded.schema().as_ref(), schema.as_ref());
 
         let filters = decoded.coord_filters().expect("filters preserved");
-        assert_eq!(filters.len(), 3);
-        match filters.get("time").unwrap() {
+        assert_eq!(filters.len(), 4); // time, lat, month, level
+
+        // `time` carries two AND-composed filters (Eq + DatePartSet).
+        let time = filters.get("time").unwrap();
+        assert_eq!(time.len(), 2);
+        match &time[0] {
             CoordFilterKind::Eq(ScalarValue::Int64(Some(v))) => assert_eq!(*v, 42),
             other => panic!("unexpected: {other:?}"),
         }
-        match filters.get("lat").unwrap() {
+        match &time[1] {
+            CoordFilterKind::DatePartSet { field, values } => {
+                assert_eq!(field, "HOUR");
+                assert_eq!(values, &vec![0, 12]);
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+        match &filters.get("lat").unwrap()[0] {
             CoordFilterKind::Range {
                 low,
                 high,
@@ -407,10 +466,19 @@ mod tests {
             }
             other => panic!("unexpected: {other:?}"),
         }
-        match filters.get("month").unwrap() {
+        match &filters.get("month").unwrap()[0] {
             CoordFilterKind::DatePart { field, value } => {
                 assert_eq!(field, "MONTH");
                 assert_eq!(*value, 12);
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+        match &filters.get("level").unwrap()[0] {
+            CoordFilterKind::InList(values) => {
+                assert_eq!(
+                    values,
+                    &vec![ScalarValue::Int64(Some(500)), ScalarValue::Int64(Some(850))]
+                );
             }
             other => panic!("unexpected: {other:?}"),
         }

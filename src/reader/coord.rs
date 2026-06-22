@@ -15,10 +15,10 @@
 //! This reduces memory usage and enables lazy value generation at query time.
 
 use arrow::array::{
-    ArrayRef, DictionaryArray, Float32Array, Float64Array, Int16Array, Int64Array,
+    ArrayRef, DictionaryArray, Float32Array, Float64Array, Int16Array, Int32Array, Int64Array,
     TimestampMicrosecondArray,
 };
-use arrow::datatypes::Int16Type;
+use arrow::datatypes::{DataType, Int16Type, Int32Type, Int64Type};
 use std::sync::Arc;
 use tracing::debug;
 
@@ -472,84 +472,113 @@ impl CoordValues {
 ///
 /// For compact encodings, generates values lazily at query time.
 /// For explicit values, uses them directly.
+///
+/// `key_type` is the dictionary key width declared in the schema for this
+/// coordinate (`Int16`, `Int32`, or `Int64`, chosen from the coordinate's
+/// cardinality). The keys built here must match it so the produced array agrees
+/// with the table schema. Picking the width from the full coordinate cardinality
+/// guarantees every key (`< selection size <= cardinality`) fits without the
+/// silent `as i16` wraparound that used to panic on coordinates larger than
+/// 32,767 distinct values.
 pub fn create_coord_dictionary_typed(
     values: &CoordValues,
     coord_idx: usize,
     coord_sizes: &[usize],
     total_rows: usize,
+    key_type: &DataType,
 ) -> ArrayRef {
     debug!(
-        "Creating coord dictionary array: values={}, coord_idx={}, coord_sizes={:?}, total_rows={}",
+        "Creating coord dictionary array: values={}, coord_idx={}, coord_sizes={:?}, total_rows={}, key_type={:?}",
         values.summary(),
         coord_idx,
         coord_sizes,
-        total_rows
+        total_rows,
+        key_type,
     );
 
-    let keys = build_coord_keys(values.len(), coord_idx, coord_sizes, total_rows);
-    let keys_array = Int16Array::from(keys);
+    let values_array = coord_values_to_array(values);
+    build_dictionary_with_key_type(key_type, coord_idx, coord_sizes, total_rows, values_array)
+}
 
+/// Materialize the dictionary *value* array (the distinct coordinate values),
+/// independent of the key width.
+fn coord_values_to_array(values: &CoordValues) -> ArrayRef {
     match values {
         CoordValues::Compact {
             encoding,
             is_timestamp,
         } => {
             if *is_timestamp {
-                // Generate timestamp values from compact encoding
-                let vals = encoding.to_vec_i64();
-                let values_array =
-                    TimestampMicrosecondArray::from(vals).with_timezone("UTC".to_string());
-                Arc::new(DictionaryArray::<Int16Type>::new(
-                    keys_array,
-                    Arc::new(values_array),
-                ))
+                Arc::new(
+                    TimestampMicrosecondArray::from(encoding.to_vec_i64())
+                        .with_timezone("UTC".to_string()),
+                )
             } else if encoding.is_integer() {
-                // Generate i64 values
-                let vals = encoding.to_vec_i64();
-                let values_array = Int64Array::from(vals);
-                Arc::new(DictionaryArray::<Int16Type>::new(
-                    keys_array,
-                    Arc::new(values_array),
-                ))
+                Arc::new(Int64Array::from(encoding.to_vec_i64()))
             } else {
-                // Generate f64 values
-                let vals = encoding.to_vec_f64();
-                let values_array = Float64Array::from(vals);
-                Arc::new(DictionaryArray::<Int16Type>::new(
-                    keys_array,
-                    Arc::new(values_array),
-                ))
+                Arc::new(Float64Array::from(encoding.to_vec_f64()))
             }
         }
-        CoordValues::Int64(vals) => {
-            let values_array = Int64Array::from(vals.clone());
-            Arc::new(DictionaryArray::<Int16Type>::new(
-                keys_array,
-                Arc::new(values_array),
-            ))
-        }
-        CoordValues::Float32(vals) => {
-            let values_array = Float32Array::from(vals.clone());
-            Arc::new(DictionaryArray::<Int16Type>::new(
-                keys_array,
-                Arc::new(values_array),
-            ))
-        }
-        CoordValues::Float64(vals) => {
-            let values_array = Float64Array::from(vals.clone());
-            Arc::new(DictionaryArray::<Int16Type>::new(
-                keys_array,
-                Arc::new(values_array),
-            ))
-        }
+        CoordValues::Int64(vals) => Arc::new(Int64Array::from(vals.clone())),
+        CoordValues::Float32(vals) => Arc::new(Float32Array::from(vals.clone())),
+        CoordValues::Float64(vals) => Arc::new(Float64Array::from(vals.clone())),
         CoordValues::TimestampMicros(vals) => {
-            let values_array =
-                TimestampMicrosecondArray::from(vals.clone()).with_timezone("UTC".to_string());
+            Arc::new(TimestampMicrosecondArray::from(vals.clone()).with_timezone("UTC".to_string()))
+        }
+    }
+}
+
+/// Build the dictionary keys at the requested width and wrap them with `values_array`.
+///
+/// The raw key for each row is `(row_idx / inner_size) % coord_size`, always in
+/// `0..coord_size`. We assert the width can hold `coord_size - 1` so an undersized
+/// `key_type` fails loudly with a clear message instead of wrapping silently.
+fn build_dictionary_with_key_type(
+    key_type: &DataType,
+    coord_idx: usize,
+    coord_sizes: &[usize],
+    total_rows: usize,
+    values_array: ArrayRef,
+) -> ArrayRef {
+    let raw_keys = build_coord_keys_range(coord_idx, coord_sizes, 0, total_rows);
+    let coord_size = coord_sizes[coord_idx];
+    let max_key = coord_size.saturating_sub(1);
+
+    match key_type {
+        DataType::Int16 => {
+            assert!(
+                max_key <= i16::MAX as usize,
+                "coordinate too large for Int16 dictionary keys: {coord_size} distinct values \
+                 (max {})",
+                i16::MAX
+            );
+            let keys: Vec<i16> = raw_keys.into_iter().map(|k| k as i16).collect();
             Arc::new(DictionaryArray::<Int16Type>::new(
-                keys_array,
-                Arc::new(values_array),
+                Int16Array::from(keys),
+                values_array,
             ))
         }
+        DataType::Int32 => {
+            assert!(
+                max_key <= i32::MAX as usize,
+                "coordinate too large for Int32 dictionary keys: {coord_size} distinct values \
+                 (max {})",
+                i32::MAX
+            );
+            let keys: Vec<i32> = raw_keys.into_iter().map(|k| k as i32).collect();
+            Arc::new(DictionaryArray::<Int32Type>::new(
+                Int32Array::from(keys),
+                values_array,
+            ))
+        }
+        DataType::Int64 => {
+            let keys: Vec<i64> = raw_keys.into_iter().map(|k| k as i64).collect();
+            Arc::new(DictionaryArray::<Int64Type>::new(
+                Int64Array::from(keys),
+                values_array,
+            ))
+        }
+        other => panic!("unsupported dictionary key type for coordinate: {other:?}"),
     }
 }
 
@@ -557,7 +586,7 @@ pub fn create_coord_dictionary_typed(
 // Coordinate key computation (unchanged)
 // ============================================================================
 
-/// Compute coordinate key for a single row index
+/// Compute the raw coordinate index for a single row.
 ///
 /// For a Cartesian product of coordinates with sizes [a, b, c, d], row index maps to:
 ///   key[0] = (row_idx / (b*c*d)) % a
@@ -565,42 +594,37 @@ pub fn create_coord_dictionary_typed(
 ///   key[2] = (row_idx / d) % c
 ///   key[3] = row_idx % d
 ///
-/// This is the mathematical property of row-major (C) order arrays.
+/// This is the mathematical property of row-major (C) order arrays. The result is
+/// the raw index (`0..coord_size`); callers narrow it to the schema's key width.
 #[inline]
-pub fn compute_coord_key(row_idx: usize, coord_idx: usize, coord_sizes: &[usize]) -> i16 {
+pub fn compute_coord_key(row_idx: usize, coord_idx: usize, coord_sizes: &[usize]) -> usize {
     let inner_size: usize = coord_sizes[coord_idx + 1..].iter().product();
     let inner_size = if inner_size == 0 { 1 } else { inner_size };
 
     let num_values = coord_sizes[coord_idx];
-    ((row_idx / inner_size) % num_values) as i16
+    (row_idx / inner_size) % num_values
 }
 
-/// Build keys array for DictionaryArray using on-demand computation
+/// Build raw key indices for DictionaryArray using on-demand computation
 ///
 /// Uses the Cartesian product formula to compute keys without nested loops.
-pub fn build_coord_keys(
-    num_values: usize,
-    coord_idx: usize,
-    coord_sizes: &[usize],
-    total_rows: usize,
-) -> Vec<i16> {
-    build_coord_keys_range(num_values, coord_idx, coord_sizes, 0, total_rows)
+pub fn build_coord_keys(coord_idx: usize, coord_sizes: &[usize], total_rows: usize) -> Vec<usize> {
+    build_coord_keys_range(coord_idx, coord_sizes, 0, total_rows)
 }
 
-/// Build keys array for a range of rows [start_row, start_row + num_rows)
+/// Build raw key indices for a range of rows [start_row, start_row + num_rows)
 pub fn build_coord_keys_range(
-    _num_values: usize,
     coord_idx: usize,
     coord_sizes: &[usize],
     start_row: usize,
     num_rows: usize,
-) -> Vec<i16> {
+) -> Vec<usize> {
     let inner_size: usize = coord_sizes[coord_idx + 1..].iter().product();
     let inner_size = if inner_size == 0 { 1 } else { inner_size };
     let coord_size = coord_sizes[coord_idx];
 
     (start_row..start_row + num_rows)
-        .map(|row_idx| ((row_idx / inner_size) % coord_size) as i16)
+        .map(|row_idx| (row_idx / inner_size) % coord_size)
         .collect()
 }
 
@@ -722,5 +746,80 @@ mod tests {
         if let CoordValues::Compact { is_timestamp, .. } = coord {
             assert!(is_timestamp);
         }
+    }
+
+    // ------------------------------------------------------------------
+    // Adaptive dictionary key width (Int16 -> Int32 -> Int64)
+    // ------------------------------------------------------------------
+
+    use arrow::array::Array;
+
+    /// A coordinate of `n` distinct integer values laid out as a single axis.
+    fn single_axis_coord(n: usize) -> CoordValues {
+        CoordValues::Int64((0..n as i64).collect())
+    }
+
+    #[test]
+    fn test_create_dictionary_int16_keys() {
+        let coord = single_axis_coord(5);
+        let dict = create_coord_dictionary_typed(&coord, 0, &[5], 5, &DataType::Int16);
+
+        let dict = dict
+            .as_any()
+            .downcast_ref::<DictionaryArray<Int16Type>>()
+            .expect("expected Int16-keyed dictionary");
+        assert_eq!(dict.len(), 5);
+        // Single axis: key[row] == row
+        assert_eq!(dict.keys().values(), &[0i16, 1, 2, 3, 4]);
+    }
+
+    #[test]
+    fn test_create_dictionary_int32_keys_large_coordinate() {
+        // 40,000 distinct values exceeds the old Int16 ceiling (32,767) and used
+        // to panic in DictionaryArray::new via a silent `as i16` wrap.
+        let n = 40_000;
+        let coord = single_axis_coord(n);
+        let dict = create_coord_dictionary_typed(&coord, 0, &[n], n, &DataType::Int32);
+
+        let dict = dict
+            .as_any()
+            .downcast_ref::<DictionaryArray<Int32Type>>()
+            .expect("expected Int32-keyed dictionary");
+        assert_eq!(dict.len(), n);
+        // First and last keys index past the Int16 range without wrapping.
+        assert_eq!(dict.keys().value(0), 0);
+        assert_eq!(dict.keys().value(n - 1), (n - 1) as i32);
+        assert_eq!(dict.values().len(), n);
+    }
+
+    #[test]
+    fn test_create_dictionary_int64_keys() {
+        let coord = single_axis_coord(8);
+        let dict = create_coord_dictionary_typed(&coord, 0, &[8], 8, &DataType::Int64);
+
+        let dict = dict
+            .as_any()
+            .downcast_ref::<DictionaryArray<Int64Type>>()
+            .expect("expected Int64-keyed dictionary");
+        assert_eq!(dict.len(), 8);
+        assert_eq!(dict.keys().value(7), 7i64);
+    }
+
+    #[test]
+    #[should_panic(expected = "too large for Int16")]
+    fn test_int16_key_overflow_panics_clearly() {
+        // Defense in depth: an undersized key type fails loudly instead of
+        // wrapping silently (the old behavior).
+        let n = 40_000;
+        let coord = single_axis_coord(n);
+        let _ = create_coord_dictionary_typed(&coord, 0, &[n], n, &DataType::Int16);
+    }
+
+    #[test]
+    fn test_cartesian_product_keys_multi_axis() {
+        // sizes [2, 3]: row-major keys for axis 0 and axis 1 over 6 rows.
+        // axis 0 key = row / 3 ; axis 1 key = row % 3
+        assert_eq!(build_coord_keys(0, &[2, 3], 6), vec![0, 0, 0, 1, 1, 1]);
+        assert_eq!(build_coord_keys(1, &[2, 3], 6), vec![0, 1, 2, 0, 1, 2]);
     }
 }
