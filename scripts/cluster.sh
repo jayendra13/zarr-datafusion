@@ -24,7 +24,7 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 RUN_DIR="$ROOT/.cluster"
 
 WORKERS="${WORKERS:-3}"
-BASE_PORT="${BASE_PORT:-8080}"
+BASE_PORT="${BASE_PORT:-9090}"
 STORE_PATH="${STORE_PATH:-$ROOT/data/synthetic_v3.zarr}"
 TABLE="${TABLE:-weather}"
 PROFILE="${PROFILE:-release}"
