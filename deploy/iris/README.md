@@ -81,6 +81,37 @@ docker run --rm YOUR_REGISTRY/zarr-dist:latest sh -c \
 (`/app/head` has no `--help`; with no args it exits with `missing SQL query`, which
 confirms it runs.) Verified locally: image ~1.4 GB on `rust:1.95` + `python:3.12-slim`.
 
+### Where to push: GAR vs GHCR
+
+For cluster runs, **Google Artifact Registry (GAR)** is the lowest-friction target:
+the worker SAs pull via existing IAM (no credentials to inject), and same-region
+pulls avoid egress cost and cold-start latency on the ~1.4 GB image. `YOUR_REGISTRY`
+then looks like `REGION-docker.pkg.dev/YOUR_PROJECT/zarr`.
+
+To publish a **public, reproducible** image instead (e.g. so others can run this
+README without a GCP project), push to **GHCR**. `gh` supplies the auth token; the
+push itself is still `docker push`:
+
+```bash
+# 1. Add the packages scope to your gh session, then log docker into GHCR.
+gh auth refresh --scopes write:packages,read:packages
+echo "$(gh auth token)" | docker login ghcr.io -u <github-user> --password-stdin
+
+# 2. Tag + push (owner = your GitHub username, lowercase).
+docker build -f deploy/iris/Dockerfile -t ghcr.io/<github-user>/zarr-dist:latest .
+docker push ghcr.io/<github-user>/zarr-dist:latest
+
+# 3. Make it public (one-time) in the web UI — there is no supported REST API
+#    to change an existing package's visibility:
+#    https://github.com/users/<github-user>/packages/container/package/zarr-dist/settings
+#    -> Danger Zone -> Change visibility -> Public.
+```
+
+The `org.opencontainers.image.source` label in the `Dockerfile` links the package
+to this repo automatically. A public image lets the GCP VMs pull anonymously (no
+credential injection), at the cost of internet egress into GCP — fine for a demo,
+but for production runs mirror it into GAR and set that as `YOUR_REGISTRY`.
+
 ## 3. Start the cluster
 
 ```bash

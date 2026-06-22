@@ -28,6 +28,10 @@ RUN cargo build --release --features distributed --bin worker --bin head \
 FROM python:3.12-slim-bookworm AS runtime
 WORKDIR /app
 
+# Links the published package to the source repo (e.g. on GHCR the package shows
+# up on the repo page and inherits its context).
+LABEL org.opencontainers.image.source="https://github.com/jayendra13/zarr-datafusion"
+
 # Iris client (pulls marin-rigging/finelog from PyPI). marin-iris ships only
 # dev/prerelease wheels (no final release), so --pre is required and we pin an
 # exact snapshot for reproducibility. Bump this in lockstep with your cluster's

@@ -12,7 +12,8 @@
 #   iris --config=deploy/iris/my-cluster.yaml cluster stop
 #
 # Replace every value tagged  # <-- EDIT
-# (project id, service accounts, zone, bucket, registry/image).
+# (project id, service accounts, zone, bucket). The task image is already set to
+# the public GHCR build (ghcr.io/jayendra13/zarr-dist:latest).
 
 platform:
   label_prefix: zarr-dist
@@ -31,8 +32,10 @@ defaults:
     # Public Iris worker/agent image — runs the task container, not your code.
     docker_image: ghcr.io/marin-community/iris-worker:latest
     # Default image for tasks if a job doesn't override --task-image. We set the
-    # zarr image here so worker/head jobs need no per-submit image flag.
-    default_task_image: YOUR_REGISTRY/zarr-dist:latest         # <-- EDIT
+    # zarr image here so worker/head jobs need no per-submit image flag. This is
+    # the public GHCR image built from deploy/iris/Dockerfile; repoint it (e.g.
+    # to your own GAR repo) if you rebuild from a fork.
+    default_task_image: ghcr.io/jayendra13/zarr-dist:latest
     port: 10001
 
 storage:
