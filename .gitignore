@@ -5,6 +5,11 @@ plans/
 # Local distributed cluster runtime artifacts (logs/pids from scripts/cluster.sh)
 .cluster/
 
+# Local SQL query dumps / scratch output
+sql/out.txt
+sql/*.oout
+*.swp
+
 # Python
 __pycache__/
 
