@@ -86,10 +86,11 @@ pub fn split_selection(sel: &CoordSelection, chunk_len: u64, target: usize) -> V
             .map(|(s, e)| CoordSelection::Range(s, e))
             .collect(),
         // Scattered positions (date-part filters): balanced contiguous groups by
-        // count. chunk_len is ignored here — scattered indices that share a chunk
-        // could land in different pieces (a double read), which is wasteful but
-        // not incorrect. For the common hourly case (chunk_len == 1) it's moot.
-        CoordSelection::Indices(v) => split_indices(v, target)
+        // count, but never splitting a single data-var chunk across two workers
+        // (that chunk would then be read twice). For the common hourly case
+        // (chunk_len == 1) every index is its own chunk, so this is the same
+        // count-balanced split as before.
+        CoordSelection::Indices(v) => split_indices(v, chunk_len, target)
             .into_iter()
             .map(CoordSelection::Indices)
             .collect(),
@@ -129,14 +130,52 @@ fn split_range(s: usize, e: usize, chunk_len: u64, target: usize) -> Vec<(usize,
     out
 }
 
-/// Split a sorted index list into up to `target` balanced contiguous groups.
-fn split_indices(v: &[usize], target: usize) -> Vec<Vec<usize>> {
+/// Split a sorted index list into up to `target` balanced contiguous groups,
+/// keeping all survivors of one data-var chunk together.
+///
+/// Indices that share a chunk (`idx / chunk_len`) form an indivisible group, so a
+/// chunk is never read by two workers. Groups are then packed greedily into ≤
+/// `target` contiguous partitions of ~`ceil(len / p)` indices each. With
+/// `chunk_len == 1` every index is its own group, recovering the previous
+/// count-balanced split.
+fn split_indices(v: &[usize], chunk_len: u64, target: usize) -> Vec<Vec<usize>> {
     if v.is_empty() {
         return vec![Vec::new()];
     }
-    let p = target.min(v.len()).max(1);
-    let per = v.len().div_ceil(p);
-    v.chunks(per).map(|c| c.to_vec()).collect()
+    let chunk_len = if chunk_len == 0 {
+        1
+    } else {
+        chunk_len as usize
+    };
+
+    // Consecutive runs of indices sharing a chunk (v is sorted ascending).
+    let mut groups: Vec<&[usize]> = Vec::new();
+    let mut start = 0;
+    for i in 1..=v.len() {
+        if i == v.len() || v[i] / chunk_len != v[start] / chunk_len {
+            groups.push(&v[start..i]);
+            start = i;
+        }
+    }
+
+    let p = target.min(groups.len()).max(1);
+    let per = v.len().div_ceil(p); // ~target indices per partition
+
+    let mut out: Vec<Vec<usize>> = Vec::with_capacity(p);
+    let mut cur: Vec<usize> = Vec::new();
+    for (gi, g) in groups.iter().enumerate() {
+        cur.extend_from_slice(g);
+        let groups_left = groups.len() - gi - 1;
+        // Close the partition once it reaches the target size, but only while
+        // enough groups remain to fill the partitions we still owe.
+        if cur.len() >= per && out.len() + 1 < p && groups_left >= p - (out.len() + 1) {
+            out.push(std::mem::take(&mut cur));
+        }
+    }
+    if !cur.is_empty() {
+        out.push(cur);
+    }
+    out
 }
 
 /// An empty slice `[0, 0)` — reads nothing. Used to pad task groups so every
@@ -479,6 +518,53 @@ mod tests {
     fn split_indices_empty_yields_one_empty() {
         let pieces = split_selection(&indices(&[]), 1, 3);
         assert_eq!(pieces, vec![indices(&[])]);
+    }
+
+    #[test]
+    fn split_indices_keeps_a_shared_chunk_together() {
+        // 0 and 5 share chunk 0 (len 10): they must NOT be split across workers,
+        // even though target=2 — that chunk would be read twice. One partition.
+        let pieces = split_selection(&indices(&[0, 5]), 10, 2);
+        assert_eq!(pieces, vec![indices(&[0, 5])]);
+    }
+
+    #[test]
+    fn split_indices_splits_on_chunk_boundaries() {
+        // chunk 0: {0,1,2}, chunk 3: {30}. Groups stay whole across 2 workers.
+        let pieces = split_selection(&indices(&[0, 1, 2, 30]), 10, 2);
+        assert_eq!(pieces, vec![indices(&[0, 1, 2]), indices(&[30])]);
+    }
+
+    #[test]
+    fn split_indices_chunk_aware_union_equals_input() {
+        // chunks of len 10: {3,7},{12},{25,28},{41}. Union is preserved and no
+        // chunk's indices are spread across two pieces.
+        let input = [3usize, 7, 12, 25, 28, 41];
+        let pieces = split_selection(&indices(&input), 10, 3);
+        let rebuilt: Vec<usize> = pieces
+            .iter()
+            .flat_map(|p| match p {
+                CoordSelection::Indices(v) => v.clone(),
+                _ => panic!("expected Indices"),
+            })
+            .collect();
+        assert_eq!(rebuilt, input);
+        // Each chunk id appears in exactly one piece.
+        for piece in &pieces {
+            if let CoordSelection::Indices(v) = piece {
+                let chunks: std::collections::HashSet<usize> = v.iter().map(|&i| i / 10).collect();
+                for other in &pieces {
+                    if std::ptr::eq(piece, other) {
+                        continue;
+                    }
+                    if let CoordSelection::Indices(o) = other {
+                        for &i in o {
+                            assert!(!chunks.contains(&(i / 10)), "chunk split across pieces");
+                        }
+                    }
+                }
+            }
+        }
     }
 
     /// The union of all pieces must reconstruct the input exactly — the
