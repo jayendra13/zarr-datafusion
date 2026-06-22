@@ -24,6 +24,7 @@ Run:
 
 import argparse
 import asyncio
+import calendar
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -72,6 +73,26 @@ def december_sst_indices() -> list[int]:
         end   = hours_from_epoch(year, 12, 31, 23)
         indices.extend(range(start, end + 1))
     return indices
+
+
+def months_sst_indices(year_months: list[tuple[int, int]]) -> list[int]:
+    """All hourly chunks for each (year, month) pair, in chronological order."""
+    indices = []
+    for year, month in year_months:
+        last_day = calendar.monthrange(year, month)[1]
+        start = hours_from_epoch(year, month, 1, 0)
+        end   = hours_from_epoch(year, month, last_day, 23)
+        indices.extend(range(start, end + 1))
+    return indices
+
+
+def parse_year_months(spec: str) -> list[tuple[int, int]]:
+    """Parse 'YYYY-MM,YYYY-MM' into [(year, month), ...]."""
+    pairs = []
+    for token in spec.split(","):
+        y, m = token.strip().split("-")
+        pairs.append((int(y), int(m)))
+    return pairs
 
 
 def time_coord_chunks_needed(sst_indices: list[int]) -> list[int]:
@@ -238,6 +259,10 @@ def main() -> None:
         "--december", action="store_true",
         help="All December hours per year (61752 chunks, ~79 GB)",
     )
+    mode.add_argument(
+        "--year-months", type=str, default=None,
+        help="All hours for explicit months, e.g. '2026-01,2026-02'",
+    )
     parser.add_argument(
         "--concurrency", type=int, default=16,
         help="Parallel downloads (default: 16)",
@@ -258,8 +283,12 @@ def main() -> None:
         parts = args.years.split("-")
         FIRST_YEAR, LAST_YEAR = int(parts[0]), int(parts[1])
 
-    # Select mode
-    if args.december:
+    # Select mode (year-months takes precedence; --snapshot defaults to True)
+    if args.year_months:
+        year_months = parse_year_months(args.year_months)
+        sst_indices = months_sst_indices(year_months)
+        mode_label  = "Explicit months: " + ", ".join(f"{y}-{m:02d}" for y, m in year_months)
+    elif args.december:
         sst_indices = december_sst_indices()
         mode_label  = "Full December monthly"
     else:
