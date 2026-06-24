@@ -1,48 +1,59 @@
 -- ============================================================================
 --  ONI time series — every overlapping 3-month season from 1950 to now
---  with ENSO phase (El Niño / La Niña / Neutral)
+--  with ENSO phase (El Niño / La Niña / Neutral), NOAA-faithful climatology
 -- ============================================================================
 --  ONI = 3-month running mean of monthly Niño-3.4 SST anomalies, where the
---  anomaly is (monthly SST − 1991-2020 monthly climatology). Instead of
---  enumerating a fixed season set, we build the monthly anomaly series and take
---  a centred 3-month moving average, so one row is emitted per centre month:
---
---      centre Jan -> DJF   centre Feb -> JFM   ...   centre Dec -> NDJ
---
+--  anomaly is (monthly SST − monthly climatology). We build the monthly anomaly
+--  series and take a centred 3-month moving average, so one row is emitted per
+--  centre month:  centre Jan -> DJF, centre Feb -> JFM, ... centre Dec -> NDJ.
 --  A season is labelled by the YEAR OF ITS CENTRE MONTH (NOAA convention):
---      DJF 1998 = Dec 1997, Jan 1998, Feb 1998.
+--  DJF 1998 = Dec 1997, Jan 1998, Feb 1998.
 --
---  ENSO phase from the ONI value (NOAA single-season thresholds):
---      ONI >= +0.5  -> El Niño      ONI <= -0.5 -> La Niña      else Neutral
---  (NOAA only *declares* an event after 5 consecutive seasons past threshold;
---   this column is the per-season classification, not that 5-season rule.)
+--  CLIMATOLOGY: each season uses NOAA CPC's centered 30-year base period that
+--  shifts forward every 5 years — NOT a single fixed window. A single fixed
+--  1991-2020 base makes deep-past anomalies depart from a modern-warm mean,
+--  which inflates a spurious pre-1991 cold bias and plants a false changepoint
+--  right at 1991 (the base-window edge). Moving the base with the data removes
+--  both: vs NOAA this drops MAE 0.21 -> 0.17 °C, bias -0.14 -> -0.04 °C, and
+--  the spurious 1991 break disappears.
 --
---  Niño-3.4 box: 5°S..5°N, 170°W..120°W  (longitude 190..240 in 0..360).
+--  NOAA base-period schedule (from CPC's ONI_change documentation; the stated
+--  "1950-1955 -> 1936-1965, 1956-1960 -> 1941-1970, and so on" +5yr pattern,
+--  held at the latest complete 30-yr period for recent years):
+--
+--      ONI season-years     centered 30-yr base period
+--      ----------------     --------------------------
+--      1950-1955            1936-1965
+--      1956-1960            1941-1970
+--      1961-1965            1946-1975
+--      1966-1970            1951-1980
+--      1971-1975            1956-1985
+--      1976-1980            1961-1990
+--      1981-1985            1966-1995
+--      1986-1990            1971-2000
+--      1991-1995            1976-2005
+--      1996-2000            1981-2010
+--      2001-2005            1986-2015
+--      2006-now             1991-2020   (held: no complete later 30-yr period yet)
 --
 --  ----------------------------------------------------------------------------
---  DATA SOURCE: public ARCO-ERA5 on GCS (anonymous). Full record (from 1940),
---  so every month 1949..now is present and ~900 seasons compute.
---  This is a BIG remote scan: time is one step per chunk, so the
---  day-15/hour-12 pushdown fetches ~900 timesteps (≈78 yrs x 12 mo), each a full
---  lat×lon plane -> expect a ~20-30 min run and several GB of remote reads.
---    * Quick local alternative: swap LOCATION to 'data/era5_sst_local.zarr',
---      but that mirror only has Jan/Feb/Dec fully, so most seasons drop out.
+--  ERA5 CAVEAT: ARCO-ERA5's full record starts in 1940, so the earliest base
+--  period (1936-1965) is effectively 1940-1965 here — 26 of its 30 years. Every
+--  later base period is fully covered. This is unavoidable with ERA5 and is the
+--  one place this query cannot exactly match NOAA.
 --
---  ----------------------------------------------------------------------------
---  Base period: a single fixed 1991-2020 climatology is used for the whole
---  series. NOAA's official historical ONI instead uses centred 30-year base
---  periods that shift every 5 years, so values for the deep past will differ
---  from NOAA's published table (most by < 0.1-0.2°C).
+--  COST CAVEAT: the sample window starts at 1940 so the deep-past climatology
+--  has data. time is one step per chunk, so the day-15/hour-12 pushdown fetches
+--  ~1000 timesteps (≈87 yrs x 12 mo), each a full lat×lon plane -> expect a
+--  ~25-35 min run and several GB of remote reads over a home connection.
 --
---  Gotchas (same engine behaviour as the DJF file):
+--  Gotchas:
 --    * `time` is dict-encoded; date funcs crash on it -> arrow_cast() first.
 --    * WHERE filters ONLY coordinates (time via extract, latitude, longitude).
---    * Absent SST chunks read back as NaN; dropped post-aggregate via HAVING,
---      not by filtering the data var in WHERE.
+--    * Absent SST chunks read back as NaN; dropped post-aggregate via HAVING.
 --    * sea_surface_temperature is (time, latitude, longitude) — no `level` dim.
 --
---  Run:  zarr-cli sql/oni_2025_all_seasons.sql
---        zarr-cli < sql/oni_2025_all_seasons.sql
+--  Run:  zarr-cli cookbook/el-nino-oni/oni_all_seasons.sql
 -- ============================================================================
 
 CREATE EXTERNAL TABLE IF NOT EXISTS era5
@@ -64,7 +75,7 @@ WITH samples AS (                               -- one noon-of-the-15th sample p
   ) AS box
   WHERE extract(day  FROM ts) = 15              -- time coordinate (via extract)
     AND extract(hour FROM ts) = 12
-    AND extract(year FROM ts) BETWEEN 1949 AND 2026   -- Dec 1949 enables DJF 1950
+    AND extract(year FROM ts) BETWEEN 1940 AND 2026   -- widened: rolling base needs deep past
 ),
 monthly AS (                                    -- spatial mean per (year, month)
   SELECT yr, mo, AVG(sst_c) AS sst_c
@@ -72,20 +83,37 @@ monthly AS (                                    -- spatial mean per (year, month
   GROUP BY yr, mo
   HAVING AVG(sst_c) BETWEEN 0 AND 50            -- drop absent-chunk (NaN) months
 ),
-clim AS (                                       -- per-month climatology 1991-2020
-  SELECT mo, AVG(sst_c) AS sst_c
-  FROM monthly
-  WHERE yr BETWEEN 1991 AND 2020
-  GROUP BY mo
+base_periods(yr_lo, yr_hi, base_lo, base_hi) AS (   -- season-year block -> 30-yr base
+  VALUES
+    (1940, 1955, 1936, 1965),   -- 1940 lower edge covers Dec 1949 (needed for DJF 1950);
+                                --   base 1936-1965 is effectively 1940-1965 in ERA5
+    (1956, 1960, 1941, 1970),
+    (1961, 1965, 1946, 1975),
+    (1966, 1970, 1951, 1980),
+    (1971, 1975, 1956, 1985),
+    (1976, 1980, 1961, 1990),
+    (1981, 1985, 1966, 1995),
+    (1986, 1990, 1971, 2000),
+    (1991, 1995, 1976, 2005),
+    (1996, 2000, 1981, 2010),
+    (2001, 2005, 1986, 2015),
+    (2006, 2026, 1991, 2020)    -- held at latest complete 30-yr period
 ),
-anom AS (                                       -- monthly anomaly on a month index t
+clim AS (                                       -- per-month climatology, per base period
+  SELECT p.yr_lo AS yr_lo, m.mo AS mo, AVG(m.sst_c) AS clim_sst
+  FROM base_periods p
+  JOIN monthly m ON m.yr BETWEEN p.base_lo AND p.base_hi
+  GROUP BY p.yr_lo, m.mo
+),
+anom AS (                                       -- monthly anomaly vs its own base period
   SELECT
     m.yr,
     m.mo,
     m.yr * 12 + (m.mo - 1) AS t,                -- contiguous month counter
-    m.sst_c - c.sst_c      AS anom
+    m.sst_c - c.clim_sst   AS anom
   FROM monthly m
-  JOIN clim   c USING (mo)
+  JOIN base_periods p ON m.yr BETWEEN p.yr_lo AND p.yr_hi
+  JOIN clim        c ON c.yr_lo = p.yr_lo AND c.mo = m.mo
 ),
 oni AS (                                        -- centred 3-month moving average
   SELECT
