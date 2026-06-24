@@ -40,10 +40,10 @@ pub fn read_zarr(
 
 ## Foundational data model
 
-### 1. Flatten nD → 2D (Cartesian product)
-`src/reader/zarr_reader.rs` — `read_zarr` / `read_zarr_async` do the flattening +
-Arrow conversion; `build_read_plans` turns a coordinate selection into the chunk
-reads that materialize the rows (a row per grid cell).
+### 1. Flatten nD → 2D (Cartesian product), as an Arrow `RecordBatch` stream
+`src/reader/zarr_reader.rs` — `read_zarr` / `read_zarr_async` do the flattening
+and the **Apache Arrow** conversion; `build_read_plans` turns a coordinate
+selection into the chunk reads that materialize the rows (a row per grid cell).
 
 ```rust
 // src/reader/zarr_reader.rs — build_read_plans
@@ -60,6 +60,46 @@ fn build_read_plans(
     ...
 }
 ```
+
+**Apache Arrow is the output contract.** Each flattened column is an Arrow
+`ArrayRef` (coordinates as `DictionaryArray`, decision 3; data variables as
+primitive arrays), assembled into a single `RecordBatch` — the columnar,
+zero-copy unit DataFusion operates on. `RecordBatchOptions::with_row_count`
+carries the row count even for an empty projection (e.g. `COUNT(*)`), where there
+are no columns to infer it from:
+
+```rust
+// src/reader/zarr_reader.rs — create_result_batch (nD values -> Arrow columns -> one RecordBatch)
+fn create_result_batch(projected_schema: SchemaRef, result_arrays: Vec<ArrayRef>,
+                       final_rows: usize) -> Result<RecordBatch> {
+    if result_arrays.is_empty() {                       // empty projection (COUNT(*))
+        Ok(RecordBatch::try_new_with_options(projected_schema, result_arrays,
+            &RecordBatchOptions::new().with_row_count(Some(final_rows)))?)
+    } else {
+        Ok(RecordBatch::try_new(projected_schema, result_arrays)?)
+    }
+}
+```
+
+**Done lazily — deferred, pull-based execution.** `read_zarr` returns a
+`SendableRecordBatchStream`, not eager rows: `ZarrTable::scan` only *plans*, and
+no bytes are read until DataFusion polls the stream returned by
+`ZarrExec::execute`. Combined with projection / filter / limit pushdown (decisions
+5–9) and partition slicing (decision 16), the cube is never fully materialized —
+only the chunks a query needs are read, per partition.
+
+```rust
+// src/reader/zarr_reader.rs — wrap the batch in a pull-based stream (one per partition)
+let batch = create_result_batch(projected_schema.clone(), result_arrays, final_rows)?;
+let stream = stream::iter(vec![Ok(batch)]);
+Ok(Box::pin(RecordBatchStreamAdapter::new(projected_schema, stream)))
+```
+
+> Caveat: each partition currently emits a **single** `RecordBatch` (one
+> `stream::iter(vec![Ok(batch)])`). True multi-batch streaming — yielding batches
+> incrementally instead of building one per partition — is a roadmap item
+> ("Streaming RecordBatch output" in the README), so laziness today comes from
+> deferred execution + pushdown + partitioning, not from chunk-by-chunk emission.
 
 ### 2. Structural convention (1D = coord, nD = data var)
 `src/reader/schema_inference.rs` — role inference from array shape, and v2/v3

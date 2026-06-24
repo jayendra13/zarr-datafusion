@@ -440,6 +440,12 @@ src/
 
 ### Design docs
 
+- **[Architecture overview](docs/architecture-overview.md)** — bird's-eye view of
+  how the modules connect and the key data structures/methods that link them,
+  traced through a CLI query.
+- **[DataFusion integration](docs/datafusion-integration.md)** — which DataFusion
+  concepts we use, and the line between what zarr-datafusion owns and what it
+  borrows from DataFusion.
 - **[Design decisions](docs/design-decisions.md)** — the pivotal design decisions
   behind the query engine, ADR-style, with rationale and trade-offs.
 - **[Design decisions — code map](docs/design-decisions-code-map.md)** — maps each
