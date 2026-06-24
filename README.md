@@ -438,6 +438,13 @@ src/
 └── udtf.rs                      # zarr_describe() table function
 ```
 
+### Design docs
+
+- **[Design decisions](docs/design-decisions.md)** — the pivotal design decisions
+  behind the query engine, ADR-style, with rationale and trade-offs.
+- **[Design decisions — code map](docs/design-decisions-code-map.md)** — maps each
+  decision to the files, traits, and functions that implement it.
+
 ## Dependencies
 
 - `arrow` - Apache Arrow for columnar data
