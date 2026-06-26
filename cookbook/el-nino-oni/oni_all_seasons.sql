@@ -10,12 +10,11 @@
 --  DJF 1998 = Dec 1997, Jan 1998, Feb 1998.
 --
 --  CLIMATOLOGY: each season uses NOAA CPC's centered 30-year base period that
---  shifts forward every 5 years — NOT a single fixed window. A single fixed
---  1991-2020 base makes deep-past anomalies depart from a modern-warm mean,
---  which inflates a spurious pre-1991 cold bias and plants a false changepoint
---  right at 1991 (the base-window edge). Moving the base with the data removes
---  both: vs NOAA this drops MAE 0.21 -> 0.17 °C, bias -0.14 -> -0.04 °C, and
---  the spurious 1991 break disappears.
+--  shifts forward every 5 years — NOT a single fixed window. A 30-year normal is a
+--  snapshot of a warming climate, so NOAA's rolling, centred schedule keeps each
+--  season's baseline contemporary to the data it explains. Reproducing that
+--  schedule is what keeps this faithful to NOAA: near-zero overall bias (-0.04 °C)
+--  and no climatology-induced break in the residual.
 --
 --  NOAA base-period schedule (from CPC's ONI_change documentation; the stated
 --  "1950-1955 -> 1936-1965, 1956-1960 -> 1941-1970, and so on" +5yr pattern,

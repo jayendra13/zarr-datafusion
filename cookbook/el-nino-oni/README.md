@@ -9,7 +9,7 @@ then validate it against NOAA CPC's official ONI table.
 
 | | |
 |---|---|
-| MAE (anomaly) | **0.17 °C** overall · **0.12 °C** in the satellite era (1979+) |
+| MAE (anomaly) | **0.17 °C** overall · **0.12 °C** from 1979 on (drops gradually toward the present) |
 | Pearson r | **0.966** |
 | Mean bias | **−0.04 °C** (negligible — essentially unbiased) |
 | ENSO-phase agreement | **quadratic-weighted κ = 0.88**, with **zero La Niña↔El Niño sign flips** |
@@ -82,12 +82,13 @@ a month's year range-joins to exactly one block, the per-block per-month
 climatology is computed over that block's 30-year window, and the anomaly is taken
 against it.
 
-**Why it matters.** A naïve single fixed 1991–2020 base measures deep-past SSTs
-against a modern-warm mean, injecting a spurious **−0.21 °C cold bias before 1991**
-and a false changepoint sitting exactly on the base-window edge at 1991. Moving the
-base with the data removes both — overall MAE drops **0.21 → 0.17 °C**, bias
-**−0.14 → −0.04 °C**, and the 1991 artifact disappears (the only remaining residual
-break is ~1965, attributable to ERA5 itself; see Caveats).
+**Why it matters.** A 30-year climatology is a snapshot of a *warming* climate, so
+the "normal" is a moving target. NOAA's rolling, centred schedule keeps each season's
+baseline contemporary to the data it explains, rather than judging every era against
+one era's mean. Reproducing that schedule is what keeps the comparison faithful to
+NOAA — it yields the near-zero overall bias (**−0.04 °C**) and leaves no
+climatology-induced break in the residual (the only residual break, ~1965, is
+attributable to ERA5 itself; see Caveats).
 
 ---
 
@@ -153,24 +154,35 @@ accuracy (Neutral dominates and inflates it).
 | Pearson r | 0.966 |
 | R² | 0.927 |
 
-**The satellite-era split is the key result:**
+**Error shrinks toward the present.** The references frame **1979** as ERA5's
+satellite-era boundary — original ERA5 begins in 1979, and the 1950–1978 portion is a
+separate, more uncertain back-extension (Bell et al. 2021). So 1979 is a natural
+vantage point to *look at*, and split there the error is roughly halved:
 
 | Era | N | MAE | bias |
 |-----|---|-----|------|
 | pre-1979 | 348 | 0.25 | −0.03 |
-| 1979+ | 568 | **0.12** | −0.04 |
+| 1979+ | 568 | 0.12 | −0.04 |
 
-Error roughly halves at 1979 — ERA5 gains satellite constraint over the tropical
-Pacific. Post-1979 MAE (0.12 °C) is at the expected ERA5-vs-ERSSTv5 floor. Note the
-bias is **flat and near-zero across the split** (−0.03 vs −0.04): with the rolling
-base period there is no systematic offset to remove, so the satellite era is now
-purely a **scatter/precision** improvement, not a bias one.
+We'd read this cautiously, though: 1979 is a line we *borrowed*, not one our residuals
+single out. Binned by decade the change looks less like a step at 1979 and more like a
+gradual decline as the observing system densifies — and cuts anywhere in ~1970–1990
+give a similar drop, so the exact year isn't doing the work:
+
+| Decade | 1950s | 1960s | 1970s | 1980s | 1990s | 2000s | 2010s | 2020s |
+|---|---|---|---|---|---|---|---|---|
+| MAE | 0.21 | 0.29 | 0.22 | 0.16 | 0.13 | 0.11 | 0.09 | 0.09 |
+
+Error peaks in the **1960s** and is already easing by the late 1970s, consistent with
+ERA5 being more weakly constrained over the tropical Pacific the further back you go
+(Hersbach et al. 2020; Bell et al. 2021). The **bias**, by contrast, stays flat and
+near-zero throughout (−0.03 vs −0.04) — the rolling base period leaves no systematic
+offset, so what improves toward the present is **scatter/precision**, not bias.
 
 ![ONI residual over time, split at 1979](oni_residual.png)
 
-The scatter visibly collapses at the 1979 boundary while the per-era bias lines sit
-together near zero — the satellite era tightens spread, and the rolling base has
-already eliminated the offset.
+The residual scatter is widest in the deep past and tightens toward the present, while
+the per-era bias lines sit together near zero.
 
 ### ENSO class
 
@@ -193,11 +205,32 @@ disagreements are the harmless kind.
 | Neutral | 0.86 | 0.84 |
 | El Niño | 0.92 | 0.84 |
 
-With the cold bias removed the recalls are now well balanced (La Niña 0.92, El Niño
-0.84) — versus the lopsided 0.95 / 0.79 a fixed 1991–2020 base produced. A faint
-residual asymmetry remains (we still slightly over-call La Niña and under-call
-El Niño), but our El Niño calls stay almost always right (precision 0.92). The worst
-residuals (1963, 1973 — weak, pre-satellite events) are deep-past cases.
+The recalls are well balanced (La Niña 0.92, El Niño 0.84). A faint residual
+asymmetry remains (we still slightly over-call La Niña and under-call El Niño), but
+our El Niño calls stay almost always right (precision 0.92). The worst residuals
+(1963, 1973 — weak, pre-satellite events) are deep-past cases.
+
+---
+
+## Is the low MAE just a low-variance artifact?
+
+A fair question: ONI is a small-amplitude, heavily smoothed index (σ ≈ 0.8 °C), so
+could **0.17 °C** look good simply because there is little to get wrong? The two
+headline metrics answer in **opposite** directions, which is the tell:
+
+- **Pearson r = 0.966 is not a low-variance effect — it is the opposite.** r measures
+  *shared variance*; a near-flat, low-variance signal would *depress* r, not inflate
+  it. The high r reflects that ENSO's large, coherent swings (the ±1–2.5 °C El Niño /
+  La Niña events) are genuinely tracked, not that the signal is small.
+- **MAE has a partial scale component, but clears the bar anyway.** Judge it against
+  the trivial "always Neutral (0)" baseline, whose MAE = mean(|ONI|) ≈ 0.6–0.7 °C. At
+  0.17 °C we are **~4× better** than that null model, and the number responds to
+  methodology (e.g. the base-period schedule) — neither would be true if low variance
+  were doing the work.
+
+Decisively, the two series come from **independent** SST products (ERA5 vs NOAA's
+ERSSTv5), so the agreement cannot be circular. Low variance would help MAE but *hurt*
+r; having both strong at once is a result low variance alone cannot manufacture.
 
 ---
 
@@ -212,11 +245,13 @@ residuals (1963, 1973 — weak, pre-satellite events) are deep-past cases.
   Every later base period is fully covered. This is the one place the climatology
   cannot exactly match NOAA, and it is the most likely source of the small residual
   changepoint near ~1965.
-- **Pre-~1965 / pre-1979:** ERA5 is weakly constrained over the tropical Pacific
-  before the satellite era — treat the deep past with more caution. This (not the
-  climatology) is now the dominant residual error.
+- **Deep past:** ERA5 appears more weakly constrained over the tropical Pacific the
+  further back you go (error peaks in the 1960s, easing toward the present) — treat the
+  deep past with more caution. The references mark 1979 as the satellite-era boundary,
+  but in our residuals the decline reads as gradual rather than a sharp break there.
+  This (not the climatology) looks like the dominant residual error.
 
-**Cheap improvement:** sample the true monthly mean instead of noon-15th — would
+**Furtther improvement:** sample the true monthly mean instead of noon-15th — would
 shave the remaining scatter, especially in the noisier deep past.
 
 ---
@@ -228,7 +263,8 @@ NOAA CPC — Oceanic Niño Index (ONI), ERSSTv5, centred rolling 30-year base pe
 - Data:  https://www.cpc.ncep.noaa.gov/data/indices/oni.ascii.txt
 - Base-period schedule: https://www.cpc.ncep.noaa.gov/products/analysis_monitoring/ensostuff/ONI_change.shtml
 
-The 1979 "satellite era" split is the standard reanalysis breakpoint (TIROS-N / TOVS
-operational late 1978):
+On 1979 as the conventional reanalysis "satellite era" boundary (TIROS-N / TOVS
+operational late 1978) — the line we borrow to look at the change, not one our
+residuals single out:
 - Hersbach et al. (2020), *The ERA5 global reanalysis*, QJRMS — https://rmets.onlinelibrary.wiley.com/doi/full/10.1002/qj.3803
 - Bell et al. (2021), *ERA5 preliminary extension to 1950*, QJRMS (frames pre-1979 as the weaker pre-satellite back-extension) — https://rmets.onlinelibrary.wiley.com/doi/10.1002/qj.4174
