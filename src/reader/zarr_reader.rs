@@ -980,6 +980,149 @@ fn build_batch(
     create_result_batch(ctx.projected_schema.clone(), result_arrays, final_rows)
 }
 
+/// Chop an outer-axis selection into contiguous sub-selections of at most
+/// `max_steps` surviving indices each (the last may be shorter). Order and
+/// membership are preserved, so concatenating the per-window batches reproduces
+/// the un-windowed result. An empty selection yields one empty window so the scan
+/// still emits a single empty batch with the projected schema.
+fn window_outer_selection(sel: &CoordSelection, max_steps: usize) -> Vec<CoordSelection> {
+    let max_steps = max_steps.max(1);
+    match sel {
+        CoordSelection::Range(s, e) => {
+            if e <= s {
+                return vec![CoordSelection::Range(*s, *s)];
+            }
+            let mut out = Vec::with_capacity((e - s).div_ceil(max_steps));
+            let mut a = *s;
+            while a < *e {
+                let b = (a + max_steps).min(*e);
+                out.push(CoordSelection::Range(a, b));
+                a = b;
+            }
+            out
+        }
+        CoordSelection::Indices(v) => {
+            if v.is_empty() {
+                return vec![CoordSelection::Indices(Vec::new())];
+            }
+            v.chunks(max_steps)
+                .map(|c| CoordSelection::Indices(c.to_vec()))
+                .collect()
+        }
+    }
+}
+
+/// Lazy, memory-bounded scan state: produces one `RecordBatch` per outer-axis
+/// window on demand (Block 0 Phase 2). Owns everything `build_batch` needs so the
+/// stream can outlive `read_zarr`'s stack frame; a fresh `BatchCtx` borrowing this
+/// state is built per window.
+struct WindowedScan {
+    store: Arc<TrackedStore<FilesystemStore>>,
+    store_meta: ZarrStoreMeta,
+    schema: SchemaRef,
+    projected_schema: SchemaRef,
+    projected_indices: Vec<usize>,
+    coord_names: Vec<String>,
+    effective_coord_indices: Vec<usize>,
+    coord_sizes: Vec<usize>,
+    stats: Option<SharedIoStats>,
+    query_coord_sizes: Vec<usize>,
+    filtered_coord_values: Vec<CoordValues>,
+    coord_ranges: Option<Vec<CoordSelection>>,
+    windows: Vec<CoordSelection>,
+    /// Coord-space index of the outer (most-significant) effective coordinate.
+    outer_coord_idx: usize,
+    /// Product of the non-outer effective sizes (rows per outer step).
+    inner_rows: usize,
+    limit: Option<usize>,
+    // Cursor.
+    widx: usize,
+    /// Survivor offset of the next window into the outer coord's filtered values.
+    offset: usize,
+    /// Rows emitted so far (drives the LIMIT stop).
+    emitted: usize,
+}
+
+impl WindowedScan {
+    /// Build the next window's batch, or `None` when the windows are exhausted or
+    /// the LIMIT has been reached (later windows are never read — laziness).
+    fn next_batch(&mut self) -> Option<Result<RecordBatch>> {
+        if self.widx >= self.windows.len() {
+            return None;
+        }
+        if let Some(limit) = self.limit {
+            if self.emitted >= limit {
+                return None;
+            }
+        }
+
+        let window = self.windows[self.widx].clone();
+        let wlen = window.len();
+        let window_rows = wlen * self.inner_rows;
+        let off = self.offset;
+
+        // Narrow the resolved selection to this window: the outer coord's size, its
+        // filtered values, and the data-var read ranges all shrink to the window.
+        let mut query_coord_sizes = self.query_coord_sizes.clone();
+        query_coord_sizes[0] = wlen;
+        let filtered_coord_values: Vec<CoordValues> = self
+            .filtered_coord_values
+            .iter()
+            .enumerate()
+            .map(|(i, v)| {
+                if i == self.outer_coord_idx {
+                    v.slice(off, off + wlen)
+                } else {
+                    v.clone()
+                }
+            })
+            .collect();
+        let coord_ranges = restrict_to_partition(
+            self.coord_ranges.clone(),
+            self.outer_coord_idx,
+            &window,
+            &self.coord_sizes,
+        );
+
+        // LIMIT as a running cap: this window contributes at most the rows still owed.
+        let (final_rows, limit_w) = match self.limit {
+            Some(limit) => {
+                let remaining = limit - self.emitted;
+                (remaining.min(window_rows), Some(remaining))
+            }
+            None => (window_rows, None),
+        };
+
+        let ctx = BatchCtx {
+            store: &self.store,
+            store_meta: &self.store_meta,
+            schema: &self.schema,
+            projected_schema: &self.projected_schema,
+            projected_indices: &self.projected_indices,
+            coord_names: &self.coord_names,
+            effective_coord_indices: &self.effective_coord_indices,
+            coord_sizes: &self.coord_sizes,
+            stats: &self.stats,
+        };
+        let batch = build_batch(
+            &ctx,
+            &coord_ranges,
+            &query_coord_sizes,
+            &filtered_coord_values,
+            final_rows,
+            limit_w,
+            window_rows,
+        );
+
+        self.widx += 1;
+        self.offset += wlen;
+        if let Ok(ref b) = batch {
+            self.emitted += b.num_rows();
+        }
+        Some(batch)
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn read_zarr(
     store_path: &str,
@@ -992,9 +1135,9 @@ pub fn read_zarr(
     // selection). `None` => read the whole (filtered) store, the legacy
     // single-partition path. (Plain `//`: doc comments aren't allowed on params.)
     partition_selection: Option<CoordSelection>,
-    // Target rows per emitted RecordBatch (DataFusion's batch_size). Threaded in
-    // Phase 0; not yet used (Block 0 streaming wires it up in Phase 2).
-    _batch_size: usize,
+    // Target rows per emitted RecordBatch (DataFusion's batch_size). Drives the
+    // outer-axis windowing of the streaming scan.
+    batch_size: usize,
 ) -> Result<SendableRecordBatchStream> {
     let fs_store = Arc::new(FilesystemStore::new(store_path).map_err(zarr_err)?);
 
@@ -1194,31 +1337,97 @@ pub fn read_zarr(
         &effective_coord_indices,
     );
 
-    let ctx = BatchCtx {
-        store: &store,
-        store_meta: &store_meta,
-        schema: &schema,
-        projected_schema: &projected_schema,
-        projected_indices: &projected_indices,
-        coord_names: &coord_names,
-        effective_coord_indices: &effective_coord_indices,
-        coord_sizes: &coord_sizes,
-        stats: &stats,
-    };
+    // Plan outer-axis windows. Windowing slices the OUTER (most-significant)
+    // effective coordinate, scaling every read by the window — which is only
+    // transparent when each projected data var spans the full coordinate cube.
+    // Mixed-dimensionality vars (fewer dims than coords) would be mis-tiled, so we
+    // fall back to a single batch for them (still correct, just not streamed).
+    // Coordinate columns are always safe.
+    let all_full_cube = projected_indices.iter().all(|&i| {
+        let name = schema.field(i).name();
+        coord_names.iter().any(|c| c == name)
+            || store_meta
+                .data_vars
+                .iter()
+                .find(|v| &v.name == name)
+                .is_some_and(|v| v.shape.len() == coord_names.len())
+    });
+    let windows =
+        if all_full_cube && !effective_coord_indices.is_empty() && !query_coord_sizes.is_empty() {
+            let outer_coord_idx = effective_coord_indices[0];
+            let inner_rows = query_coord_sizes[1..].iter().product::<usize>().max(1);
+            let max_steps = (batch_size / inner_rows).max(1);
+            let outer_sel = match &coord_ranges {
+                Some(sels) => sels[outer_coord_idx].clone(),
+                None => CoordSelection::Range(0, query_coord_sizes[0]),
+            };
+            window_outer_selection(&outer_sel, max_steps)
+        } else {
+            Vec::new()
+        };
 
-    // Phase 1: one batch over the full selection. Phase 2 will split the outer
-    // axis and call build_batch per sub-selection, emitted lazily.
-    let batch = build_batch(
-        &ctx,
-        &coord_ranges,
-        &query_coord_sizes,
-        &filtered_coord_values,
-        final_rows,
+    // Single window (small result, mixed dimensionality, or no windowable axis):
+    // one batch, byte-identical to the un-windowed path.
+    if windows.len() <= 1 {
+        let ctx = BatchCtx {
+            store: &store,
+            store_meta: &store_meta,
+            schema: &schema,
+            projected_schema: &projected_schema,
+            projected_indices: &projected_indices,
+            coord_names: &coord_names,
+            effective_coord_indices: &effective_coord_indices,
+            coord_sizes: &coord_sizes,
+            stats: &stats,
+        };
+        let batch = build_batch(
+            &ctx,
+            &coord_ranges,
+            &query_coord_sizes,
+            &filtered_coord_values,
+            final_rows,
+            limit,
+            query_rows,
+        )?;
+        let stream = stream::iter(vec![Ok(batch)]);
+        return Ok(Box::pin(RecordBatchStreamAdapter::new(
+            projected_schema,
+            stream,
+        )));
+    }
+
+    // Multiple windows: emit one batch per window, lazily, bounding peak memory to
+    // ~one window instead of the whole selection.
+    let outer_coord_idx = effective_coord_indices[0];
+    let inner_rows = query_coord_sizes[1..].iter().product::<usize>().max(1);
+    info!(
+        num_windows = windows.len(),
+        inner_rows, batch_size, "Streaming scan: windowing outer axis"
+    );
+    let scan = WindowedScan {
+        store,
+        store_meta,
+        schema,
+        projected_schema: projected_schema.clone(),
+        projected_indices,
+        coord_names,
+        effective_coord_indices,
+        coord_sizes,
+        stats,
+        query_coord_sizes,
+        filtered_coord_values,
+        coord_ranges,
+        windows,
+        outer_coord_idx,
+        inner_rows,
         limit,
-        query_rows,
-    )?;
-    let stream = stream::iter(vec![Ok(batch)]);
-
+        widx: 0,
+        offset: 0,
+        emitted: 0,
+    };
+    let stream = stream::unfold(scan, |mut scan| async move {
+        scan.next_batch().map(|batch| (batch, scan))
+    });
     Ok(Box::pin(RecordBatchStreamAdapter::new(
         projected_schema,
         stream,
@@ -1939,8 +2148,17 @@ mod outer_read_tests {
 
     fn read(partition: Option<CoordSelection>) -> RecordBatch {
         let schema = Arc::new(infer_schema(STORE).unwrap());
-        let stream =
-            read_zarr(STORE, schema.clone(), None, None, None, None, partition, 8192).unwrap();
+        let stream = read_zarr(
+            STORE,
+            schema.clone(),
+            None,
+            None,
+            None,
+            None,
+            partition,
+            8192,
+        )
+        .unwrap();
         let batches: Vec<RecordBatch> = block_on(stream.try_collect()).unwrap();
         concat_batches(&batches[0].schema(), &batches).unwrap()
     }
