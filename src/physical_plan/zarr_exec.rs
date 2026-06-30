@@ -242,8 +242,12 @@ impl ExecutionPlan for ZarrExec {
     fn execute(
         &self,
         partition: usize,
-        _context: std::sync::Arc<datafusion::execution::TaskContext>,
+        context: std::sync::Arc<datafusion::execution::TaskContext>,
     ) -> datafusion::error::Result<datafusion::execution::SendableRecordBatchStream> {
+        // DataFusion decides the target rows per emitted RecordBatch via session
+        // config; we honor it as the streaming batch target (Block 0).
+        let batch_size = context.session_config().batch_size();
+
         // Look up this partition's outer-axis selection. Empty `partitions` =>
         // legacy whole-store read (`None`). The selection is intersected with the
         // filter-derived ranges inside the reader.
@@ -275,6 +279,7 @@ impl ExecutionPlan for ZarrExec {
                 self.limit,
                 self.io_stats.clone(),
                 self.coord_filters.clone(),
+                batch_size,
             );
         }
 
@@ -287,6 +292,7 @@ impl ExecutionPlan for ZarrExec {
                 self.limit,
                 self.io_stats.clone(),
                 self.coord_filters.clone(),
+                batch_size,
             )
         } else if is_remote_url(&self.path) {
             info!("Using remote (async) execution path");
@@ -299,6 +305,7 @@ impl ExecutionPlan for ZarrExec {
                 self.cached_remote.clone(),
                 self.coord_filters.clone(),
                 partition_selection,
+                batch_size,
             )
         } else {
             info!("Using local (sync) execution path");
@@ -310,6 +317,7 @@ impl ExecutionPlan for ZarrExec {
                 Some(self.io_stats.clone()),
                 self.coord_filters.clone(),
                 partition_selection,
+                batch_size,
             )
         }
     }
@@ -346,6 +354,8 @@ struct AsyncReadParams {
     coord_filters: Option<CoordFilters>,
     /// Outer-axis selection for this partition; `None` => whole store.
     partition_selection: Option<CoordSelection>,
+    /// Target rows per emitted RecordBatch (DataFusion's batch_size).
+    batch_size: usize,
 }
 
 /// Execute an async read with the given store setup function.
@@ -393,6 +403,7 @@ where
             cached_meta,
             params.coord_filters,
             params.partition_selection,
+            params.batch_size,
         )
         .await?;
 
@@ -422,6 +433,7 @@ fn execute_remote(
     cached_remote: CachedRemoteStore,
     coord_filters: Option<CoordFilters>,
     partition_selection: Option<CoordSelection>,
+    batch_size: usize,
 ) -> datafusion::error::Result<datafusion::execution::SendableRecordBatchStream> {
     use crate::reader::storage::create_async_store;
 
@@ -434,6 +446,7 @@ fn execute_remote(
         stats,
         coord_filters,
         partition_selection,
+        batch_size,
     };
 
     execute_async_read(
@@ -463,6 +476,7 @@ fn execute_virtualizarr(
     limit: Option<usize>,
     stats: SharedIoStats,
     coord_filters: Option<CoordFilters>,
+    batch_size: usize,
 ) -> datafusion::error::Result<datafusion::execution::SendableRecordBatchStream> {
     use crate::reader::schema_inference::discover_arrays;
 
@@ -479,6 +493,7 @@ fn execute_virtualizarr(
         coord_filters,
         // VirtualiZarr stays single-partition for now (scan() doesn't partition it).
         partition_selection: None,
+        batch_size,
     };
 
     execute_async_read(
@@ -502,6 +517,7 @@ fn execute_virtualizarr_with_adapter(
     limit: Option<usize>,
     stats: SharedIoStats,
     coord_filters: Option<CoordFilters>,
+    batch_size: usize,
 ) -> datafusion::error::Result<datafusion::execution::SendableRecordBatchStream> {
     debug!("Setting up remote VirtualiZarr execution with cached adapter");
 
@@ -512,6 +528,7 @@ fn execute_virtualizarr_with_adapter(
         stats,
         coord_filters,
         partition_selection: None,
+        batch_size,
     };
 
     execute_async_read(

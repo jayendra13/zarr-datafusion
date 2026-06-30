@@ -851,6 +851,7 @@ pub async fn resolve_outer_selection_async(
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn read_zarr(
     store_path: &str,
     schema: SchemaRef,
@@ -862,6 +863,9 @@ pub fn read_zarr(
     // selection). `None` => read the whole (filtered) store, the legacy
     // single-partition path. (Plain `//`: doc comments aren't allowed on params.)
     partition_selection: Option<CoordSelection>,
+    // Target rows per emitted RecordBatch (DataFusion's batch_size). Threaded in
+    // Phase 0; not yet used (Block 0 streaming wires it up in Phase 2).
+    _batch_size: usize,
 ) -> Result<SendableRecordBatchStream> {
     let fs_store = Arc::new(FilesystemStore::new(store_path).map_err(zarr_err)?);
 
@@ -1182,6 +1186,9 @@ pub async fn read_zarr_async(
     coord_filters: Option<CoordFilters>,
     // Outer-axis selection for this partition; `None` => whole store.
     partition_selection: Option<CoordSelection>,
+    // Target rows per emitted RecordBatch (DataFusion's batch_size). Threaded in
+    // Phase 0; not yet used (Block 0 streaming wires it up in Phase 3).
+    _batch_size: usize,
 ) -> Result<SendableRecordBatchStream> {
     info!("Starting async Zarr read");
 
@@ -1871,7 +1878,8 @@ mod outer_read_tests {
 
     fn read(partition: Option<CoordSelection>) -> RecordBatch {
         let schema = Arc::new(infer_schema(STORE).unwrap());
-        let stream = read_zarr(STORE, schema.clone(), None, None, None, None, partition).unwrap();
+        let stream =
+            read_zarr(STORE, schema.clone(), None, None, None, None, partition, 8192).unwrap();
         let batches: Vec<RecordBatch> = block_on(stream.try_collect()).unwrap();
         concat_batches(&batches[0].schema(), &batches).unwrap()
     }
