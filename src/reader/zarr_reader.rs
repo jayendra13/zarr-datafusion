@@ -851,6 +851,135 @@ pub async fn resolve_outer_selection_async(
     )
 }
 
+/// Constant context shared by every batch produced from one scan.
+///
+/// Block 0 Phase 1 extracted the per-batch column-building logic into
+/// [`build_batch`] so each batch runs identical code; this struct carries the
+/// inputs that do *not* change between batches. Phase 2 will call `build_batch`
+/// once per outer-axis sub-selection (lazily), reusing one `BatchCtx`.
+struct BatchCtx<'a> {
+    store: &'a Arc<TrackedStore<FilesystemStore>>,
+    store_meta: &'a ZarrStoreMeta,
+    schema: &'a SchemaRef,
+    projected_schema: &'a SchemaRef,
+    projected_indices: &'a [usize],
+    coord_names: &'a [String],
+    effective_coord_indices: &'a [usize],
+    coord_sizes: &'a [usize],
+    stats: &'a Option<SharedIoStats>,
+}
+
+/// Build a single `RecordBatch` from a resolved selection state.
+///
+/// The varying inputs (`coord_ranges`, `query_coord_sizes`,
+/// `filtered_coord_values`, `final_rows`) describe one slice of the scan; in
+/// Phase 1 they cover the whole selection and this is called once. Phase 2 will
+/// vary them per outer-axis sub-selection. Behavior is identical to the old
+/// inlined block.
+fn build_batch(
+    ctx: &BatchCtx<'_>,
+    coord_ranges: &Option<Vec<CoordSelection>>,
+    query_coord_sizes: &[usize],
+    filtered_coord_values: &[CoordValues],
+    final_rows: usize,
+    limit: Option<usize>,
+    query_rows: usize,
+) -> Result<RecordBatch> {
+    let mut result_arrays: Vec<ArrayRef> = Vec::new();
+
+    for idx in ctx.projected_indices {
+        let field = ctx.schema.field(*idx);
+        let field_name = field.name();
+
+        // Check if this is a coordinate
+        if let Some(coord_idx) = ctx.coord_names.iter().position(|n| n == field_name) {
+            // Skip coordinates not relevant to the projected variables
+            if !ctx.effective_coord_indices.contains(&coord_idx) {
+                debug!(field = %field_name, "Skipping coordinate not used by projected variables");
+                continue;
+            }
+
+            // Find position of this coordinate in the effective set
+            let query_coord_idx = ctx
+                .effective_coord_indices
+                .iter()
+                .position(|&i| i == coord_idx)
+                .unwrap();
+
+            // Create DictionaryArray for coordinate (memory efficient).
+            // Key width comes from the schema field so the array matches the
+            // declared dictionary key type (Int16/Int32/Int64).
+            let dict_array = create_coord_dictionary_typed(
+                &filtered_coord_values[coord_idx],
+                query_coord_idx,
+                query_coord_sizes,
+                final_rows,
+                dictionary_key_type(field.data_type()),
+            );
+            result_arrays.push(dict_array);
+        } else {
+            // Data variable - read filtered subset
+            let read_start = Instant::now();
+            let arr =
+                Array::open(ctx.store.clone(), &format!("/{}", field_name)).map_err(zarr_err)?;
+            let data_var_shape = arr.shape();
+
+            // Chunk shape of this variable (from discovery metadata). Used by the
+            // chunk-bucketing heuristic to coalesce scattered outer-axis (e.g. time)
+            // reads onto chunk boundaries instead of one read per surviving index.
+            let data_var_chunks: Option<Vec<u64>> = ctx
+                .store_meta
+                .data_vars
+                .iter()
+                .find(|v| v.name == *field_name)
+                .and_then(|v| v.chunks.clone());
+            debug!(field = %field_name, chunks = ?data_var_chunks, "Data variable chunk shape");
+
+            // Build read plans: one for all-Range filters; for scattered outer-axis
+            // (e.g. time) indices, one per occupied chunk with a keep-mask.
+            let plans = if let Some(sels) = coord_ranges {
+                build_read_plans(
+                    sels,
+                    ctx.coord_sizes,
+                    data_var_shape,
+                    data_var_chunks.as_deref(),
+                )
+            } else {
+                vec![ReadPlan {
+                    subset: ArraySubset::new_with_shape(arr.shape().to_vec()),
+                    keep: Keep::All,
+                }]
+            };
+            // Elements actually fetched (chunk windows may include non-survivors).
+            let num_elements: u64 = plans.iter().map(|p| p.subset.num_elements()).sum();
+
+            let mut parts: Vec<ArrayRef> = Vec::with_capacity(plans.len());
+            for plan in &plans {
+                let raw = read_data_array!(sync, arr, &plan.subset, field.data_type());
+                parts.push(apply_keep(raw, &plan.keep)?);
+            }
+            let array: ArrayRef = if parts.len() == 1 {
+                parts.remove(0)
+            } else {
+                let refs: Vec<&dyn arrow::array::Array> =
+                    parts.iter().map(|a| a.as_ref()).collect();
+                arrow::compute::concat(&refs).map_err(DataFusionError::from)?
+            };
+
+            if let Some(s) = ctx.stats {
+                let bytes = num_elements * arrow_dtype_to_bytes(field.data_type());
+                s.record_data(bytes, read_start.elapsed());
+            }
+            result_arrays.push(array);
+        }
+    }
+
+    // Apply limit if specified (slice the already-filtered arrays)
+    let result_arrays = apply_limit_to_arrays(result_arrays, limit, query_rows);
+
+    create_result_batch(ctx.projected_schema.clone(), result_arrays, final_rows)
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn read_zarr(
     store_path: &str,
@@ -1057,93 +1186,7 @@ pub fn read_zarr(
         }
     }
 
-    let mut result_arrays: Vec<ArrayRef> = Vec::new();
-
-    for idx in &projected_indices {
-        let field = schema.field(*idx);
-        let field_name = field.name();
-
-        // Check if this is a coordinate
-        if let Some(coord_idx) = coord_names.iter().position(|n| n == field_name) {
-            // Skip coordinates not relevant to the projected variables
-            if !effective_coord_indices.contains(&coord_idx) {
-                debug!(field = %field_name, "Skipping coordinate not used by projected variables");
-                continue;
-            }
-
-            // Find position of this coordinate in the effective set
-            let query_coord_idx = effective_coord_indices
-                .iter()
-                .position(|&i| i == coord_idx)
-                .unwrap();
-
-            // Create DictionaryArray for coordinate (memory efficient).
-            // Key width comes from the schema field so the array matches the
-            // declared dictionary key type (Int16/Int32/Int64).
-            let dict_array = create_coord_dictionary_typed(
-                &filtered_coord_values[coord_idx],
-                query_coord_idx,
-                &query_coord_sizes,
-                final_rows,
-                dictionary_key_type(field.data_type()),
-            );
-            result_arrays.push(dict_array);
-        } else {
-            // Data variable - read filtered subset
-            let read_start = Instant::now();
-            let arr = Array::open(store.clone(), &format!("/{}", field_name)).map_err(zarr_err)?;
-            let data_var_shape = arr.shape();
-
-            // Chunk shape of this variable (from discovery metadata). Used by the
-            // chunk-bucketing heuristic to coalesce scattered outer-axis (e.g. time)
-            // reads onto chunk boundaries instead of one read per surviving index.
-            let data_var_chunks: Option<Vec<u64>> = store_meta
-                .data_vars
-                .iter()
-                .find(|v| v.name == *field_name)
-                .and_then(|v| v.chunks.clone());
-            debug!(field = %field_name, chunks = ?data_var_chunks, "Data variable chunk shape");
-
-            // Build read plans: one for all-Range filters; for scattered outer-axis
-            // (e.g. time) indices, one per occupied chunk with a keep-mask.
-            let plans = if let Some(ref sels) = coord_ranges {
-                build_read_plans(
-                    sels,
-                    &coord_sizes,
-                    data_var_shape,
-                    data_var_chunks.as_deref(),
-                )
-            } else {
-                vec![ReadPlan {
-                    subset: ArraySubset::new_with_shape(arr.shape().to_vec()),
-                    keep: Keep::All,
-                }]
-            };
-            // Elements actually fetched (chunk windows may include non-survivors).
-            let num_elements: u64 = plans.iter().map(|p| p.subset.num_elements()).sum();
-
-            let mut parts: Vec<ArrayRef> = Vec::with_capacity(plans.len());
-            for plan in &plans {
-                let raw = read_data_array!(sync, arr, &plan.subset, field.data_type());
-                parts.push(apply_keep(raw, &plan.keep)?);
-            }
-            let array: ArrayRef = if parts.len() == 1 {
-                parts.remove(0)
-            } else {
-                let refs: Vec<&dyn arrow::array::Array> =
-                    parts.iter().map(|a| a.as_ref()).collect();
-                arrow::compute::concat(&refs).map_err(DataFusionError::from)?
-            };
-
-            if let Some(ref s) = stats {
-                let bytes = num_elements * arrow_dtype_to_bytes(field.data_type());
-                s.record_data(bytes, read_start.elapsed());
-            }
-            result_arrays.push(array);
-        }
-    }
-
-    // Build projected schema, excluding coordinates that were skipped
+    // Build projected schema (constant across batches), excluding skipped coords.
     let projected_schema = build_projected_schema(
         &schema,
         &projected_indices,
@@ -1151,11 +1194,29 @@ pub fn read_zarr(
         &effective_coord_indices,
     );
 
-    // Apply limit if specified (slice the already-filtered arrays)
-    let result_arrays = apply_limit_to_arrays(result_arrays, limit, query_rows);
+    let ctx = BatchCtx {
+        store: &store,
+        store_meta: &store_meta,
+        schema: &schema,
+        projected_schema: &projected_schema,
+        projected_indices: &projected_indices,
+        coord_names: &coord_names,
+        effective_coord_indices: &effective_coord_indices,
+        coord_sizes: &coord_sizes,
+        stats: &stats,
+    };
 
-    // Create result batch and wrap in stream
-    let batch = create_result_batch(projected_schema.clone(), result_arrays, final_rows)?;
+    // Phase 1: one batch over the full selection. Phase 2 will split the outer
+    // axis and call build_batch per sub-selection, emitted lazily.
+    let batch = build_batch(
+        &ctx,
+        &coord_ranges,
+        &query_coord_sizes,
+        &filtered_coord_values,
+        final_rows,
+        limit,
+        query_rows,
+    )?;
     let stream = stream::iter(vec![Ok(batch)]);
 
     Ok(Box::pin(RecordBatchStreamAdapter::new(
