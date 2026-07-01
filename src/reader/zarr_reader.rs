@@ -1442,6 +1442,229 @@ use super::schema_inference::{discover_arrays_async, ZarrStoreMeta};
 use zarrs::storage::AsyncReadableListableStorage;
 use zarrs_object_store::object_store::path::Path as ObjectPath;
 
+/// Async twin of [`BatchCtx`]: constant context for [`build_batch_async`].
+struct AsyncBatchCtx<'a> {
+    store: &'a AsyncReadableListableStorage,
+    prefix: &'a ObjectPath,
+    store_meta: &'a ZarrStoreMeta,
+    schema: &'a SchemaRef,
+    projected_schema: &'a SchemaRef,
+    projected_indices: &'a [usize],
+    coord_names: &'a [String],
+    effective_coord_indices: &'a [usize],
+    coord_sizes: &'a [usize],
+    stats: &'a Option<SharedIoStats>,
+}
+
+/// Async twin of [`build_batch`]: builds one `RecordBatch` from a resolved
+/// selection state using async object-store reads. `final_rows` is the async
+/// path's `effective_rows` (limit already folded into it); `total_rows` feeds the
+/// no-filter limit-subset read optimization, which only fires when `coord_ranges`
+/// is `None` (i.e. the single, un-windowed batch).
+#[allow(clippy::too_many_arguments)]
+async fn build_batch_async(
+    ctx: &AsyncBatchCtx<'_>,
+    coord_ranges: &Option<Vec<CoordSelection>>,
+    query_coord_sizes: &[usize],
+    filtered_coord_values: &[CoordValues],
+    final_rows: usize,
+    limit: Option<usize>,
+    query_rows: usize,
+    total_rows: usize,
+) -> Result<RecordBatch> {
+    let mut result_arrays: Vec<ArrayRef> = Vec::new();
+
+    for idx in ctx.projected_indices {
+        let field = ctx.schema.field(*idx);
+        let field_name = field.name();
+
+        if let Some(coord_idx) = ctx.coord_names.iter().position(|n| n == field_name) {
+            if !ctx.effective_coord_indices.contains(&coord_idx) {
+                debug!(field = %field_name, "Skipping coordinate not used by projected variables");
+                continue;
+            }
+            let query_coord_idx = ctx
+                .effective_coord_indices
+                .iter()
+                .position(|&i| i == coord_idx)
+                .unwrap();
+            let dict_array = create_coord_dictionary_typed(
+                &filtered_coord_values[coord_idx],
+                query_coord_idx,
+                query_coord_sizes,
+                final_rows,
+                dictionary_key_type(field.data_type()),
+            );
+            result_arrays.push(dict_array);
+        } else {
+            let read_start = Instant::now();
+            let array_path = if ctx.prefix.as_ref().is_empty() {
+                format!("/{}", field_name)
+            } else {
+                format!("/{}/{}", ctx.prefix, field_name)
+            };
+            let arr = Array::async_open(ctx.store.clone(), &array_path)
+                .await
+                .map_err(zarr_err)?;
+            let data_var_shape = arr.shape();
+            let data_var_chunks: Option<Vec<u64>> = ctx
+                .store_meta
+                .data_vars
+                .iter()
+                .find(|v| v.name == *field_name)
+                .and_then(|v| v.chunks.clone());
+
+            let plans = if let Some(sels) = coord_ranges {
+                build_read_plans(
+                    sels,
+                    ctx.coord_sizes,
+                    data_var_shape,
+                    data_var_chunks.as_deref(),
+                )
+            } else if final_rows < total_rows {
+                // No filter, but a LIMIT: read only the leading rows.
+                let ranges = calculate_limited_subset(arr.shape(), final_rows);
+                vec![ReadPlan {
+                    subset: ArraySubset::new_with_ranges(&ranges),
+                    keep: Keep::All,
+                }]
+            } else {
+                vec![ReadPlan {
+                    subset: ArraySubset::new_with_shape(arr.shape().to_vec()),
+                    keep: Keep::All,
+                }]
+            };
+            let num_elements: u64 = plans.iter().map(|p| p.subset.num_elements()).sum();
+
+            let mut parts: Vec<ArrayRef> = Vec::with_capacity(plans.len());
+            for plan in &plans {
+                let raw = read_data_array!(async, arr, &plan.subset, field.data_type());
+                parts.push(apply_keep(raw, &plan.keep)?);
+            }
+            let array: ArrayRef = if parts.len() == 1 {
+                parts.remove(0)
+            } else {
+                let refs: Vec<&dyn arrow::array::Array> =
+                    parts.iter().map(|a| a.as_ref()).collect();
+                arrow::compute::concat(&refs).map_err(DataFusionError::from)?
+            };
+
+            if let Some(s) = ctx.stats {
+                let bytes = num_elements * arrow_dtype_to_bytes(field.data_type());
+                s.record_data(bytes, read_start.elapsed());
+            }
+            result_arrays.push(array);
+        }
+    }
+
+    let result_arrays = apply_limit_to_arrays(result_arrays, limit, query_rows);
+    create_result_batch(ctx.projected_schema.clone(), result_arrays, final_rows)
+}
+
+/// Async twin of [`WindowedScan`]: produces one `RecordBatch` per outer-axis
+/// window via async reads, on demand.
+struct AsyncWindowedScan {
+    store: AsyncReadableListableStorage,
+    prefix: ObjectPath,
+    store_meta: ZarrStoreMeta,
+    schema: SchemaRef,
+    projected_schema: SchemaRef,
+    projected_indices: Vec<usize>,
+    coord_names: Vec<String>,
+    effective_coord_indices: Vec<usize>,
+    coord_sizes: Vec<usize>,
+    stats: Option<SharedIoStats>,
+    query_coord_sizes: Vec<usize>,
+    filtered_coord_values: Vec<CoordValues>,
+    coord_ranges: Option<Vec<CoordSelection>>,
+    windows: Vec<CoordSelection>,
+    outer_coord_idx: usize,
+    inner_rows: usize,
+    limit: Option<usize>,
+    total_rows: usize,
+    widx: usize,
+    offset: usize,
+    emitted: usize,
+}
+
+impl AsyncWindowedScan {
+    async fn next_batch(&mut self) -> Option<Result<RecordBatch>> {
+        if self.widx >= self.windows.len() {
+            return None;
+        }
+        if let Some(limit) = self.limit {
+            if self.emitted >= limit {
+                return None;
+            }
+        }
+
+        let window = self.windows[self.widx].clone();
+        let wlen = window.len();
+        let window_rows = wlen * self.inner_rows;
+        let off = self.offset;
+
+        let mut query_coord_sizes = self.query_coord_sizes.clone();
+        query_coord_sizes[0] = wlen;
+        let filtered_coord_values: Vec<CoordValues> = self
+            .filtered_coord_values
+            .iter()
+            .enumerate()
+            .map(|(i, v)| {
+                if i == self.outer_coord_idx {
+                    v.slice(off, off + wlen)
+                } else {
+                    v.clone()
+                }
+            })
+            .collect();
+        let coord_ranges = restrict_to_partition(
+            self.coord_ranges.clone(),
+            self.outer_coord_idx,
+            &window,
+            &self.coord_sizes,
+        );
+
+        let (final_rows, limit_w) = match self.limit {
+            Some(limit) => {
+                let remaining = limit - self.emitted;
+                (remaining.min(window_rows), Some(remaining))
+            }
+            None => (window_rows, None),
+        };
+
+        let ctx = AsyncBatchCtx {
+            store: &self.store,
+            prefix: &self.prefix,
+            store_meta: &self.store_meta,
+            schema: &self.schema,
+            projected_schema: &self.projected_schema,
+            projected_indices: &self.projected_indices,
+            coord_names: &self.coord_names,
+            effective_coord_indices: &self.effective_coord_indices,
+            coord_sizes: &self.coord_sizes,
+            stats: &self.stats,
+        };
+        let batch = build_batch_async(
+            &ctx,
+            &coord_ranges,
+            &query_coord_sizes,
+            &filtered_coord_values,
+            final_rows,
+            limit_w,
+            window_rows,
+            self.total_rows,
+        )
+        .await;
+
+        self.widx += 1;
+        self.offset += wlen;
+        if let Ok(ref b) = batch {
+            self.emitted += b.num_rows();
+        }
+        Some(batch)
+    }
+}
+
 /// Async version of read_zarr for remote object stores
 #[allow(clippy::too_many_arguments)]
 #[instrument(level = "info", skip_all)]
@@ -1456,9 +1679,9 @@ pub async fn read_zarr_async(
     coord_filters: Option<CoordFilters>,
     // Outer-axis selection for this partition; `None` => whole store.
     partition_selection: Option<CoordSelection>,
-    // Target rows per emitted RecordBatch (DataFusion's batch_size). Threaded in
-    // Phase 0; not yet used (Block 0 streaming wires it up in Phase 3).
-    _batch_size: usize,
+    // Target rows per emitted RecordBatch (DataFusion's batch_size). Drives the
+    // outer-axis windowing of the streaming scan.
+    batch_size: usize,
 ) -> Result<SendableRecordBatchStream> {
     info!("Starting async Zarr read");
 
@@ -1686,136 +1909,11 @@ pub async fn read_zarr_async(
     // Recalculate effective_rows with limit applied to query_rows
     let effective_rows = limit.map(|l| l.min(query_rows)).unwrap_or(query_rows);
 
-    let mut result_arrays: Vec<ArrayRef> = Vec::new();
+    // `effective_rows` already folds LIMIT into query_rows; it is the async twin
+    // of the sync path's `final_rows`.
+    let final_rows = effective_rows;
 
-    for idx in &projected_indices {
-        let field = schema.field(*idx);
-        let field_name = field.name();
-
-        // Check if this is a coordinate
-        if let Some(coord_idx) = coord_names.iter().position(|n| n == field_name) {
-            // Skip coordinates not relevant to the projected variables
-            if !effective_coord_indices.contains(&coord_idx) {
-                debug!(field = %field_name, "Skipping coordinate not used by projected variables");
-                continue;
-            }
-
-            // Find position of this coordinate in the effective set
-            let query_coord_idx = effective_coord_indices
-                .iter()
-                .position(|&i| i == coord_idx)
-                .unwrap();
-
-            debug!(field = %field_name, coord_idx, query_coord_idx, "Building dictionary array for coordinate");
-            // Create DictionaryArray for coordinate (memory efficient)
-            // Use query_coord_idx for position within the effective coordinate set.
-            // Key width comes from the schema field's declared dictionary key type.
-            let dict_array = create_coord_dictionary_typed(
-                &filtered_coord_values[coord_idx],
-                query_coord_idx,
-                &query_coord_sizes,
-                effective_rows,
-                dictionary_key_type(field.data_type()),
-            );
-            result_arrays.push(dict_array);
-        } else {
-            // Data variable - read filtered subset
-            debug!(field_name = %field_name, "Reading data variable");
-            let read_start = Instant::now();
-            let array_path = if prefix.as_ref().is_empty() {
-                format!("/{}", field_name)
-            } else {
-                format!("/{}/{}", prefix, field_name)
-            };
-            debug!(path = %array_path, "Opening data variable array");
-
-            let arr = Array::async_open(store.clone(), &array_path)
-                .await
-                .map_err(zarr_err)?;
-            debug!(shape = ?arr.shape(), "Data variable shape");
-
-            // Build subsets: one for all-Range filters, N for Indices (scattered chunks)
-            let full_elements: u64 = arr.shape().iter().product();
-            let data_var_shape = arr.shape();
-
-            // Chunk shape of this variable (from discovery metadata). Used by the
-            // chunk-bucketing heuristic to coalesce scattered outer-axis (e.g. time)
-            // reads onto chunk boundaries instead of one read per surviving index.
-            let data_var_chunks: Option<Vec<u64>> = store_meta
-                .data_vars
-                .iter()
-                .find(|v| v.name == *field_name)
-                .and_then(|v| v.chunks.clone());
-            debug!(field = %field_name, chunks = ?data_var_chunks, "Data variable chunk shape");
-
-            let plans = if let Some(ref sels) = coord_ranges {
-                let plans = build_read_plans(
-                    sels,
-                    &coord_sizes,
-                    data_var_shape,
-                    data_var_chunks.as_deref(),
-                );
-                let subset_elements: u64 = plans.iter().map(|p| p.subset.num_elements()).sum();
-                let reduction_pct = 100.0 * (1.0 - (subset_elements as f64 / full_elements as f64));
-                info!(
-                    field = %field_name,
-                    subset_elements,
-                    full_elements,
-                    num_subsets = plans.len(),
-                    reduction_pct = format!("{:.2}%", reduction_pct),
-                    "Filter-based data subset optimization"
-                );
-                plans
-            } else if effective_rows < total_rows {
-                let ranges = calculate_limited_subset(arr.shape(), effective_rows);
-                let limited_subset = ArraySubset::new_with_ranges(&ranges);
-                let subset_elements = limited_subset.num_elements();
-                let reduction_pct = 100.0 * (1.0 - (subset_elements as f64 / full_elements as f64));
-                info!(
-                    field = %field_name,
-                    subset_elements,
-                    full_elements,
-                    reduction_pct = format!("{:.2}%", reduction_pct),
-                    "Limit-based data subset optimization"
-                );
-                vec![ReadPlan {
-                    subset: limited_subset,
-                    keep: Keep::All,
-                }]
-            } else {
-                debug!(field = %field_name, full_elements, "Reading full array");
-                vec![ReadPlan {
-                    subset: ArraySubset::new_with_shape(arr.shape().to_vec()),
-                    keep: Keep::All,
-                }]
-            };
-            // Elements actually fetched (chunk windows may include non-survivors).
-            let num_elements: u64 = plans.iter().map(|p| p.subset.num_elements()).sum();
-
-            let mut parts: Vec<ArrayRef> = Vec::with_capacity(plans.len());
-            for plan in &plans {
-                let raw = read_data_array!(async, arr, &plan.subset, field.data_type());
-                parts.push(apply_keep(raw, &plan.keep)?);
-            }
-            let array: ArrayRef = if parts.len() == 1 {
-                parts.remove(0)
-            } else {
-                let refs: Vec<&dyn arrow::array::Array> =
-                    parts.iter().map(|a| a.as_ref()).collect();
-                arrow::compute::concat(&refs).map_err(DataFusionError::from)?
-            };
-
-            debug!(elapsed = ?read_start.elapsed(), "Data variable read complete");
-            if let Some(ref s) = stats {
-                let bytes = num_elements * arrow_dtype_to_bytes(field.data_type());
-                s.record_data(bytes, read_start.elapsed());
-            }
-            result_arrays.push(array);
-        }
-    }
-
-    // Build projected schema, excluding coordinates that were skipped
-    debug!("Building projected schema");
+    // Build projected schema (constant across batches), excluding skipped coords.
     let projected_schema = build_projected_schema(
         &schema,
         &projected_indices,
@@ -1823,23 +1921,100 @@ pub async fn read_zarr_async(
         &effective_coord_indices,
     );
 
-    // Apply final limit slice if needed (use query_rows, not rows_after_filter)
-    let final_rows = limit.map(|l| l.min(query_rows)).unwrap_or(query_rows);
-    let result_arrays = apply_limit_to_arrays(result_arrays, limit, query_rows);
-    if limit.is_some() {
-        debug!(final_rows, "Applied final limit slice");
+    // Plan outer-axis windows — same logic and safety gate as the sync path
+    // (`read_zarr`): window only when every projected data var spans the full
+    // coordinate cube, so mixed-dimensionality vars fall back to a single batch.
+    let all_full_cube = projected_indices.iter().all(|&i| {
+        let name = schema.field(i).name();
+        coord_names.iter().any(|c| c == name)
+            || store_meta
+                .data_vars
+                .iter()
+                .find(|v| &v.name == name)
+                .is_some_and(|v| v.shape.len() == coord_names.len())
+    });
+    let windows =
+        if all_full_cube && !effective_coord_indices.is_empty() && !query_coord_sizes.is_empty() {
+            let outer_coord_idx = effective_coord_indices[0];
+            let inner_rows = query_coord_sizes[1..].iter().product::<usize>().max(1);
+            let max_steps = (batch_size / inner_rows).max(1);
+            let outer_sel = match &coord_ranges {
+                Some(sels) => sels[outer_coord_idx].clone(),
+                None => CoordSelection::Range(0, query_coord_sizes[0]),
+            };
+            window_outer_selection(&outer_sel, max_steps)
+        } else {
+            Vec::new()
+        };
+
+    // Single window (small result, mixed dimensionality, or no windowable axis):
+    // one batch, byte-identical to the un-windowed path (incl. the no-filter
+    // limit-subset read optimization inside build_batch_async).
+    if windows.len() <= 1 {
+        let ctx = AsyncBatchCtx {
+            store: &store,
+            prefix,
+            store_meta: &store_meta,
+            schema: &schema,
+            projected_schema: &projected_schema,
+            projected_indices: &projected_indices,
+            coord_names: &coord_names,
+            effective_coord_indices: &effective_coord_indices,
+            coord_sizes: &coord_sizes,
+            stats: &stats,
+        };
+        let batch = build_batch_async(
+            &ctx,
+            &coord_ranges,
+            &query_coord_sizes,
+            &filtered_coord_values,
+            final_rows,
+            limit,
+            query_rows,
+            total_rows,
+        )
+        .await?;
+        let stream = stream::iter(vec![Ok(batch)]);
+        return Ok(Box::pin(RecordBatchStreamAdapter::new(
+            projected_schema,
+            stream,
+        )));
     }
 
-    // Create result batch and wrap in stream
-    let batch = create_result_batch(projected_schema.clone(), result_arrays, final_rows)?;
+    // Multiple windows: emit one batch per window, lazily, bounding peak memory to
+    // ~one window instead of the whole selection.
+    let outer_coord_idx = effective_coord_indices[0];
+    let inner_rows = query_coord_sizes[1..].iter().product::<usize>().max(1);
     info!(
-        num_rows = batch.num_rows(),
-        num_columns = batch.num_columns(),
-        "RecordBatch created successfully"
+        num_windows = windows.len(),
+        inner_rows, batch_size, "Streaming async scan: windowing outer axis"
     );
-
-    let stream = stream::iter(vec![Ok(batch)]);
-
+    let scan = AsyncWindowedScan {
+        store,
+        prefix: prefix.clone(),
+        store_meta,
+        schema,
+        projected_schema: projected_schema.clone(),
+        projected_indices,
+        coord_names,
+        effective_coord_indices,
+        coord_sizes,
+        stats,
+        query_coord_sizes,
+        filtered_coord_values,
+        coord_ranges,
+        windows,
+        outer_coord_idx,
+        inner_rows,
+        limit,
+        total_rows,
+        widx: 0,
+        offset: 0,
+        emitted: 0,
+    };
+    let stream = stream::unfold(scan, |mut scan| async move {
+        scan.next_batch().await.map(|batch| (batch, scan))
+    });
     Ok(Box::pin(RecordBatchStreamAdapter::new(
         projected_schema,
         stream,
@@ -2204,5 +2379,106 @@ mod outer_read_tests {
     #[test]
     fn empty_partition_yields_no_rows() {
         assert_eq!(read(Some(CoordSelection::Range(2, 2))).num_rows(), 0);
+    }
+}
+
+// End-to-end tests for the async streaming path (`read_zarr_async`), driven over
+// a local object store so they run in CI without network. Mirrors the sync-path
+// streaming coverage: streamed == reference, and LIMIT stops early (Phase 3).
+#[cfg(test)]
+mod async_streaming_tests {
+    use super::*;
+    use crate::reader::stats::ZarrIoStats;
+    use arrow::record_batch::RecordBatch;
+    use futures::TryStreamExt;
+    use zarrs_object_store::object_store::local::LocalFileSystem;
+    use zarrs_object_store::AsyncObjectStore;
+
+    const STORE: &str = "data/synthetic_v3.zarr"; // time(7) × lat(10) × lon(10)
+
+    fn local_async_store() -> (AsyncReadableListableStorage, ObjectPath) {
+        let abs = std::fs::canonicalize(STORE).unwrap();
+        let fs = LocalFileSystem::new_with_prefix(abs).unwrap();
+        let store: AsyncReadableListableStorage = Arc::new(AsyncObjectStore::new(fs));
+        (store, ObjectPath::from(""))
+    }
+
+    async fn read_async(
+        limit: Option<usize>,
+        batch_size: usize,
+        stats: Option<SharedIoStats>,
+    ) -> Vec<RecordBatch> {
+        let (schema, meta) =
+            crate::reader::schema_inference::infer_schema_with_meta(STORE).unwrap();
+        let (store, prefix) = local_async_store();
+        let stream = read_zarr_async(
+            store,
+            &prefix,
+            Arc::new(schema),
+            None,
+            limit,
+            stats,
+            Some(meta),
+            None,
+            None,
+            batch_size,
+        )
+        .await
+        .unwrap();
+        stream.try_collect().await.unwrap()
+    }
+
+    fn rows(batches: &[RecordBatch]) -> usize {
+        batches.iter().map(|b| b.num_rows()).sum()
+    }
+
+    fn rendered(batches: &[RecordBatch]) -> String {
+        arrow::util::pretty::pretty_format_batches(batches)
+            .unwrap()
+            .to_string()
+    }
+
+    #[tokio::test]
+    async fn async_streaming_is_transparent() {
+        // batch_size 150, inner_rows=100 => 1 time step/window => 7 windows of 100.
+        let streamed = read_async(None, 150, None).await;
+        let reference = read_async(None, 10_000_000, None).await;
+        assert!(
+            streamed.len() > 1,
+            "expected multiple batches, got {}",
+            streamed.len()
+        );
+        assert_eq!(reference.len(), 1, "reference reads in one batch");
+        assert_eq!(rows(&streamed), 700);
+        assert_eq!(rendered(&streamed), rendered(&reference));
+    }
+
+    #[tokio::test]
+    async fn async_streaming_limit_reads_less() {
+        // LIMIT 100 (one time plane) with 100-row windows: the lazy stream should
+        // stop after the first window and read far fewer data bytes than a full
+        // scan — proof the remote path streams instead of materializing everything.
+        let full_stats = Arc::new(ZarrIoStats::default());
+        let full = read_async(None, 100, Some(full_stats.clone())).await;
+        assert_eq!(rows(&full), 700);
+
+        let limit_stats = Arc::new(ZarrIoStats::default());
+        let limited = read_async(Some(100), 100, Some(limit_stats.clone())).await;
+        assert_eq!(rows(&limited), 100, "LIMIT caps total rows");
+
+        let full_bytes = full_stats
+            .data_bytes
+            .load(std::sync::atomic::Ordering::Relaxed);
+        let limit_bytes = limit_stats
+            .data_bytes
+            .load(std::sync::atomic::Ordering::Relaxed);
+        assert!(
+            limit_bytes < full_bytes,
+            "LIMIT should read fewer data bytes ({limit_bytes}) than a full scan ({full_bytes})"
+        );
+
+        // And the rows match the first 100 of a full read.
+        let reference = read_async(None, 10_000_000, None).await;
+        assert_eq!(rendered(&limited), rendered(&[reference[0].slice(0, 100)]));
     }
 }

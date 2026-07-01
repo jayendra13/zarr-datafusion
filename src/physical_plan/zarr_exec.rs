@@ -379,7 +379,6 @@ where
             )>,
         > + Send,
 {
-    use arrow::record_batch::RecordBatch;
     use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
     use futures::stream::{self, TryStreamExt};
 
@@ -407,12 +406,10 @@ where
         )
         .await?;
 
-        // Collect into batches and return as stream
-        debug!("Collecting batches from {}", debug_name);
-        let batches: Vec<RecordBatch> = result_stream.try_collect().await?;
-        info!(num_batches = batches.len(), "{} read complete", debug_name);
-
-        Ok::<_, DataFusionError>(stream::iter(batches.into_iter().map(Ok)))
+        // Return the reader's stream directly so batches flow lazily — collecting
+        // here would materialize the whole result and defeat streaming.
+        debug!("{} reader stream ready", debug_name);
+        Ok::<_, DataFusionError>(result_stream)
     })
     .try_flatten();
 
