@@ -177,4 +177,41 @@ for `Indices`).
 rules green (14); peak memory bounded on the ignored large test (15). At that
 point the monthly-mean query runs bounded with a fixed `batch_size`, and Block 4
 later just swaps the fixed size for a cardinality-derived one.
-</content>
+
+## Known limitations (as built)
+
+These are the deliberate scope boundaries of the shipped Block 0. Both keep the
+result **correct**; they only limit *where the memory-streaming optimization
+applies*.
+
+- **Granularity bound (whole outer steps).** A window is a whole number of outer
+  steps, so the per-batch bound is `max(batch_size, inner_rows)` where `inner_rows`
+  = product of the non-outer effective sizes. If one inner plane already exceeds
+  `batch_size` (e.g. a single global timestep, 721×1440 ≈ 1M rows), that plane is
+  one batch and exceeds `batch_size`. Acceptable: memory is bounded to **one plane**
+  instead of the whole time series (the actual OOM cause). Sub-plane (inner-axis)
+  windowing is out of scope. Tested by `streaming_indivisible_plane_still_streams`.
+
+- **Mixed-dimensionality projections fall back to a single batch.** Windowing
+  slices the outer coordinate, which is only transparent when every projected data
+  var spans the **full** coordinate cube. The gate is `all_full_cube` in `read_zarr`
+  / `read_zarr_async`: a projected data var qualifies only when
+  `shape.len() == coord_names.len()` (coordinate columns are always fine). If any
+  projected var is lower-dimensional, `windows` is empty and the un-windowed
+  single-batch path runs.
+
+  *Why:* consider coords `time(100) × lat(721) × lon(1440)` with
+  `temperature[time,lat,lon]` (full cube) and a static `elevation[lat,lon]` (no
+  time axis). The flattened table is the Cartesian product, so `elevation` is
+  *broadcast* — the same lat×lon plane repeated for every timestep. Windowing along
+  time works for `temperature` (its read scales with the window) but not for
+  `elevation`: it has no time axis to slice, so a per-window read yields a
+  `lat×lon` block that would need tiling `(t1−t0)×` to line up. The window path
+  doesn't broadcast-tile, so it would mismatch row counts. Rather than special-case
+  that, we fall back to the original single-batch path, which already handles the
+  broadcast correctly.
+
+  *Consequence:* `SELECT temperature` streams; `SELECT temperature, elevation` (or
+  `SELECT elevation`) does not — it can still materialize a large single batch. The
+  fallback is driven by the *projection*, not the store. Broadcast-aware /
+  inner-axis windowing is future work.

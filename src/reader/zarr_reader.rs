@@ -1342,7 +1342,8 @@ pub fn read_zarr(
     // transparent when each projected data var spans the full coordinate cube.
     // Mixed-dimensionality vars (fewer dims than coords) would be mis-tiled, so we
     // fall back to a single batch for them (still correct, just not streamed).
-    // Coordinate columns are always safe.
+    // Coordinate columns are always safe. See docs/block-0-impl.md "Known
+    // limitations" for the worked example.
     let all_full_cube = projected_indices.iter().all(|&i| {
         let name = schema.field(i).name();
         coord_names.iter().any(|c| c == name)
