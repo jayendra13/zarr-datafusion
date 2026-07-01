@@ -229,6 +229,41 @@ async fn streaming_v2_v3_parity() {
 }
 
 #[tokio::test]
+async fn scan_honors_configured_batch_size() {
+    // Directly assert the configured `datafusion.execution.batch_size` controls
+    // window sizing. Pin a single partition so sizes are determined purely by
+    // batch_size (no partition sub-splitting). Outer=time(7), inner_rows=100, so a
+    // full window holds floor(batch_size/100) time steps (min 1) => that many
+    // hundreds of rows; the last window holds the remainder.
+    async fn batch_sizes(batch_size: usize) -> Vec<usize> {
+        let cfg = SessionConfig::new()
+            .with_batch_size(batch_size)
+            .with_target_partitions(1);
+        let state = SessionStateBuilder::new()
+            .with_config(cfg)
+            .with_default_features()
+            .build();
+        let ctx = SessionContext::new_with_state(state);
+        register_zarr_table(&ctx, "data", SYNTHETIC_V3);
+        // Confirm the single-partition assumption holds for this scan.
+        assert_eq!(partition_count(&ctx, "SELECT * FROM data").await, 1);
+        zarr_exec_batches(&ctx, "SELECT * FROM data")
+            .await
+            .iter()
+            .map(|b| b.num_rows())
+            .collect()
+    }
+
+    assert_eq!(
+        batch_sizes(100).await,
+        vec![100, 100, 100, 100, 100, 100, 100]
+    );
+    assert_eq!(batch_sizes(300).await, vec![300, 300, 100]);
+    assert_eq!(batch_sizes(700).await, vec![700]);
+    assert_eq!(batch_sizes(10_000).await, vec![700]);
+}
+
+#[tokio::test]
 async fn streaming_preserves_optimizer_shortcircuit() {
     // The MIN/MAX/COUNT rules fold to constants from statistics and bypass the
     // scan entirely; the streaming rework must not change that.
