@@ -2382,6 +2382,95 @@ mod outer_read_tests {
     }
 }
 
+#[cfg(test)]
+mod window_tests {
+    use super::window_outer_selection;
+    use crate::reader::filter::CoordSelection;
+
+    fn r(s: usize, e: usize) -> CoordSelection {
+        CoordSelection::Range(s, e)
+    }
+    fn ix(v: &[usize]) -> CoordSelection {
+        CoordSelection::Indices(v.to_vec())
+    }
+
+    #[test]
+    fn range_splits_evenly() {
+        assert_eq!(
+            window_outer_selection(&r(0, 10), 5),
+            vec![r(0, 5), r(5, 10)]
+        );
+    }
+
+    #[test]
+    fn range_last_window_is_shorter() {
+        assert_eq!(
+            window_outer_selection(&r(0, 7), 3),
+            vec![r(0, 3), r(3, 6), r(6, 7)]
+        );
+    }
+
+    #[test]
+    fn range_larger_than_len_is_one_window() {
+        assert_eq!(window_outer_selection(&r(2, 5), 100), vec![r(2, 5)]);
+    }
+
+    #[test]
+    fn range_preserves_offset() {
+        // Windows carry absolute indices, not zero-based.
+        assert_eq!(
+            window_outer_selection(&r(4, 9), 2),
+            vec![r(4, 6), r(6, 8), r(8, 9)]
+        );
+    }
+
+    #[test]
+    fn indices_chunk_in_order() {
+        assert_eq!(
+            window_outer_selection(&ix(&[1, 3, 5, 7]), 2),
+            vec![ix(&[1, 3]), ix(&[5, 7])]
+        );
+    }
+
+    #[test]
+    fn indices_last_chunk_is_shorter() {
+        assert_eq!(
+            window_outer_selection(&ix(&[1, 3, 5, 7, 9]), 2),
+            vec![ix(&[1, 3]), ix(&[5, 7]), ix(&[9])]
+        );
+    }
+
+    #[test]
+    fn empty_selection_yields_one_empty_window() {
+        assert_eq!(window_outer_selection(&r(5, 5), 4), vec![r(5, 5)]);
+        assert_eq!(window_outer_selection(&ix(&[]), 4), vec![ix(&[])]);
+    }
+
+    #[test]
+    fn zero_max_steps_is_clamped_to_one() {
+        assert_eq!(window_outer_selection(&r(0, 2), 0), vec![r(0, 1), r(1, 2)]);
+    }
+
+    #[test]
+    fn windows_cover_the_whole_selection() {
+        // The union of windows equals the input, in order (the concat invariant).
+        for &(s, e) in &[(0usize, 13usize), (3, 3), (7, 20)] {
+            for w in 1..=6 {
+                let pieces = window_outer_selection(&r(s, e), w);
+                let rebuilt: Vec<usize> = pieces
+                    .iter()
+                    .flat_map(|p| match p {
+                        CoordSelection::Range(a, b) => (*a..*b).collect::<Vec<_>>(),
+                        CoordSelection::Indices(v) => v.clone(),
+                    })
+                    .collect();
+                let expected: Vec<usize> = (s..e).collect();
+                assert_eq!(rebuilt, expected, "range=({s},{e}) w={w}");
+            }
+        }
+    }
+}
+
 // End-to-end tests for the async streaming path (`read_zarr_async`), driven over
 // a local object store so they run in CI without network. Mirrors the sync-path
 // streaming coverage: streamed == reference, and LIMIT stops early (Phase 3).

@@ -227,3 +227,51 @@ async fn streaming_v2_v3_parity() {
     assert!(v2.len() > 1 && v3.len() > 1, "both should stream");
     assert_eq!(rendered(&v2), rendered(&v3), "v2 and v3 must agree");
 }
+
+#[tokio::test]
+async fn streaming_preserves_optimizer_shortcircuit() {
+    // The MIN/MAX/COUNT rules fold to constants from statistics and bypass the
+    // scan entirely; the streaming rework must not change that.
+    let ctx = create_test_context();
+    register_zarr_table(&ctx, "data", SYNTHETIC_V3);
+    for sql in [
+        "SELECT COUNT(*) FROM data",
+        "SELECT MIN(lat) FROM data",
+        "SELECT MAX(lon) FROM data",
+    ] {
+        let plan = get_physical_plan(&ctx, sql).await;
+        assert_no_zarr_exec(&plan);
+    }
+}
+
+// The ships-value proof: on a large cube a full scan must NOT build one giant
+// batch. Ignored because it reads the whole ERA5 cube (~6M rows); run manually:
+//   cargo test --test integration_streaming -- --ignored --nocapture
+#[tokio::test]
+#[ignore = "reads the full ERA5 cube; run manually to see peak-batch bounding"]
+async fn streaming_bounds_peak_batch_on_large_cube() {
+    // batch_size well under one outer plane, so each window is a single plane.
+    let ctx = ctx_with_batch_size(1_000_000);
+    register_zarr_table(&ctx, "data", ERA5_V3);
+    let batches = zarr_exec_batches(&ctx, "SELECT temperature FROM data").await;
+
+    let total = total_rows(&batches);
+    let max_batch = batches.iter().map(|b| b.num_rows()).max().unwrap_or(0);
+    println!(
+        "ERA5 cube: total={total} rows across {} batches, largest batch={max_batch} rows \
+         ({:.1}% of the cube)",
+        batches.len(),
+        100.0 * max_batch as f64 / total as f64
+    );
+
+    assert!(
+        batches.len() > 1,
+        "large cube must stream into multiple batches"
+    );
+    // The whole point: the biggest batch is bounded to about one plane, not the
+    // whole cube. Un-windowed, this would be a single `total`-row batch.
+    assert!(
+        max_batch * 2 <= total,
+        "largest batch ({max_batch}) should be at most ~half the cube ({total})"
+    );
+}
