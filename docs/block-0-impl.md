@@ -192,13 +192,17 @@ applies*.
   instead of the whole time series (the actual OOM cause). Sub-plane (inner-axis)
   windowing is out of scope. Tested by `streaming_indivisible_plane_still_streams`.
 
-- **Mixed-dimensionality projections fall back to a single batch.** Windowing
+- **Broadcast (missing-coord) projections fall back to a single batch.** Windowing
   slices the outer coordinate, which is only transparent when every projected data
-  var spans the **full** coordinate cube. The gate is `all_full_cube` in `read_zarr`
-  / `read_zarr_async`: a projected data var qualifies only when
-  `shape.len() == coord_names.len()` (coordinate columns are always fine). If any
-  projected var is lower-dimensional, `windows` is empty and the un-windowed
-  single-batch path runs.
+  var spans the full **effective** coordinate set — the coords *this projection*
+  uses. The gate is `all_full_cube` in `read_zarr` / `read_zarr_async`: a projected
+  data var qualifies when `shape.len() == effective_coord_indices.len()` (coordinate
+  columns are always fine). The comparison is against the *effective* set, not every
+  store coordinate — so a var that merely doesn't use some coordinate (e.g. a
+  surface field `sst[time,lat,lon]` in a store that also has a `level` axis) still
+  streams. Only a var missing one of the *effective* coords — a genuine broadcast,
+  like a static field selected alongside a time-varying one — makes `windows` empty
+  and takes the single-batch path.
 
   *Why:* consider coords `time(100) × lat(721) × lon(1440)` with
   `temperature[time,lat,lon]` (full cube) and a static `elevation[lat,lon]` (no

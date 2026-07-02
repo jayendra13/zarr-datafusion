@@ -1339,9 +1339,13 @@ pub fn read_zarr(
 
     // Plan outer-axis windows. Windowing slices the OUTER (most-significant)
     // effective coordinate, scaling every read by the window — which is only
-    // transparent when each projected data var spans the full coordinate cube.
-    // Mixed-dimensionality vars (fewer dims than coords) would be mis-tiled, so we
-    // fall back to a single batch for them (still correct, just not streamed).
+    // transparent when each projected data var spans the full *effective*
+    // coordinate set (the coords this projection uses). Comparing against the
+    // effective set, not every store coordinate, is what lets a var that simply
+    // doesn't use some coord (e.g. SST in a store that also has `level`) still
+    // stream. A var missing an *effective* coord (broadcast across the outer axis,
+    // e.g. a static field selected next to a time-varying one) can't be windowed,
+    // so it falls back to a single batch (still correct, just not streamed).
     // Coordinate columns are always safe. See docs/block-0-impl.md "Known
     // limitations" for the worked example.
     let all_full_cube = projected_indices.iter().all(|&i| {
@@ -1351,7 +1355,7 @@ pub fn read_zarr(
                 .data_vars
                 .iter()
                 .find(|v| &v.name == name)
-                .is_some_and(|v| v.shape.len() == coord_names.len())
+                .is_some_and(|v| v.shape.len() == effective_coord_indices.len())
     });
     let windows =
         if all_full_cube && !effective_coord_indices.is_empty() && !query_coord_sizes.is_empty() {
@@ -1924,7 +1928,8 @@ pub async fn read_zarr_async(
 
     // Plan outer-axis windows — same logic and safety gate as the sync path
     // (`read_zarr`): window only when every projected data var spans the full
-    // coordinate cube, so mixed-dimensionality vars fall back to a single batch.
+    // *effective* coordinate set, so a var missing an effective coord (broadcast
+    // across the outer axis) falls back to a single batch.
     let all_full_cube = projected_indices.iter().all(|&i| {
         let name = schema.field(i).name();
         coord_names.iter().any(|c| c == name)
@@ -1932,7 +1937,7 @@ pub async fn read_zarr_async(
                 .data_vars
                 .iter()
                 .find(|v| &v.name == name)
-                .is_some_and(|v| v.shape.len() == coord_names.len())
+                .is_some_and(|v| v.shape.len() == effective_coord_indices.len())
     });
     let windows =
         if all_full_cube && !effective_coord_indices.is_empty() && !query_coord_sizes.is_empty() {
