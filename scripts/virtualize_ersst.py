@@ -40,6 +40,11 @@ def drop_vars(store_dir):
 IN = sys.argv[1] if len(sys.argv) > 1 else "data/ersst_v5_psl.nc"
 OUT = sys.argv[2] if len(sys.argv) > 2 else "data/ersst_v5.parq"
 LIMIT = int(sys.argv[3]) if len(sys.argv) > 3 else 0
+# If set, record THIS path in the manifest instead of the local file — read the
+# local copy for speed but stamp the remote URL so the reference is portable and
+# reads straight from the source (e.g. NOAA over HTTPS). Byte offsets are internal
+# to the file, so a local scan and the remote file agree.
+SOURCE_URL = os.environ.get("ERSST_SOURCE_URL")
 
 os.makedirs(OUT, exist_ok=True)
 lfs = fsspec.filesystem("file")
@@ -50,8 +55,12 @@ if os.path.isfile(IN):
     # once, write refs straight to the Parquet store. Absolute local path so the
     # manifest points at this file (Stage 1); later stages rewrite the prefix.
     ap = os.path.abspath(IN)
-    print(f"virtualizing single aggregated file: {ap}")
-    SingleHdf5ToZarr(ap, out=out, inline_threshold=5000).translate()
+    recorded = SOURCE_URL or ap
+    print(f"virtualizing single aggregated file: read {ap}, record {recorded}")
+    # Pass a file OBJECT (not a path) so kerchunk records `url` instead of the
+    # local path — this is what lets us stamp the remote source URL.
+    with open(ap, "rb") as f:
+        SingleHdf5ToZarr(f, url=recorded, out=out, inline_threshold=5000).translate()
     out.flush()
     drop_vars(OUT)
 else:

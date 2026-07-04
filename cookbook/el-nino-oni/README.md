@@ -82,16 +82,21 @@ reproduces NOAA's own pipeline — and it's the showcase for reading a **remote 
 without converting it**: we build a tiny **VirtualiZarr** reference (a chunk→byte-range
 manifest) over the NOAA file, and the engine fetches only the bytes each query needs.
 
+The committed `data/ersst_v5.parq` reference (~56 KB) already points at NOAA's PSL file
+over **HTTPS**, so you can run the recipe directly — no download, no local data:
+
 ```bash
-# 1. fetch the aggregated ERSST v5 file from NOAA PSL (~150 MB)
-scripts/download_ersst.sh                 # (or use PSL's sst.mnmean.nc directly)
-
-# 2. virtualize it: NetCDF -> VirtualiZarr kerchunk-parquet reference (~56 KB)
-uv run --with kerchunk --with h5py --with fsspec --with fastparquet --with 'zarr<3' \
-  scripts/virtualize_ersst.py data/ersst_v5_psl.nc data/ersst_v5.parq
-
-# 3. compute ONI (sst is already monthly and in °C)
 zarr-cli cookbook/el-nino-oni/oni_ersst.sql > cookbook/el-nino-oni/oni_ersst_computed.txt
+```
+
+To regenerate the reference (e.g. NOAA refreshes the file monthly, which shifts the byte
+offsets the manifest pins), rebuild it from a local copy and stamp the source URL:
+
+```bash
+scripts/download_ersst.sh          # fetch PSL's sst.mnmean.nc (~150 MB) into data/
+ERSST_SOURCE_URL="https://downloads.psl.noaa.gov/Datasets/noaa.ersst.v5/sst.mnmean.nc" \
+  uv run --with kerchunk --with h5py --with fsspec --with fastparquet --with 'zarr<3' \
+  scripts/virtualize_ersst.py data/ersst_v5_psl.nc data/ersst_v5.parq
 ```
 
 **Result — reproduces NOAA to rounding (916 seasons, 1950–2026):**

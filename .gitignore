@@ -19,3 +19,5 @@ terraform/terraform.tfstate
 terraform/terraform.tfstate.backup
 terraform/terraform.tfvars
 *.tfplan
+data/ersst_v5_nc/
+data/ersst_v5_psl.nc
