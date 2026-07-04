@@ -18,6 +18,9 @@ use zarrs::storage::{
     StorePrefix,
 };
 use zarrs_object_store::object_store::aws::AmazonS3Builder;
+use zarrs_object_store::object_store::gcp::GoogleCloudStorageBuilder;
+use zarrs_object_store::object_store::http::HttpBuilder;
+use zarrs_object_store::object_store::local::LocalFileSystem;
 use zarrs_object_store::object_store::path::Path as ObjectPath;
 use zarrs_object_store::object_store::{GetRange, ObjectStore};
 
@@ -35,8 +38,9 @@ pub struct VirtualStoreAdapter {
     metadata: serde_json::Value,
     /// Loaded parquet refs, keyed by array name
     refs: HashMap<String, ParquetRefs>,
-    /// S3 client for fetching chunks from source files
-    s3_client: Option<Arc<dyn ObjectStore>>,
+    /// Object store for fetching chunks from source files. Built from the scheme
+    /// of the manifest paths: local filesystem, S3, GCS, or HTTP(S).
+    source_store: Option<Arc<dyn ObjectStore>>,
     /// Array metadata cache (shape, chunks) from .zmetadata
     array_meta: HashMap<String, ArrayMetaCache>,
 }
@@ -85,13 +89,13 @@ impl VirtualStoreAdapter {
         let refs = Self::load_all_refs(store_path, &array_meta)?;
 
         // Create S3 client if any refs point to S3
-        let s3_client = Self::create_s3_client_if_needed(&refs)?;
+        let source_store = Self::create_source_store_if_needed(&refs)?;
 
         Ok(Self {
             store_path: store_path.to_string(),
             metadata,
             refs,
-            s3_client,
+            source_store,
             array_meta,
         })
     }
@@ -143,7 +147,7 @@ impl VirtualStoreAdapter {
         let refs = Self::load_all_refs_async(store, prefix, &array_meta).await?;
 
         // Create S3 client if any refs point to S3
-        let s3_client = Self::create_s3_client_if_needed(&refs)?;
+        let source_store = Self::create_source_store_if_needed(&refs)?;
 
         debug!(
             location = %location,
@@ -155,7 +159,7 @@ impl VirtualStoreAdapter {
             store_path: location.to_string(),
             metadata,
             refs,
-            s3_client,
+            source_store,
             array_meta,
         })
     }
@@ -285,36 +289,85 @@ impl VirtualStoreAdapter {
         Ok(refs)
     }
 
-    /// Create S3 client if any refs point to S3 URLs
-    fn create_s3_client_if_needed(
+    /// Build the object store used to fetch chunk bytes, from the scheme of the
+    /// first non-inline manifest path. All chunks in a VirtualiZarr store share a
+    /// scheme (and, for cloud, an authority), so one store serves them all.
+    ///
+    /// Supports the full ladder of chunk sources: local filesystem, S3, GCS, and
+    /// HTTP(S). Inline (`raw`) chunks need no store.
+    fn create_source_store_if_needed(
         refs: &HashMap<String, ParquetRefs>,
     ) -> Result<Option<Arc<dyn ObjectStore>>, Box<dyn std::error::Error + Send + Sync>> {
-        // Check if any refs point to S3
+        // Find the first ref that actually points at a source file (not inline).
+        let mut sample: Option<&str> = None;
         for parquet_refs in refs.values() {
-            if let Some(first_ref) = parquet_refs.get(0) {
-                if first_ref.path.starts_with("s3://") {
-                    // Extract bucket from first S3 URL
-                    let url = Url::parse(&first_ref.path)?;
-                    let bucket = url
-                        .host_str()
-                        .ok_or("Missing bucket in S3 URL")?
-                        .to_string();
-
-                    debug!(bucket = %bucket, "Creating S3 client for VirtualiZarr refs");
-
-                    // Try environment credentials first, fall back to anonymous for public buckets
-                    let store = AmazonS3Builder::from_env()
-                        .with_bucket_name(&bucket)
-                        .with_skip_signature(true) // Allow anonymous access for public buckets
-                        .with_region("us-east-1") // NOAA data is typically in us-east-1
-                        .build()?;
-
-                    return Ok(Some(Arc::new(store)));
+            if let Some(r) = parquet_refs.get(0) {
+                if r.raw.is_none() && !r.path.is_empty() {
+                    sample = Some(&r.path);
+                    break;
                 }
             }
         }
+        let Some(path) = sample else {
+            return Ok(None);
+        };
 
-        Ok(None)
+        let store: Arc<dyn ObjectStore> = if path.starts_with("s3://") {
+            let url = Url::parse(path)?;
+            let bucket = url.host_str().ok_or("Missing bucket in S3 URL")?;
+            debug!(bucket = %bucket, "VirtualiZarr chunk source: S3");
+            // from_env() honors AWS_ENDPOINT_URL/keys (e.g. minio); skip_signature
+            // falls back to anonymous for public buckets when no creds are set.
+            Arc::new(
+                AmazonS3Builder::from_env()
+                    .with_bucket_name(bucket)
+                    .with_skip_signature(true)
+                    .with_region("us-east-1")
+                    .build()?,
+            )
+        } else if path.starts_with("gs://") {
+            let url = Url::parse(path)?;
+            let bucket = url.host_str().ok_or("Missing bucket in GCS URL")?;
+            debug!(bucket = %bucket, "VirtualiZarr chunk source: GCS");
+            Arc::new(
+                GoogleCloudStorageBuilder::from_env()
+                    .with_bucket_name(bucket)
+                    .build()?,
+            )
+        } else if path.starts_with("http://") || path.starts_with("https://") {
+            let url = Url::parse(path)?;
+            let base = format!(
+                "{}://{}",
+                url.scheme(),
+                url.host_str().ok_or("Missing host in HTTP URL")?
+            );
+            debug!(base = %base, "VirtualiZarr chunk source: HTTP");
+            Arc::new(HttpBuilder::new().with_url(base).build()?)
+        } else {
+            // Bare path => local filesystem (Stage 1).
+            debug!("VirtualiZarr chunk source: local filesystem");
+            Arc::new(LocalFileSystem::new())
+        };
+
+        Ok(Some(store))
+    }
+
+    /// Map a manifest path to the object-store key within [`Self::source_store`].
+    /// For cloud/HTTP schemes this is the URL path; for a local file it is the
+    /// absolute filesystem path.
+    fn object_path_for(path: &str) -> Result<ObjectPath, StorageError> {
+        if path.starts_with("s3://")
+            || path.starts_with("gs://")
+            || path.starts_with("http://")
+            || path.starts_with("https://")
+        {
+            let url =
+                Url::parse(path).map_err(|e| StorageError::Other(format!("Invalid URL: {}", e)))?;
+            Ok(ObjectPath::from(url.path().trim_start_matches('/')))
+        } else {
+            ObjectPath::from_absolute_path(path)
+                .map_err(|e| StorageError::Other(format!("Invalid local path {}: {}", path, e)))
+        }
     }
 
     /// Get the raw .zmetadata JSON for schema inference
@@ -403,25 +456,19 @@ impl VirtualStoreAdapter {
             return Ok(Some(raw.clone().into()));
         }
 
-        // Parse S3 URL
-        let url = Url::parse(&chunk_ref.path)
-            .map_err(|e| StorageError::Other(format!("Invalid URL: {}", e)))?;
-
-        let s3_client = self
-            .s3_client
+        let source_store = self
+            .source_store
             .as_ref()
-            .ok_or_else(|| StorageError::Other("No S3 client configured".to_string()))?;
+            .ok_or_else(|| StorageError::Other("No chunk source store configured".to_string()))?;
 
-        // Extract path from URL (everything after bucket)
-        let path = url.path().trim_start_matches('/');
-        let object_path = ObjectPath::from(path);
+        let object_path = Self::object_path_for(&chunk_ref.path)?;
 
         // Fetch byte range using get_opts with range
         debug!(
             path = %chunk_ref.path,
             offset = chunk_ref.offset,
             size = chunk_ref.size,
-            "Fetching chunk from S3"
+            "Fetching chunk byte range"
         );
 
         let opts = zarrs_object_store::object_store::GetOptions {
@@ -431,15 +478,15 @@ impl VirtualStoreAdapter {
             ..Default::default()
         };
 
-        let result = s3_client
+        let result = source_store
             .get_opts(&object_path, opts)
             .await
-            .map_err(|e| StorageError::Other(format!("S3 fetch error: {}", e)))?;
+            .map_err(|e| StorageError::Other(format!("chunk fetch error: {}", e)))?;
 
         let bytes = result
             .bytes()
             .await
-            .map_err(|e| StorageError::Other(format!("S3 read error: {}", e)))?;
+            .map_err(|e| StorageError::Other(format!("chunk read error: {}", e)))?;
 
         Ok(Some(bytes))
     }
@@ -791,8 +838,8 @@ mod tests {
         // t2 should be in the refs
         assert!(adapter.refs.contains_key("t2"));
 
-        // Should have S3 client since refs point to S3
-        assert!(adapter.s3_client.is_some());
+        // Should have a chunk-source store since refs point to S3
+        assert!(adapter.source_store.is_some());
     }
 
     #[tokio::test]
