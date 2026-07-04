@@ -1,0 +1,917 @@
+year,season,ours,noaa,resid,ours_cls,noaa_cls
+1950,DJF,-1.53,-1.53,0.0,La Nina,La Nina
+1950,JFM,-1.34,-1.34,0.0,La Nina,La Nina
+1950,FMA,-1.16,-1.16,0.0,La Nina,La Nina
+1950,MAM,-1.18,-1.18,0.0,La Nina,La Nina
+1950,AMJ,-1.07,-1.07,0.0,La Nina,La Nina
+1950,MJJ,-0.85,-0.85,0.0,La Nina,La Nina
+1950,JJA,-0.54,-0.54,0.0,La Nina,La Nina
+1950,JAS,-0.42,-0.42,0.0,Neutral,Neutral
+1950,ASO,-0.39,-0.39,0.0,Neutral,Neutral
+1950,SON,-0.44,-0.44,0.0,Neutral,Neutral
+1950,OND,-0.6,-0.6,0.0,La Nina,La Nina
+1950,NDJ,-0.8,-0.8,0.0,La Nina,La Nina
+1951,DJF,-0.82,-0.82,0.0,La Nina,La Nina
+1951,JFM,-0.54,-0.54,0.0,La Nina,La Nina
+1951,FMA,-0.17,-0.17,0.0,Neutral,Neutral
+1951,MAM,0.18,0.18,0.0,Neutral,Neutral
+1951,AMJ,0.36,0.36,0.0,Neutral,Neutral
+1951,MJJ,0.58,0.58,0.0,El Nino,El Nino
+1951,JJA,0.7,0.7,0.0,El Nino,El Nino
+1951,JAS,0.89,0.89,0.0,El Nino,El Nino
+1951,ASO,0.99,0.99,0.0,El Nino,El Nino
+1951,SON,1.15,1.15,0.0,El Nino,El Nino
+1951,OND,1.04,1.04,0.0,El Nino,El Nino
+1951,NDJ,0.81,0.81,0.0,El Nino,El Nino
+1952,DJF,0.53,0.53,0.0,El Nino,El Nino
+1952,JFM,0.37,0.37,0.0,Neutral,Neutral
+1952,FMA,0.34,0.34,0.0,Neutral,Neutral
+1952,MAM,0.29,0.29,0.0,Neutral,Neutral
+1952,AMJ,0.2,0.2,0.0,Neutral,Neutral
+1952,MJJ,0.0,0.0,0.0,Neutral,Neutral
+1952,JJA,-0.08,-0.08,0.0,Neutral,Neutral
+1952,JAS,0.0,0.0,0.0,Neutral,Neutral
+1952,ASO,0.15,0.15,0.0,Neutral,Neutral
+1952,SON,0.1,0.1,0.0,Neutral,Neutral
+1952,OND,0.04,0.04,0.0,Neutral,Neutral
+1952,NDJ,0.15,0.15,0.0,Neutral,Neutral
+1953,DJF,0.4,0.4,0.0,Neutral,Neutral
+1953,JFM,0.6,0.6,0.0,El Nino,El Nino
+1953,FMA,0.63,0.63,0.0,El Nino,El Nino
+1953,MAM,0.66,0.66,0.0,El Nino,El Nino
+1953,AMJ,0.75,0.75,0.0,El Nino,El Nino
+1953,MJJ,0.77,0.77,0.0,El Nino,El Nino
+1953,JJA,0.75,0.75,0.0,El Nino,El Nino
+1953,JAS,0.73,0.73,0.0,El Nino,El Nino
+1953,ASO,0.78,0.78,0.0,El Nino,El Nino
+1953,SON,0.84,0.84,0.0,El Nino,El Nino
+1953,OND,0.84,0.84,0.0,El Nino,El Nino
+1953,NDJ,0.81,0.81,0.0,El Nino,El Nino
+1954,DJF,0.76,0.76,0.0,El Nino,El Nino
+1954,JFM,0.47,0.47,0.0,Neutral,Neutral
+1954,FMA,-0.05,-0.05,0.0,Neutral,Neutral
+1954,MAM,-0.41,-0.41,0.0,Neutral,Neutral
+1954,AMJ,-0.54,-0.54,0.0,La Nina,La Nina
+1954,MJJ,-0.5,-0.5,0.0,La Nina,La Nina
+1954,JJA,-0.64,-0.64,0.0,La Nina,La Nina
+1954,JAS,-0.84,-0.84,0.0,La Nina,La Nina
+1954,ASO,-0.9,-0.9,0.0,La Nina,La Nina
+1954,SON,-0.77,-0.77,0.0,La Nina,La Nina
+1954,OND,-0.73,-0.73,0.0,La Nina,La Nina
+1954,NDJ,-0.66,-0.66,0.0,La Nina,La Nina
+1955,DJF,-0.68,-0.68,0.0,La Nina,La Nina
+1955,JFM,-0.62,-0.62,0.0,La Nina,La Nina
+1955,FMA,-0.69,-0.69,0.0,La Nina,La Nina
+1955,MAM,-0.8,-0.8,0.0,La Nina,La Nina
+1955,AMJ,-0.79,-0.79,0.0,La Nina,La Nina
+1955,MJJ,-0.72,-0.72,0.0,La Nina,La Nina
+1955,JJA,-0.68,-0.68,0.0,La Nina,La Nina
+1955,JAS,-0.75,-0.75,0.0,La Nina,La Nina
+1955,ASO,-1.09,-1.09,0.0,La Nina,La Nina
+1955,SON,-1.42,-1.42,0.0,La Nina,La Nina
+1955,OND,-1.67,-1.67,0.0,La Nina,La Nina
+1955,NDJ,-1.47,-1.47,0.0,La Nina,La Nina
+1956,DJF,-1.11,-1.11,0.0,La Nina,La Nina
+1956,JFM,-0.76,-0.76,0.0,La Nina,La Nina
+1956,FMA,-0.63,-0.63,0.0,La Nina,La Nina
+1956,MAM,-0.54,-0.54,0.0,La Nina,La Nina
+1956,AMJ,-0.52,-0.52,0.0,La Nina,La Nina
+1956,MJJ,-0.51,-0.51,0.0,La Nina,La Nina
+1956,JJA,-0.57,-0.57,0.0,La Nina,La Nina
+1956,JAS,-0.55,-0.55,0.0,La Nina,La Nina
+1956,ASO,-0.46,-0.46,0.0,Neutral,Neutral
+1956,SON,-0.42,-0.42,0.0,Neutral,Neutral
+1956,OND,-0.43,-0.43,0.0,Neutral,Neutral
+1956,NDJ,-0.43,-0.43,0.0,Neutral,Neutral
+1957,DJF,-0.25,-0.25,0.0,Neutral,Neutral
+1957,JFM,0.06,0.06,0.0,Neutral,Neutral
+1957,FMA,0.41,0.41,0.0,Neutral,Neutral
+1957,MAM,0.72,0.72,0.0,El Nino,El Nino
+1957,AMJ,0.92,0.92,0.0,El Nino,El Nino
+1957,MJJ,1.11,1.11,0.0,El Nino,El Nino
+1957,JJA,1.25,1.25,0.0,El Nino,El Nino
+1957,JAS,1.32,1.32,0.0,El Nino,El Nino
+1957,ASO,1.33,1.33,0.0,El Nino,El Nino
+1957,SON,1.39,1.39,0.0,El Nino,El Nino
+1957,OND,1.53,1.53,0.0,El Nino,El Nino
+1957,NDJ,1.74,1.74,0.0,El Nino,El Nino
+1958,DJF,1.81,1.81,0.0,El Nino,El Nino
+1958,JFM,1.66,1.66,0.0,El Nino,El Nino
+1958,FMA,1.27,1.27,0.0,El Nino,El Nino
+1958,MAM,0.93,0.93,0.0,El Nino,El Nino
+1958,AMJ,0.74,0.74,0.0,El Nino,El Nino
+1958,MJJ,0.64,0.64,0.0,El Nino,El Nino
+1958,JJA,0.57,0.57,0.0,El Nino,El Nino
+1958,JAS,0.43,0.43,0.0,Neutral,Neutral
+1958,ASO,0.39,0.39,0.0,Neutral,Neutral
+1958,SON,0.44,0.44,0.0,Neutral,Neutral
+1958,OND,0.5,0.5,0.0,El Nino,El Nino
+1958,NDJ,0.61,0.61,0.0,El Nino,El Nino
+1959,DJF,0.61,0.61,0.0,El Nino,El Nino
+1959,JFM,0.62,0.62,0.0,El Nino,El Nino
+1959,FMA,0.51,0.52,-0.010000000000000009,El Nino,El Nino
+1959,MAM,0.33,0.33,0.0,Neutral,Neutral
+1959,AMJ,0.2,0.2,0.0,Neutral,Neutral
+1959,MJJ,-0.07,-0.07,0.0,Neutral,Neutral
+1959,JJA,-0.18,-0.18,0.0,Neutral,Neutral
+1959,JAS,-0.28,-0.28,0.0,Neutral,Neutral
+1959,ASO,-0.09,-0.09,0.0,Neutral,Neutral
+1959,SON,-0.03,-0.03,0.0,Neutral,Neutral
+1959,OND,0.05,0.05,0.0,Neutral,Neutral
+1959,NDJ,-0.04,-0.04,0.0,Neutral,Neutral
+1960,DJF,-0.1,-0.1,0.0,Neutral,Neutral
+1960,JFM,-0.1,-0.1,0.0,Neutral,Neutral
+1960,FMA,-0.07,-0.07,0.0,Neutral,Neutral
+1960,MAM,0.03,0.03,0.0,Neutral,Neutral
+1960,AMJ,0.02,0.02,0.0,Neutral,Neutral
+1960,MJJ,0.03,0.03,0.0,Neutral,Neutral
+1960,JJA,0.13,0.13,0.0,Neutral,Neutral
+1960,JAS,0.24,0.24,0.0,Neutral,Neutral
+1960,ASO,0.27,0.27,0.0,Neutral,Neutral
+1960,SON,0.2,0.2,0.0,Neutral,Neutral
+1960,OND,0.12,0.12,0.0,Neutral,Neutral
+1960,NDJ,0.05,0.05,0.0,Neutral,Neutral
+1961,DJF,0.04,0.04,0.0,Neutral,Neutral
+1961,JFM,0.03,0.03,0.0,Neutral,Neutral
+1961,FMA,0.04,0.04,0.0,Neutral,Neutral
+1961,MAM,0.09,0.09,0.0,Neutral,Neutral
+1961,AMJ,0.23,0.23,0.0,Neutral,Neutral
+1961,MJJ,0.27,0.27,0.0,Neutral,Neutral
+1961,JJA,0.14,0.14,0.0,Neutral,Neutral
+1961,JAS,-0.13,-0.13,0.0,Neutral,Neutral
+1961,ASO,-0.3,-0.3,0.0,Neutral,Neutral
+1961,SON,-0.26,-0.26,0.0,Neutral,Neutral
+1961,OND,-0.19,-0.19,0.0,Neutral,Neutral
+1961,NDJ,-0.16,-0.16,0.0,Neutral,Neutral
+1962,DJF,-0.24,-0.24,0.0,Neutral,Neutral
+1962,JFM,-0.22,-0.22,0.0,Neutral,Neutral
+1962,FMA,-0.2,-0.2,0.0,Neutral,Neutral
+1962,MAM,-0.26,-0.26,0.0,Neutral,Neutral
+1962,AMJ,-0.28,-0.28,0.0,Neutral,Neutral
+1962,MJJ,-0.2,-0.2,0.0,Neutral,Neutral
+1962,JJA,-0.04,-0.04,0.0,Neutral,Neutral
+1962,JAS,-0.07,-0.07,0.0,Neutral,Neutral
+1962,ASO,-0.11,-0.11,0.0,Neutral,Neutral
+1962,SON,-0.22,-0.22,0.0,Neutral,Neutral
+1962,OND,-0.31,-0.31,0.0,Neutral,Neutral
+1962,NDJ,-0.43,-0.43,0.0,Neutral,Neutral
+1963,DJF,-0.4,-0.4,0.0,Neutral,Neutral
+1963,JFM,-0.15,-0.15,0.0,Neutral,Neutral
+1963,FMA,0.15,0.15,0.0,Neutral,Neutral
+1963,MAM,0.27,0.27,0.0,Neutral,Neutral
+1963,AMJ,0.32,0.31,0.010000000000000009,Neutral,Neutral
+1963,MJJ,0.52,0.52,0.0,El Nino,El Nino
+1963,JJA,0.86,0.86,0.0,El Nino,El Nino
+1963,JAS,1.14,1.14,0.0,El Nino,El Nino
+1963,ASO,1.22,1.22,0.0,El Nino,El Nino
+1963,SON,1.29,1.29,0.0,El Nino,El Nino
+1963,OND,1.37,1.37,0.0,El Nino,El Nino
+1963,NDJ,1.31,1.31,0.0,El Nino,El Nino
+1964,DJF,1.07,1.07,0.0,El Nino,El Nino
+1964,JFM,0.62,0.62,0.0,El Nino,El Nino
+1964,FMA,0.12,0.12,0.0,Neutral,Neutral
+1964,MAM,-0.33,-0.33,0.0,Neutral,Neutral
+1964,AMJ,-0.58,-0.58,0.0,La Nina,La Nina
+1964,MJJ,-0.58,-0.58,0.0,La Nina,La Nina
+1964,JJA,-0.59,-0.6,0.010000000000000009,La Nina,La Nina
+1964,JAS,-0.66,-0.66,0.0,La Nina,La Nina
+1964,ASO,-0.76,-0.76,0.0,La Nina,La Nina
+1964,SON,-0.8,-0.8,0.0,La Nina,La Nina
+1964,OND,-0.82,-0.82,0.0,La Nina,La Nina
+1964,NDJ,-0.78,-0.78,0.0,La Nina,La Nina
+1965,DJF,-0.59,-0.59,0.0,La Nina,La Nina
+1965,JFM,-0.28,-0.28,0.0,Neutral,Neutral
+1965,FMA,-0.07,-0.07,0.0,Neutral,Neutral
+1965,MAM,0.18,0.18,0.0,Neutral,Neutral
+1965,AMJ,0.46,0.46,0.0,Neutral,Neutral
+1965,MJJ,0.83,0.83,0.0,El Nino,El Nino
+1965,JJA,1.22,1.22,0.0,El Nino,El Nino
+1965,JAS,1.54,1.54,0.0,El Nino,El Nino
+1965,ASO,1.85,1.85,0.0,El Nino,El Nino
+1965,SON,1.98,1.98,0.0,El Nino,El Nino
+1965,OND,1.97,1.97,0.0,El Nino,El Nino
+1965,NDJ,1.72,1.72,0.0,El Nino,El Nino
+1966,DJF,1.37,1.37,0.0,El Nino,El Nino
+1966,JFM,1.17,1.17,0.0,El Nino,El Nino
+1966,FMA,0.98,0.98,0.0,El Nino,El Nino
+1966,MAM,0.66,0.66,0.0,El Nino,El Nino
+1966,AMJ,0.35,0.35,0.0,Neutral,Neutral
+1966,MJJ,0.24,0.24,0.0,Neutral,Neutral
+1966,JJA,0.24,0.24,0.0,Neutral,Neutral
+1966,JAS,0.12,0.12,0.0,Neutral,Neutral
+1966,ASO,-0.05,-0.05,0.0,Neutral,Neutral
+1966,SON,-0.1,-0.1,0.0,Neutral,Neutral
+1966,OND,-0.18,-0.18,0.0,Neutral,Neutral
+1966,NDJ,-0.3,-0.3,0.0,Neutral,Neutral
+1967,DJF,-0.41,-0.41,0.0,Neutral,Neutral
+1967,JFM,-0.48,-0.48,0.0,Neutral,Neutral
+1967,FMA,-0.54,-0.53,-0.010000000000000009,La Nina,La Nina
+1967,MAM,-0.45,-0.45,0.0,Neutral,Neutral
+1967,AMJ,-0.24,-0.24,0.0,Neutral,Neutral
+1967,MJJ,-0.0,-0.0,0.0,Neutral,Neutral
+1967,JJA,0.05,0.05,0.0,Neutral,Neutral
+1967,JAS,-0.16,-0.16,0.0,Neutral,Neutral
+1967,ASO,-0.3,-0.3,0.0,Neutral,Neutral
+1967,SON,-0.38,-0.38,0.0,Neutral,Neutral
+1967,OND,-0.34,-0.34,0.0,Neutral,Neutral
+1967,NDJ,-0.44,-0.44,0.0,Neutral,Neutral
+1968,DJF,-0.64,-0.64,0.0,La Nina,La Nina
+1968,JFM,-0.74,-0.74,0.0,La Nina,La Nina
+1968,FMA,-0.62,-0.62,0.0,La Nina,La Nina
+1968,MAM,-0.44,-0.44,0.0,Neutral,Neutral
+1968,AMJ,-0.04,-0.04,0.0,Neutral,Neutral
+1968,MJJ,0.28,0.28,0.0,Neutral,Neutral
+1968,JJA,0.58,0.58,0.0,El Nino,El Nino
+1968,JAS,0.53,0.53,0.0,El Nino,El Nino
+1968,ASO,0.45,0.45,0.0,Neutral,Neutral
+1968,SON,0.55,0.55,0.0,El Nino,El Nino
+1968,OND,0.73,0.73,0.0,El Nino,El Nino
+1968,NDJ,0.98,0.98,0.0,El Nino,El Nino
+1969,DJF,1.13,1.13,0.0,El Nino,El Nino
+1969,JFM,1.08,1.09,-0.010000000000000009,El Nino,El Nino
+1969,FMA,0.95,0.95,0.0,El Nino,El Nino
+1969,MAM,0.77,0.77,0.0,El Nino,El Nino
+1969,AMJ,0.61,0.61,0.0,El Nino,El Nino
+1969,MJJ,0.43,0.43,0.0,Neutral,Neutral
+1969,JJA,0.36,0.36,0.0,Neutral,Neutral
+1969,JAS,0.51,0.51,0.0,El Nino,El Nino
+1969,ASO,0.79,0.79,0.0,El Nino,El Nino
+1969,SON,0.86,0.86,0.0,El Nino,El Nino
+1969,OND,0.81,0.81,0.0,El Nino,El Nino
+1969,NDJ,0.63,0.63,0.0,El Nino,El Nino
+1970,DJF,0.51,0.51,0.0,El Nino,El Nino
+1970,JFM,0.34,0.34,0.0,Neutral,Neutral
+1970,FMA,0.29,0.29,0.0,Neutral,Neutral
+1970,MAM,0.19,0.19,0.0,Neutral,Neutral
+1970,AMJ,0.05,0.04,0.010000000000000002,Neutral,Neutral
+1970,MJJ,-0.3,-0.3,0.0,Neutral,Neutral
+1970,JJA,-0.63,-0.63,0.0,La Nina,La Nina
+1970,JAS,-0.76,-0.76,0.0,La Nina,La Nina
+1970,ASO,-0.77,-0.77,0.0,La Nina,La Nina
+1970,SON,-0.74,-0.74,0.0,La Nina,La Nina
+1970,OND,-0.86,-0.86,0.0,La Nina,La Nina
+1970,NDJ,-1.15,-1.15,0.0,La Nina,La Nina
+1971,DJF,-1.36,-1.36,0.0,La Nina,La Nina
+1971,JFM,-1.38,-1.38,0.0,La Nina,La Nina
+1971,FMA,-1.12,-1.12,0.0,La Nina,La Nina
+1971,MAM,-0.85,-0.85,0.0,La Nina,La Nina
+1971,AMJ,-0.73,-0.73,0.0,La Nina,La Nina
+1971,MJJ,-0.74,-0.74,0.0,La Nina,La Nina
+1971,JJA,-0.8,-0.8,0.0,La Nina,La Nina
+1971,JAS,-0.77,-0.77,0.0,La Nina,La Nina
+1971,ASO,-0.82,-0.82,0.0,La Nina,La Nina
+1971,SON,-0.85,-0.85,0.0,La Nina,La Nina
+1971,OND,-0.96,-0.96,0.0,La Nina,La Nina
+1971,NDJ,-0.9,-0.9,0.0,La Nina,La Nina
+1972,DJF,-0.71,-0.71,0.0,La Nina,La Nina
+1972,JFM,-0.35,-0.35,0.0,Neutral,Neutral
+1972,FMA,0.06,0.06,0.0,Neutral,Neutral
+1972,MAM,0.41,0.41,0.0,Neutral,Neutral
+1972,AMJ,0.67,0.67,0.0,El Nino,El Nino
+1972,MJJ,0.92,0.92,0.0,El Nino,El Nino
+1972,JJA,1.13,1.13,0.0,El Nino,El Nino
+1972,JAS,1.37,1.37,0.0,El Nino,El Nino
+1972,ASO,1.58,1.58,0.0,El Nino,El Nino
+1972,SON,1.84,1.84,0.0,El Nino,El Nino
+1972,OND,2.09,2.09,0.0,El Nino,El Nino
+1972,NDJ,2.12,2.12,0.0,El Nino,El Nino
+1973,DJF,1.84,1.84,0.0,El Nino,El Nino
+1973,JFM,1.25,1.25,0.0,El Nino,El Nino
+1973,FMA,0.55,0.54,0.010000000000000009,El Nino,El Nino
+1973,MAM,-0.1,-0.1,0.0,Neutral,Neutral
+1973,AMJ,-0.54,-0.54,0.0,La Nina,La Nina
+1973,MJJ,-0.87,-0.87,0.0,La Nina,La Nina
+1973,JJA,-1.11,-1.11,0.0,La Nina,La Nina
+1973,JAS,-1.28,-1.28,0.0,La Nina,La Nina
+1973,ASO,-1.45,-1.45,0.0,La Nina,La Nina
+1973,SON,-1.71,-1.71,0.0,La Nina,La Nina
+1973,OND,-1.95,-1.95,0.0,La Nina,La Nina
+1973,NDJ,-2.03,-2.03,0.0,La Nina,La Nina
+1974,DJF,-1.84,-1.84,0.0,La Nina,La Nina
+1974,JFM,-1.55,-1.55,0.0,La Nina,La Nina
+1974,FMA,-1.23,-1.23,0.0,La Nina,La Nina
+1974,MAM,-1.03,-1.03,0.0,La Nina,La Nina
+1974,AMJ,-0.91,-0.91,0.0,La Nina,La Nina
+1974,MJJ,-0.77,-0.77,0.0,La Nina,La Nina
+1974,JJA,-0.53,-0.53,0.0,La Nina,La Nina
+1974,JAS,-0.37,-0.37,0.0,Neutral,Neutral
+1974,ASO,-0.41,-0.41,0.0,Neutral,Neutral
+1974,SON,-0.61,-0.61,0.0,La Nina,La Nina
+1974,OND,-0.75,-0.75,0.0,La Nina,La Nina
+1974,NDJ,-0.64,-0.64,0.0,La Nina,La Nina
+1975,DJF,-0.54,-0.54,0.0,La Nina,La Nina
+1975,JFM,-0.57,-0.57,0.0,La Nina,La Nina
+1975,FMA,-0.65,-0.65,0.0,La Nina,La Nina
+1975,MAM,-0.73,-0.73,0.0,La Nina,La Nina
+1975,AMJ,-0.83,-0.83,0.0,La Nina,La Nina
+1975,MJJ,-0.98,-0.98,0.0,La Nina,La Nina
+1975,JJA,-1.13,-1.13,0.0,La Nina,La Nina
+1975,JAS,-1.2,-1.2,0.0,La Nina,La Nina
+1975,ASO,-1.37,-1.37,0.0,La Nina,La Nina
+1975,SON,-1.43,-1.43,0.0,La Nina,La Nina
+1975,OND,-1.55,-1.55,0.0,La Nina,La Nina
+1975,NDJ,-1.65,-1.65,0.0,La Nina,La Nina
+1976,DJF,-1.56,-1.56,0.0,La Nina,La Nina
+1976,JFM,-1.17,-1.17,0.0,La Nina,La Nina
+1976,FMA,-0.73,-0.73,0.0,La Nina,La Nina
+1976,MAM,-0.47,-0.47,0.0,Neutral,Neutral
+1976,AMJ,-0.28,-0.28,0.0,Neutral,Neutral
+1976,MJJ,-0.05,-0.05,0.0,Neutral,Neutral
+1976,JJA,0.18,0.18,0.0,Neutral,Neutral
+1976,JAS,0.35,0.35,0.0,Neutral,Neutral
+1976,ASO,0.62,0.62,0.0,El Nino,El Nino
+1976,SON,0.81,0.81,0.0,El Nino,El Nino
+1976,OND,0.86,0.86,0.0,El Nino,El Nino
+1976,NDJ,0.85,0.85,0.0,El Nino,El Nino
+1977,DJF,0.71,0.71,0.0,El Nino,El Nino
+1977,JFM,0.64,0.64,0.0,El Nino,El Nino
+1977,FMA,0.34,0.34,0.0,Neutral,Neutral
+1977,MAM,0.23,0.23,0.0,Neutral,Neutral
+1977,AMJ,0.21,0.21,0.0,Neutral,Neutral
+1977,MJJ,0.34,0.34,0.0,Neutral,Neutral
+1977,JJA,0.35,0.35,0.0,Neutral,Neutral
+1977,JAS,0.42,0.42,0.0,Neutral,Neutral
+1977,ASO,0.57,0.57,0.0,El Nino,El Nino
+1977,SON,0.73,0.73,0.0,El Nino,El Nino
+1977,OND,0.81,0.81,0.0,El Nino,El Nino
+1977,NDJ,0.79,0.79,0.0,El Nino,El Nino
+1978,DJF,0.69,0.69,0.0,El Nino,El Nino
+1978,JFM,0.42,0.42,0.0,Neutral,Neutral
+1978,FMA,0.06,0.06,0.0,Neutral,Neutral
+1978,MAM,-0.18,-0.18,0.0,Neutral,Neutral
+1978,AMJ,-0.31,-0.31,0.0,Neutral,Neutral
+1978,MJJ,-0.29,-0.29,0.0,Neutral,Neutral
+1978,JJA,-0.36,-0.36,0.0,Neutral,Neutral
+1978,JAS,-0.42,-0.42,0.0,Neutral,Neutral
+1978,ASO,-0.42,-0.42,0.0,Neutral,Neutral
+1978,SON,-0.29,-0.29,0.0,Neutral,Neutral
+1978,OND,-0.08,-0.08,0.0,Neutral,Neutral
+1978,NDJ,0.0,0.0,0.0,Neutral,Neutral
+1979,DJF,0.03,0.03,0.0,Neutral,Neutral
+1979,JFM,0.07,0.07,0.0,Neutral,Neutral
+1979,FMA,0.2,0.2,0.0,Neutral,Neutral
+1979,MAM,0.28,0.28,0.0,Neutral,Neutral
+1979,AMJ,0.23,0.23,0.0,Neutral,Neutral
+1979,MJJ,0.05,0.05,0.0,Neutral,Neutral
+1979,JJA,0.04,0.04,0.0,Neutral,Neutral
+1979,JAS,0.17,0.17,0.0,Neutral,Neutral
+1979,ASO,0.33,0.33,0.0,Neutral,Neutral
+1979,SON,0.45,0.45,0.0,Neutral,Neutral
+1979,OND,0.52,0.52,0.0,El Nino,El Nino
+1979,NDJ,0.64,0.64,0.0,El Nino,El Nino
+1980,DJF,0.59,0.59,0.0,El Nino,El Nino
+1980,JFM,0.46,0.46,0.0,Neutral,Neutral
+1980,FMA,0.34,0.34,0.0,Neutral,Neutral
+1980,MAM,0.38,0.38,0.0,Neutral,Neutral
+1980,AMJ,0.48,0.48,0.0,Neutral,Neutral
+1980,MJJ,0.46,0.46,0.0,Neutral,Neutral
+1980,JJA,0.25,0.25,0.0,Neutral,Neutral
+1980,JAS,0.03,0.03,0.0,Neutral,Neutral
+1980,ASO,-0.07,-0.07,0.0,Neutral,Neutral
+1980,SON,0.02,0.02,0.0,Neutral,Neutral
+1980,OND,0.11,0.11,0.0,Neutral,Neutral
+1980,NDJ,-0.01,-0.01,0.0,Neutral,Neutral
+1981,DJF,-0.26,-0.26,0.0,Neutral,Neutral
+1981,JFM,-0.5,-0.5,0.0,La Nina,La Nina
+1981,FMA,-0.47,-0.47,0.0,Neutral,Neutral
+1981,MAM,-0.37,-0.37,0.0,Neutral,Neutral
+1981,AMJ,-0.26,-0.26,0.0,Neutral,Neutral
+1981,MJJ,-0.29,-0.29,0.0,Neutral,Neutral
+1981,JJA,-0.3,-0.3,0.0,Neutral,Neutral
+1981,JAS,-0.25,-0.25,0.0,Neutral,Neutral
+1981,ASO,-0.16,-0.16,0.0,Neutral,Neutral
+1981,SON,-0.13,-0.13,0.0,Neutral,Neutral
+1981,OND,-0.15,-0.15,0.0,Neutral,Neutral
+1981,NDJ,-0.08,-0.08,0.0,Neutral,Neutral
+1982,DJF,-0.05,-0.05,0.0,Neutral,Neutral
+1982,JFM,0.07,0.07,0.0,Neutral,Neutral
+1982,FMA,0.19,0.19,0.0,Neutral,Neutral
+1982,MAM,0.47,0.47,0.0,Neutral,Neutral
+1982,AMJ,0.66,0.66,0.0,El Nino,El Nino
+1982,MJJ,0.72,0.72,0.0,El Nino,El Nino
+1982,JJA,0.79,0.79,0.0,El Nino,El Nino
+1982,JAS,1.07,1.07,0.0,El Nino,El Nino
+1982,ASO,1.58,1.58,0.0,El Nino,El Nino
+1982,SON,1.97,1.97,0.0,El Nino,El Nino
+1982,OND,2.18,2.18,0.0,El Nino,El Nino
+1982,NDJ,2.23,2.23,0.0,El Nino,El Nino
+1983,DJF,2.18,2.18,0.0,El Nino,El Nino
+1983,JFM,1.92,1.92,0.0,El Nino,El Nino
+1983,FMA,1.54,1.54,0.0,El Nino,El Nino
+1983,MAM,1.29,1.29,0.0,El Nino,El Nino
+1983,AMJ,1.06,1.06,0.0,El Nino,El Nino
+1983,MJJ,0.72,0.72,0.0,El Nino,El Nino
+1983,JJA,0.31,0.31,0.0,Neutral,Neutral
+1983,JAS,-0.08,-0.08,0.0,Neutral,Neutral
+1983,ASO,-0.45,-0.46,0.010000000000000009,Neutral,Neutral
+1983,SON,-0.81,-0.81,0.0,La Nina,La Nina
+1983,OND,-1.0,-1.0,0.0,La Nina,La Nina
+1983,NDJ,-0.91,-0.91,0.0,La Nina,La Nina
+1984,DJF,-0.6,-0.6,0.0,La Nina,La Nina
+1984,JFM,-0.42,-0.42,0.0,Neutral,Neutral
+1984,FMA,-0.34,-0.34,0.0,Neutral,Neutral
+1984,MAM,-0.43,-0.43,0.0,Neutral,Neutral
+1984,AMJ,-0.51,-0.51,0.0,La Nina,La Nina
+1984,MJJ,-0.45,-0.45,0.0,Neutral,Neutral
+1984,JJA,-0.3,-0.3,0.0,Neutral,Neutral
+1984,JAS,-0.16,-0.16,0.0,Neutral,Neutral
+1984,ASO,-0.24,-0.24,0.0,Neutral,Neutral
+1984,SON,-0.56,-0.56,0.0,La Nina,La Nina
+1984,OND,-0.92,-0.92,0.0,La Nina,La Nina
+1984,NDJ,-1.14,-1.14,0.0,La Nina,La Nina
+1985,DJF,-1.04,-1.04,0.0,La Nina,La Nina
+1985,JFM,-0.85,-0.85,0.0,La Nina,La Nina
+1985,FMA,-0.77,-0.77,0.0,La Nina,La Nina
+1985,MAM,-0.78,-0.78,0.0,La Nina,La Nina
+1985,AMJ,-0.78,-0.78,0.0,La Nina,La Nina
+1985,MJJ,-0.63,-0.63,0.0,La Nina,La Nina
+1985,JJA,-0.49,-0.49,0.0,Neutral,Neutral
+1985,JAS,-0.46,-0.46,0.0,Neutral,Neutral
+1985,ASO,-0.4,-0.4,0.0,Neutral,Neutral
+1985,SON,-0.35,-0.35,0.0,Neutral,Neutral
+1985,OND,-0.27,-0.27,0.0,Neutral,Neutral
+1985,NDJ,-0.36,-0.36,0.0,Neutral,Neutral
+1986,DJF,-0.49,-0.49,0.0,Neutral,Neutral
+1986,JFM,-0.47,-0.47,0.0,Neutral,Neutral
+1986,FMA,-0.31,-0.31,0.0,Neutral,Neutral
+1986,MAM,-0.2,-0.2,0.0,Neutral,Neutral
+1986,AMJ,-0.12,-0.12,0.0,Neutral,Neutral
+1986,MJJ,-0.04,-0.04,0.0,Neutral,Neutral
+1986,JJA,0.22,0.22,0.0,Neutral,Neutral
+1986,JAS,0.44,0.44,0.0,Neutral,Neutral
+1986,ASO,0.71,0.71,0.0,El Nino,El Nino
+1986,SON,0.94,0.94,0.0,El Nino,El Nino
+1986,OND,1.14,1.14,0.0,El Nino,El Nino
+1986,NDJ,1.22,1.22,0.0,El Nino,El Nino
+1987,DJF,1.23,1.23,0.0,El Nino,El Nino
+1987,JFM,1.19,1.19,0.0,El Nino,El Nino
+1987,FMA,1.06,1.06,0.0,El Nino,El Nino
+1987,MAM,0.95,0.95,0.0,El Nino,El Nino
+1987,AMJ,0.97,0.97,0.0,El Nino,El Nino
+1987,MJJ,1.22,1.22,0.0,El Nino,El Nino
+1987,JJA,1.51,1.51,0.0,El Nino,El Nino
+1987,JAS,1.7,1.7,0.0,El Nino,El Nino
+1987,ASO,1.65,1.65,0.0,El Nino,El Nino
+1987,SON,1.48,1.48,0.0,El Nino,El Nino
+1987,OND,1.25,1.25,0.0,El Nino,El Nino
+1987,NDJ,1.11,1.11,0.0,El Nino,El Nino
+1988,DJF,0.81,0.81,0.0,El Nino,El Nino
+1988,JFM,0.54,0.54,0.0,El Nino,El Nino
+1988,FMA,0.14,0.14,0.0,Neutral,Neutral
+1988,MAM,-0.31,-0.31,0.0,Neutral,Neutral
+1988,AMJ,-0.88,-0.88,0.0,La Nina,La Nina
+1988,MJJ,-1.3,-1.3,0.0,La Nina,La Nina
+1988,JJA,-1.3,-1.3,0.0,La Nina,La Nina
+1988,JAS,-1.11,-1.11,0.0,La Nina,La Nina
+1988,ASO,-1.19,-1.19,0.0,La Nina,La Nina
+1988,SON,-1.48,-1.48,0.0,La Nina,La Nina
+1988,OND,-1.8,-1.8,0.0,La Nina,La Nina
+1988,NDJ,-1.85,-1.85,0.0,La Nina,La Nina
+1989,DJF,-1.69,-1.69,0.0,La Nina,La Nina
+1989,JFM,-1.43,-1.43,0.0,La Nina,La Nina
+1989,FMA,-1.08,-1.08,0.0,La Nina,La Nina
+1989,MAM,-0.83,-0.83,0.0,La Nina,La Nina
+1989,AMJ,-0.58,-0.58,0.0,La Nina,La Nina
+1989,MJJ,-0.4,-0.4,0.0,Neutral,Neutral
+1989,JJA,-0.31,-0.31,0.0,Neutral,Neutral
+1989,JAS,-0.27,-0.27,0.0,Neutral,Neutral
+1989,ASO,-0.24,-0.24,0.0,Neutral,Neutral
+1989,SON,-0.22,-0.22,0.0,Neutral,Neutral
+1989,OND,-0.16,-0.16,0.0,Neutral,Neutral
+1989,NDJ,-0.05,-0.05,0.0,Neutral,Neutral
+1990,DJF,0.14,0.14,0.0,Neutral,Neutral
+1990,JFM,0.21,0.21,0.0,Neutral,Neutral
+1990,FMA,0.28,0.28,0.0,Neutral,Neutral
+1990,MAM,0.29,0.29,0.0,Neutral,Neutral
+1990,AMJ,0.29,0.29,0.0,Neutral,Neutral
+1990,MJJ,0.31,0.31,0.0,Neutral,Neutral
+1990,JJA,0.33,0.33,0.0,Neutral,Neutral
+1990,JAS,0.38,0.38,0.0,Neutral,Neutral
+1990,ASO,0.39,0.39,0.0,Neutral,Neutral
+1990,SON,0.35,0.35,0.0,Neutral,Neutral
+1990,OND,0.4,0.4,0.0,Neutral,Neutral
+1990,NDJ,0.41,0.41,0.0,Neutral,Neutral
+1991,DJF,0.41,0.41,0.0,Neutral,Neutral
+1991,JFM,0.26,0.26,0.0,Neutral,Neutral
+1991,FMA,0.22,0.22,0.0,Neutral,Neutral
+1991,MAM,0.26,0.26,0.0,Neutral,Neutral
+1991,AMJ,0.45,0.45,0.0,Neutral,Neutral
+1991,MJJ,0.64,0.64,0.0,El Nino,El Nino
+1991,JJA,0.73,0.73,0.0,El Nino,El Nino
+1991,JAS,0.64,0.64,0.0,El Nino,El Nino
+1991,ASO,0.62,0.62,0.0,El Nino,El Nino
+1991,SON,0.79,0.79,0.0,El Nino,El Nino
+1991,OND,1.21,1.21,0.0,El Nino,El Nino
+1991,NDJ,1.53,1.53,0.0,El Nino,El Nino
+1992,DJF,1.71,1.71,0.0,El Nino,El Nino
+1992,JFM,1.63,1.63,0.0,El Nino,El Nino
+1992,FMA,1.48,1.48,0.0,El Nino,El Nino
+1992,MAM,1.29,1.29,0.0,El Nino,El Nino
+1992,AMJ,1.06,1.06,0.0,El Nino,El Nino
+1992,MJJ,0.73,0.73,0.0,El Nino,El Nino
+1992,JJA,0.37,0.37,0.0,Neutral,Neutral
+1992,JAS,0.09,0.09,0.0,Neutral,Neutral
+1992,ASO,-0.13,-0.13,0.0,Neutral,Neutral
+1992,SON,-0.25,-0.25,0.0,Neutral,Neutral
+1992,OND,-0.28,-0.28,0.0,Neutral,Neutral
+1992,NDJ,-0.13,-0.13,0.0,Neutral,Neutral
+1993,DJF,0.09,0.09,0.0,Neutral,Neutral
+1993,JFM,0.3,0.3,0.0,Neutral,Neutral
+1993,FMA,0.5,0.5,0.0,El Nino,El Nino
+1993,MAM,0.67,0.67,0.0,El Nino,El Nino
+1993,AMJ,0.7,0.7,0.0,El Nino,El Nino
+1993,MJJ,0.57,0.57,0.0,El Nino,El Nino
+1993,JJA,0.32,0.32,0.0,Neutral,Neutral
+1993,JAS,0.25,0.25,0.0,Neutral,Neutral
+1993,ASO,0.15,0.15,0.0,Neutral,Neutral
+1993,SON,0.1,0.1,0.0,Neutral,Neutral
+1993,OND,0.04,0.04,0.0,Neutral,Neutral
+1993,NDJ,0.06,0.06,0.0,Neutral,Neutral
+1994,DJF,0.06,0.06,0.0,Neutral,Neutral
+1994,JFM,0.07,0.07,0.0,Neutral,Neutral
+1994,FMA,0.17,0.17,0.0,Neutral,Neutral
+1994,MAM,0.31,0.31,0.0,Neutral,Neutral
+1994,AMJ,0.42,0.42,0.0,Neutral,Neutral
+1994,MJJ,0.41,0.41,0.0,Neutral,Neutral
+1994,JJA,0.44,0.44,0.0,Neutral,Neutral
+1994,JAS,0.43,0.43,0.0,Neutral,Neutral
+1994,ASO,0.55,0.55,0.0,El Nino,El Nino
+1994,SON,0.74,0.74,0.0,El Nino,El Nino
+1994,OND,1.01,1.01,0.0,El Nino,El Nino
+1994,NDJ,1.09,1.09,0.0,El Nino,El Nino
+1995,DJF,0.96,0.96,0.0,El Nino,El Nino
+1995,JFM,0.72,0.72,0.0,El Nino,El Nino
+1995,FMA,0.53,0.53,0.0,El Nino,El Nino
+1995,MAM,0.3,0.3,0.0,Neutral,Neutral
+1995,AMJ,0.14,0.14,0.0,Neutral,Neutral
+1995,MJJ,-0.03,-0.03,0.0,Neutral,Neutral
+1995,JJA,-0.24,-0.24,0.0,Neutral,Neutral
+1995,JAS,-0.54,-0.54,0.0,La Nina,La Nina
+1995,ASO,-0.81,-0.81,0.0,La Nina,La Nina
+1995,SON,-0.97,-0.97,0.0,La Nina,La Nina
+1995,OND,-1.0,-1.0,0.0,La Nina,La Nina
+1995,NDJ,-0.98,-0.98,0.0,La Nina,La Nina
+1996,DJF,-0.9,-0.9,0.0,La Nina,La Nina
+1996,JFM,-0.75,-0.75,0.0,La Nina,La Nina
+1996,FMA,-0.59,-0.59,0.0,La Nina,La Nina
+1996,MAM,-0.39,-0.39,0.0,Neutral,Neutral
+1996,AMJ,-0.31,-0.31,0.0,Neutral,Neutral
+1996,MJJ,-0.3,-0.3,0.0,Neutral,Neutral
+1996,JJA,-0.27,-0.27,0.0,Neutral,Neutral
+1996,JAS,-0.33,-0.32,-0.010000000000000009,Neutral,Neutral
+1996,ASO,-0.35,-0.35,0.0,Neutral,Neutral
+1996,SON,-0.4,-0.4,0.0,Neutral,Neutral
+1996,OND,-0.45,-0.45,0.0,Neutral,Neutral
+1996,NDJ,-0.49,-0.49,0.0,Neutral,Neutral
+1997,DJF,-0.5,-0.5,0.0,La Nina,La Nina
+1997,JFM,-0.36,-0.36,0.0,Neutral,Neutral
+1997,FMA,-0.1,-0.1,0.0,Neutral,Neutral
+1997,MAM,0.28,0.28,0.0,Neutral,Neutral
+1997,AMJ,0.75,0.75,0.0,El Nino,El Nino
+1997,MJJ,1.22,1.22,0.0,El Nino,El Nino
+1997,JJA,1.6,1.6,0.0,El Nino,El Nino
+1997,JAS,1.9,1.9,0.0,El Nino,El Nino
+1997,ASO,2.14,2.14,0.0,El Nino,El Nino
+1997,SON,2.33,2.33,0.0,El Nino,El Nino
+1997,OND,2.4,2.4,0.0,El Nino,El Nino
+1997,NDJ,2.39,2.39,0.0,El Nino,El Nino
+1998,DJF,2.24,2.24,0.0,El Nino,El Nino
+1998,JFM,1.93,1.93,0.0,El Nino,El Nino
+1998,FMA,1.44,1.44,0.0,El Nino,El Nino
+1998,MAM,0.99,0.99,0.0,El Nino,El Nino
+1998,AMJ,0.45,0.45,0.0,Neutral,Neutral
+1998,MJJ,-0.13,-0.13,0.0,Neutral,Neutral
+1998,JJA,-0.78,-0.78,0.0,La Nina,La Nina
+1998,JAS,-1.12,-1.12,0.0,La Nina,La Nina
+1998,ASO,-1.31,-1.31,0.0,La Nina,La Nina
+1998,SON,-1.35,-1.35,0.0,La Nina,La Nina
+1998,OND,-1.48,-1.48,0.0,La Nina,La Nina
+1998,NDJ,-1.57,-1.57,0.0,La Nina,La Nina
+1999,DJF,-1.55,-1.55,0.0,La Nina,La Nina
+1999,JFM,-1.3,-1.3,0.0,La Nina,La Nina
+1999,FMA,-1.07,-1.07,0.0,La Nina,La Nina
+1999,MAM,-0.98,-0.98,0.0,La Nina,La Nina
+1999,AMJ,-1.02,-1.02,0.0,La Nina,La Nina
+1999,MJJ,-1.04,-1.04,0.0,La Nina,La Nina
+1999,JJA,-1.1,-1.1,0.0,La Nina,La Nina
+1999,JAS,-1.11,-1.11,0.0,La Nina,La Nina
+1999,ASO,-1.16,-1.16,0.0,La Nina,La Nina
+1999,SON,-1.26,-1.26,0.0,La Nina,La Nina
+1999,OND,-1.46,-1.46,0.0,La Nina,La Nina
+1999,NDJ,-1.66,-1.65,-0.010000000000000009,La Nina,La Nina
+2000,DJF,-1.66,-1.66,0.0,La Nina,La Nina
+2000,JFM,-1.41,-1.41,0.0,La Nina,La Nina
+2000,FMA,-1.07,-1.07,0.0,La Nina,La Nina
+2000,MAM,-0.81,-0.81,0.0,La Nina,La Nina
+2000,AMJ,-0.71,-0.71,0.0,La Nina,La Nina
+2000,MJJ,-0.64,-0.64,0.0,La Nina,La Nina
+2000,JJA,-0.55,-0.55,0.0,La Nina,La Nina
+2000,JAS,-0.51,-0.51,0.0,La Nina,La Nina
+2000,ASO,-0.55,-0.55,0.0,La Nina,La Nina
+2000,SON,-0.63,-0.63,0.0,La Nina,La Nina
+2000,OND,-0.75,-0.75,0.0,La Nina,La Nina
+2000,NDJ,-0.74,-0.74,0.0,La Nina,La Nina
+2001,DJF,-0.68,-0.68,0.0,La Nina,La Nina
+2001,JFM,-0.52,-0.52,0.0,La Nina,La Nina
+2001,FMA,-0.44,-0.44,0.0,Neutral,Neutral
+2001,MAM,-0.34,-0.34,0.0,Neutral,Neutral
+2001,AMJ,-0.25,-0.25,0.0,Neutral,Neutral
+2001,MJJ,-0.12,-0.12,0.0,Neutral,Neutral
+2001,JJA,-0.07,-0.08,0.009999999999999995,Neutral,Neutral
+2001,JAS,-0.13,-0.13,0.0,Neutral,Neutral
+2001,ASO,-0.19,-0.19,0.0,Neutral,Neutral
+2001,SON,-0.29,-0.29,0.0,Neutral,Neutral
+2001,OND,-0.35,-0.35,0.0,Neutral,Neutral
+2001,NDJ,-0.31,-0.31,0.0,Neutral,Neutral
+2002,DJF,-0.15,-0.15,0.0,Neutral,Neutral
+2002,JFM,0.03,0.03,0.0,Neutral,Neutral
+2002,FMA,0.09,0.09,0.0,Neutral,Neutral
+2002,MAM,0.2,0.2,0.0,Neutral,Neutral
+2002,AMJ,0.43,0.43,0.0,Neutral,Neutral
+2002,MJJ,0.65,0.65,0.0,El Nino,El Nino
+2002,JJA,0.79,0.79,0.0,El Nino,El Nino
+2002,JAS,0.86,0.86,0.0,El Nino,El Nino
+2002,ASO,1.01,1.01,0.0,El Nino,El Nino
+2002,SON,1.21,1.21,0.0,El Nino,El Nino
+2002,OND,1.31,1.31,0.0,El Nino,El Nino
+2002,NDJ,1.14,1.14,0.0,El Nino,El Nino
+2003,DJF,0.92,0.92,0.0,El Nino,El Nino
+2003,JFM,0.63,0.63,0.0,El Nino,El Nino
+2003,FMA,0.38,0.38,0.0,Neutral,Neutral
+2003,MAM,-0.04,-0.04,0.0,Neutral,Neutral
+2003,AMJ,-0.26,-0.26,0.0,Neutral,Neutral
+2003,MJJ,-0.16,-0.16,0.0,Neutral,Neutral
+2003,JJA,0.08,0.08,0.0,Neutral,Neutral
+2003,JAS,0.21,0.21,0.0,Neutral,Neutral
+2003,ASO,0.26,0.26,0.0,Neutral,Neutral
+2003,SON,0.29,0.29,0.0,Neutral,Neutral
+2003,OND,0.35,0.35,0.0,Neutral,Neutral
+2003,NDJ,0.35,0.35,0.0,Neutral,Neutral
+2004,DJF,0.37,0.37,0.0,Neutral,Neutral
+2004,JFM,0.31,0.31,0.0,Neutral,Neutral
+2004,FMA,0.23,0.23,0.0,Neutral,Neutral
+2004,MAM,0.17,0.17,0.0,Neutral,Neutral
+2004,AMJ,0.17,0.17,0.0,Neutral,Neutral
+2004,MJJ,0.28,0.28,0.0,Neutral,Neutral
+2004,JJA,0.47,0.47,0.0,Neutral,Neutral
+2004,JAS,0.64,0.64,0.0,El Nino,El Nino
+2004,ASO,0.7,0.7,0.0,El Nino,El Nino
+2004,SON,0.67,0.67,0.0,El Nino,El Nino
+2004,OND,0.66,0.66,0.0,El Nino,El Nino
+2004,NDJ,0.69,0.69,0.0,El Nino,El Nino
+2005,DJF,0.64,0.64,0.0,El Nino,El Nino
+2005,JFM,0.58,0.58,0.0,El Nino,El Nino
+2005,FMA,0.45,0.45,0.0,Neutral,Neutral
+2005,MAM,0.43,0.43,0.0,Neutral,Neutral
+2005,AMJ,0.29,0.29,0.0,Neutral,Neutral
+2005,MJJ,0.11,0.11,0.0,Neutral,Neutral
+2005,JJA,-0.06,-0.06,0.0,Neutral,Neutral
+2005,JAS,-0.14,-0.14,0.0,Neutral,Neutral
+2005,ASO,-0.11,-0.11,0.0,Neutral,Neutral
+2005,SON,-0.28,-0.29,0.009999999999999953,Neutral,Neutral
+2005,OND,-0.57,-0.57,0.0,La Nina,La Nina
+2005,NDJ,-0.84,-0.84,0.0,La Nina,La Nina
+2006,DJF,-0.85,-0.85,0.0,La Nina,La Nina
+2006,JFM,-0.77,-0.77,0.0,La Nina,La Nina
+2006,FMA,-0.57,-0.57,0.0,La Nina,La Nina
+2006,MAM,-0.37,-0.37,0.0,Neutral,Neutral
+2006,AMJ,-0.14,-0.14,0.0,Neutral,Neutral
+2006,MJJ,-0.03,-0.03,0.0,Neutral,Neutral
+2006,JJA,0.1,0.1,0.0,Neutral,Neutral
+2006,JAS,0.3,0.3,0.0,Neutral,Neutral
+2006,ASO,0.53,0.54,-0.010000000000000009,El Nino,El Nino
+2006,SON,0.76,0.77,-0.010000000000000009,El Nino,El Nino
+2006,OND,0.94,0.94,0.0,El Nino,El Nino
+2006,NDJ,0.94,0.94,0.0,El Nino,El Nino
+2007,DJF,0.66,0.66,0.0,El Nino,El Nino
+2007,JFM,0.22,0.22,0.0,Neutral,Neutral
+2007,FMA,-0.12,-0.12,0.0,Neutral,Neutral
+2007,MAM,-0.32,-0.32,0.0,Neutral,Neutral
+2007,AMJ,-0.38,-0.38,0.0,Neutral,Neutral
+2007,MJJ,-0.47,-0.47,0.0,Neutral,Neutral
+2007,JJA,-0.56,-0.56,0.0,La Nina,La Nina
+2007,JAS,-0.81,-0.81,0.0,La Nina,La Nina
+2007,ASO,-1.07,-1.07,0.0,La Nina,La Nina
+2007,SON,-1.34,-1.34,0.0,La Nina,La Nina
+2007,OND,-1.5,-1.5,0.0,La Nina,La Nina
+2007,NDJ,-1.6,-1.6,0.0,La Nina,La Nina
+2008,DJF,-1.64,-1.64,0.0,La Nina,La Nina
+2008,JFM,-1.52,-1.52,0.0,La Nina,La Nina
+2008,FMA,-1.29,-1.29,0.0,La Nina,La Nina
+2008,MAM,-1.01,-1.01,0.0,La Nina,La Nina
+2008,AMJ,-0.84,-0.84,0.0,La Nina,La Nina
+2008,MJJ,-0.61,-0.61,0.0,La Nina,La Nina
+2008,JJA,-0.37,-0.37,0.0,Neutral,Neutral
+2008,JAS,-0.23,-0.23,0.0,Neutral,Neutral
+2008,ASO,-0.25,-0.24,-0.010000000000000009,Neutral,Neutral
+2008,SON,-0.35,-0.35,0.0,Neutral,Neutral
+2008,OND,-0.56,-0.55,-0.010000000000000009,La Nina,La Nina
+2008,NDJ,-0.74,-0.73,-0.010000000000000009,La Nina,La Nina
+2009,DJF,-0.85,-0.85,0.0,La Nina,La Nina
+2009,JFM,-0.79,-0.79,0.0,La Nina,La Nina
+2009,FMA,-0.61,-0.61,0.0,La Nina,La Nina
+2009,MAM,-0.33,-0.33,0.0,Neutral,Neutral
+2009,AMJ,0.01,0.01,0.0,Neutral,Neutral
+2009,MJJ,0.28,0.28,0.0,Neutral,Neutral
+2009,JJA,0.45,0.45,0.0,Neutral,Neutral
+2009,JAS,0.57,0.58,-0.010000000000000009,El Nino,El Nino
+2009,ASO,0.71,0.71,0.0,El Nino,El Nino
+2009,SON,1.01,1.01,0.0,El Nino,El Nino
+2009,OND,1.36,1.36,0.0,El Nino,El Nino
+2009,NDJ,1.56,1.56,0.0,El Nino,El Nino
+2010,DJF,1.5,1.5,0.0,El Nino,El Nino
+2010,JFM,1.22,1.22,0.0,El Nino,El Nino
+2010,FMA,0.84,0.84,0.0,El Nino,El Nino
+2010,MAM,0.36,0.35,0.010000000000000009,Neutral,Neutral
+2010,AMJ,-0.17,-0.17,0.0,Neutral,Neutral
+2010,MJJ,-0.66,-0.66,0.0,La Nina,La Nina
+2010,JJA,-1.05,-1.05,0.0,La Nina,La Nina
+2010,JAS,-1.35,-1.35,0.0,La Nina,La Nina
+2010,ASO,-1.55,-1.56,0.010000000000000009,La Nina,La Nina
+2010,SON,-1.64,-1.64,0.0,La Nina,La Nina
+2010,OND,-1.64,-1.64,0.0,La Nina,La Nina
+2010,NDJ,-1.54,-1.54,0.0,La Nina,La Nina
+2011,DJF,-1.31,-1.31,0.0,La Nina,La Nina
+2011,JFM,-1.04,-1.04,0.0,La Nina,La Nina
+2011,FMA,-0.8,-0.8,0.0,La Nina,La Nina
+2011,MAM,-0.62,-0.62,0.0,La Nina,La Nina
+2011,AMJ,-0.45,-0.46,0.010000000000000009,Neutral,Neutral
+2011,MJJ,-0.37,-0.37,0.0,Neutral,Neutral
+2011,JJA,-0.43,-0.43,0.0,Neutral,Neutral
+2011,JAS,-0.58,-0.58,0.0,La Nina,La Nina
+2011,ASO,-0.78,-0.79,0.010000000000000009,La Nina,La Nina
+2011,SON,-0.96,-0.96,0.0,La Nina,La Nina
+2011,OND,-1.02,-1.02,0.0,La Nina,La Nina
+2011,NDJ,-0.92,-0.92,0.0,La Nina,La Nina
+2012,DJF,-0.72,-0.72,0.0,La Nina,La Nina
+2012,JFM,-0.58,-0.57,-0.010000000000000009,La Nina,La Nina
+2012,FMA,-0.47,-0.46,-0.009999999999999953,Neutral,Neutral
+2012,MAM,-0.37,-0.36,-0.010000000000000009,Neutral,Neutral
+2012,AMJ,-0.17,-0.17,0.0,Neutral,Neutral
+2012,MJJ,0.05,0.06,-0.009999999999999995,Neutral,Neutral
+2012,JJA,0.29,0.3,-0.010000000000000009,Neutral,Neutral
+2012,JAS,0.4,0.41,-0.009999999999999953,Neutral,Neutral
+2012,ASO,0.41,0.41,0.0,Neutral,Neutral
+2012,SON,0.31,0.31,0.0,Neutral,Neutral
+2012,OND,0.12,0.13,-0.010000000000000009,Neutral,Neutral
+2012,NDJ,-0.1,-0.1,0.0,Neutral,Neutral
+2013,DJF,-0.29,-0.29,0.0,Neutral,Neutral
+2013,JFM,-0.29,-0.29,0.0,Neutral,Neutral
+2013,FMA,-0.21,-0.21,0.0,Neutral,Neutral
+2013,MAM,-0.19,-0.19,0.0,Neutral,Neutral
+2013,AMJ,-0.26,-0.27,0.010000000000000009,Neutral,Neutral
+2013,MJJ,-0.34,-0.34,0.0,Neutral,Neutral
+2013,JJA,-0.35,-0.35,0.0,Neutral,Neutral
+2013,JAS,-0.28,-0.28,0.0,Neutral,Neutral
+2013,ASO,-0.21,-0.21,0.0,Neutral,Neutral
+2013,SON,-0.13,-0.13,0.0,Neutral,Neutral
+2013,OND,-0.1,-0.1,0.0,Neutral,Neutral
+2013,NDJ,-0.16,-0.15,-0.010000000000000009,Neutral,Neutral
+2014,DJF,-0.29,-0.28,-0.009999999999999953,Neutral,Neutral
+2014,JFM,-0.33,-0.32,-0.010000000000000009,Neutral,Neutral
+2014,FMA,-0.15,-0.14,-0.009999999999999981,Neutral,Neutral
+2014,MAM,0.14,0.15,-0.009999999999999981,Neutral,Neutral
+2014,AMJ,0.29,0.31,-0.020000000000000018,Neutral,Neutral
+2014,MJJ,0.22,0.23,-0.010000000000000009,Neutral,Neutral
+2014,JJA,0.08,0.1,-0.020000000000000004,Neutral,Neutral
+2014,JAS,0.1,0.11,-0.009999999999999995,Neutral,Neutral
+2014,ASO,0.27,0.28,-0.010000000000000009,Neutral,Neutral
+2014,SON,0.53,0.54,-0.010000000000000009,El Nino,El Nino
+2014,OND,0.7,0.71,-0.010000000000000009,El Nino,El Nino
+2014,NDJ,0.76,0.77,-0.010000000000000009,El Nino,El Nino
+2015,DJF,0.69,0.69,0.0,El Nino,El Nino
+2015,JFM,0.62,0.61,0.010000000000000009,El Nino,El Nino
+2015,FMA,0.66,0.65,0.010000000000000009,El Nino,El Nino
+2015,MAM,0.81,0.81,0.0,El Nino,El Nino
+2015,AMJ,1.02,1.02,0.0,El Nino,El Nino
+2015,MJJ,1.25,1.25,0.0,El Nino,El Nino
+2015,JJA,1.57,1.57,0.0,El Nino,El Nino
+2015,JAS,1.9,1.91,-0.010000000000000009,El Nino,El Nino
+2015,ASO,2.2,2.21,-0.009999999999999787,El Nino,El Nino
+2015,SON,2.47,2.47,0.0,El Nino,El Nino
+2015,OND,2.64,2.64,0.0,El Nino,El Nino
+2015,NDJ,2.75,2.75,0.0,El Nino,El Nino
+2016,DJF,2.63,2.63,0.0,El Nino,El Nino
+2016,JFM,2.29,2.28,0.010000000000000231,El Nino,El Nino
+2016,FMA,1.72,1.71,0.010000000000000009,El Nino,El Nino
+2016,MAM,1.06,1.05,0.010000000000000009,El Nino,El Nino
+2016,AMJ,0.5,0.49,0.010000000000000009,El Nino,Neutral
+2016,MJJ,0.01,0.0,0.01,Neutral,Neutral
+2016,JJA,-0.3,-0.31,0.010000000000000009,Neutral,Neutral
+2016,JAS,-0.49,-0.5,0.010000000000000009,Neutral,La Nina
+2016,ASO,-0.57,-0.58,0.010000000000000009,La Nina,La Nina
+2016,SON,-0.63,-0.64,0.010000000000000009,La Nina,La Nina
+2016,OND,-0.59,-0.6,0.010000000000000009,La Nina,La Nina
+2016,NDJ,-0.45,-0.45,0.0,Neutral,Neutral
+2017,DJF,-0.19,-0.19,0.0,Neutral,Neutral
+2017,JFM,-0.01,-0.02,0.01,Neutral,Neutral
+2017,FMA,0.18,0.18,0.0,Neutral,Neutral
+2017,MAM,0.31,0.31,0.0,Neutral,Neutral
+2017,AMJ,0.39,0.4,-0.010000000000000009,Neutral,Neutral
+2017,MJJ,0.39,0.39,0.0,Neutral,Neutral
+2017,JJA,0.2,0.19,0.010000000000000009,Neutral,Neutral
+2017,JAS,-0.06,-0.07,0.010000000000000009,Neutral,Neutral
+2017,ASO,-0.34,-0.34,0.0,Neutral,Neutral
+2017,SON,-0.6,-0.6,0.0,La Nina,La Nina
+2017,OND,-0.77,-0.77,0.0,La Nina,La Nina
+2017,NDJ,-0.86,-0.86,0.0,La Nina,La Nina
+2018,DJF,-0.77,-0.77,0.0,La Nina,La Nina
+2018,JFM,-0.71,-0.71,0.0,La Nina,La Nina
+2018,FMA,-0.57,-0.57,0.0,La Nina,La Nina
+2018,MAM,-0.39,-0.39,0.0,Neutral,Neutral
+2018,AMJ,-0.12,-0.13,0.010000000000000009,Neutral,Neutral
+2018,MJJ,0.07,0.06,0.010000000000000009,Neutral,Neutral
+2018,JJA,0.15,0.14,0.009999999999999981,Neutral,Neutral
+2018,JAS,0.29,0.27,0.019999999999999962,Neutral,Neutral
+2018,ASO,0.55,0.53,0.020000000000000018,El Nino,El Nino
+2018,SON,0.82,0.81,0.009999999999999898,El Nino,El Nino
+2018,OND,0.98,0.97,0.010000000000000009,El Nino,El Nino
+2018,NDJ,0.94,0.92,0.019999999999999907,El Nino,El Nino
+2019,DJF,0.9,0.89,0.010000000000000009,El Nino,El Nino
+2019,JFM,0.87,0.86,0.010000000000000009,El Nino,El Nino
+2019,FMA,0.85,0.84,0.010000000000000009,El Nino,El Nino
+2019,MAM,0.78,0.77,0.010000000000000009,El Nino,El Nino
+2019,AMJ,0.65,0.64,0.010000000000000009,El Nino,El Nino
+2019,MJJ,0.53,0.52,0.010000000000000009,El Nino,El Nino
+2019,JJA,0.34,0.33,0.010000000000000009,Neutral,Neutral
+2019,JAS,0.2,0.19,0.010000000000000009,Neutral,Neutral
+2019,ASO,0.24,0.23,0.009999999999999981,Neutral,Neutral
+2019,SON,0.41,0.39,0.019999999999999962,Neutral,Neutral
+2019,OND,0.59,0.58,0.010000000000000009,El Nino,El Nino
+2019,NDJ,0.67,0.66,0.010000000000000009,El Nino,El Nino
+2020,DJF,0.64,0.64,0.0,El Nino,El Nino
+2020,JFM,0.63,0.63,0.0,El Nino,El Nino
+2020,FMA,0.53,0.53,0.0,El Nino,El Nino
+2020,MAM,0.3,0.3,0.0,Neutral,Neutral
+2020,AMJ,0.01,0.01,0.0,Neutral,Neutral
+2020,MJJ,-0.23,-0.23,0.0,Neutral,Neutral
+2020,JJA,-0.36,-0.36,0.0,Neutral,Neutral
+2020,JAS,-0.53,-0.53,0.0,La Nina,La Nina
+2020,ASO,-0.84,-0.85,0.010000000000000009,La Nina,La Nina
+2020,SON,-1.12,-1.12,0.0,La Nina,La Nina
+2020,OND,-1.2,-1.2,0.0,La Nina,La Nina
+2020,NDJ,-1.08,-1.08,0.0,La Nina,La Nina
+2021,DJF,-0.91,-0.91,0.0,La Nina,La Nina
+2021,JFM,-0.79,-0.79,0.0,La Nina,La Nina
+2021,FMA,-0.72,-0.71,-0.010000000000000009,La Nina,La Nina
+2021,MAM,-0.55,-0.55,0.0,La Nina,La Nina
+2021,AMJ,-0.39,-0.39,0.0,Neutral,Neutral
+2021,MJJ,-0.31,-0.3,-0.010000000000000009,Neutral,Neutral
+2021,JJA,-0.35,-0.35,0.0,Neutral,Neutral
+2021,JAS,-0.45,-0.45,0.0,Neutral,Neutral
+2021,ASO,-0.64,-0.63,-0.010000000000000009,La Nina,La Nina
+2021,SON,-0.77,-0.76,-0.010000000000000009,La Nina,La Nina
+2021,OND,-0.92,-0.91,-0.010000000000000009,La Nina,La Nina
+2021,NDJ,-0.88,-0.87,-0.010000000000000009,La Nina,La Nina
+2022,DJF,-0.83,-0.82,-0.010000000000000009,La Nina,La Nina
+2022,JFM,-0.8,-0.79,-0.010000000000000009,La Nina,La Nina
+2022,FMA,-0.87,-0.86,-0.010000000000000009,La Nina,La Nina
+2022,MAM,-0.96,-0.95,-0.010000000000000009,La Nina,La Nina
+2022,AMJ,-0.9,-0.9,0.0,La Nina,La Nina
+2022,MJJ,-0.79,-0.78,-0.010000000000000009,La Nina,La Nina
+2022,JJA,-0.77,-0.76,-0.010000000000000009,La Nina,La Nina
+2022,JAS,-0.88,-0.87,-0.010000000000000009,La Nina,La Nina
+2022,ASO,-0.98,-0.97,-0.010000000000000009,La Nina,La Nina
+2022,SON,-0.95,-0.94,-0.010000000000000009,La Nina,La Nina
+2022,OND,-0.85,-0.85,0.0,La Nina,La Nina
+2022,NDJ,-0.72,-0.71,-0.010000000000000009,La Nina,La Nina
+2023,DJF,-0.54,-0.54,0.0,La Nina,La Nina
+2023,JFM,-0.29,-0.29,0.0,Neutral,Neutral
+2023,FMA,-0.02,-0.02,0.0,Neutral,Neutral
+2023,MAM,0.27,0.27,0.0,Neutral,Neutral
+2023,AMJ,0.57,0.57,0.0,El Nino,El Nino
+2023,MJJ,0.84,0.84,0.0,El Nino,El Nino
+2023,JJA,1.12,1.12,0.0,El Nino,El Nino
+2023,JAS,1.37,1.37,0.0,El Nino,El Nino
+2023,ASO,1.6,1.6,0.0,El Nino,El Nino
+2023,SON,1.83,1.83,0.0,El Nino,El Nino
+2023,OND,1.99,1.99,0.0,El Nino,El Nino
+2023,NDJ,2.07,2.06,0.009999999999999787,El Nino,El Nino
+2024,DJF,1.93,1.92,0.010000000000000009,El Nino,El Nino
+2024,JFM,1.63,1.62,0.009999999999999787,El Nino,El Nino
+2024,FMA,1.27,1.26,0.010000000000000009,El Nino,El Nino
+2024,MAM,0.83,0.82,0.010000000000000009,El Nino,El Nino
+2024,AMJ,0.5,0.49,0.010000000000000009,El Nino,Neutral
+2024,MJJ,0.23,0.22,0.010000000000000009,Neutral,Neutral
+2024,JJA,0.09,0.08,0.009999999999999995,Neutral,Neutral
+2024,JAS,-0.06,-0.07,0.010000000000000009,Neutral,Neutral
+2024,ASO,-0.16,-0.17,0.010000000000000009,Neutral,Neutral
+2024,SON,-0.2,-0.21,0.009999999999999981,Neutral,Neutral
+2024,OND,-0.29,-0.3,0.010000000000000009,Neutral,Neutral
+2024,NDJ,-0.41,-0.42,0.010000000000000009,Neutral,Neutral
+2025,DJF,-0.44,-0.45,0.010000000000000009,Neutral,Neutral
+2025,JFM,-0.25,-0.24,-0.010000000000000009,Neutral,Neutral
+2025,FMA,-0.06,-0.06,0.0,Neutral,Neutral
+2025,MAM,0.02,0.02,0.0,Neutral,Neutral
+2025,AMJ,-0.02,-0.02,0.0,Neutral,Neutral
+2025,MJJ,-0.04,-0.04,0.0,Neutral,Neutral
+2025,JJA,-0.14,-0.14,0.0,Neutral,Neutral
+2025,JAS,-0.28,-0.28,0.0,Neutral,Neutral
+2025,ASO,-0.4,-0.4,0.0,Neutral,Neutral
+2025,SON,-0.51,-0.51,0.0,La Nina,La Nina
+2025,OND,-0.55,-0.55,0.0,La Nina,La Nina
+2025,NDJ,-0.54,-0.54,0.0,La Nina,La Nina
+2026,DJF,-0.37,-0.37,0.0,Neutral,Neutral
+2026,JFM,-0.15,-0.14,-0.009999999999999981,Neutral,Neutral
+2026,FMA,0.13,0.13,0.0,Neutral,Neutral
+2026,MAM,0.48,0.48,0.0,Neutral,Neutral

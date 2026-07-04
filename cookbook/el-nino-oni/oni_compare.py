@@ -174,6 +174,7 @@ def main():
     ap.add_argument("--reference", default=None)
     ap.add_argument("--threshold", type=float, default=0.5)
     ap.add_argument("--out", default="data/oni_comparison.csv")
+    ap.add_argument("--label", default="ERA5", help="dataset label for the report header")
     a = ap.parse_args()
 
     ours = load_computed(a.computed)
@@ -189,7 +190,7 @@ def main():
     m["noaa_cls"] = m["noaa"].map(lambda x: classify(x, a.threshold))
 
     print("=" * 68)
-    print(f"ONI comparison: zarr-datafusion (ERA5)  vs  NOAA CPC (ERSSTv5)")
+    print(f"ONI comparison: zarr-datafusion ({a.label})  vs  NOAA CPC (ERSSTv5)")
     print(f"matched {len(m)} seasons, "
           f"{m.year.min()}-{m.year.max()}, threshold +/-{a.threshold} degC")
     print("=" * 68)

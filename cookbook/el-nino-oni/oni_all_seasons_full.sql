@@ -72,9 +72,7 @@ WITH samples AS (                               -- one noon-of-the-15th sample p
     WHERE latitude  BETWEEN  -5.0 AND   5.0     -- coordinates only in WHERE
       AND longitude BETWEEN 190.0 AND 240.0
   ) AS box
-  WHERE extract(day  FROM ts) = 15              -- time coordinate (via extract)
-    AND extract(hour FROM ts) = 12
-    AND extract(year FROM ts) BETWEEN 1940 AND 2026   -- widened: rolling base needs deep past
+  WHERE extract(year FROM ts) BETWEEN 1940 AND 2026   -- widened: rolling base needs deep past
 ),
 monthly AS (                                    -- spatial mean per (year, month)
   SELECT yr, mo, AVG(sst_c) AS sst_c
