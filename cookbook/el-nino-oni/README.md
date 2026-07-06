@@ -218,6 +218,87 @@ result low variance alone cannot manufacture.
 
 ---
 
+## Does the one-hour-a-month proxy hold up? A spectral check
+
+Recipe B represents each month by a **single hour** — noon on the 15th — rather than a
+true monthly mean. Is that faithful, or does it alias sub-monthly noise into the signal?
+The way to answer *by timescale* is a **power spectral density (PSD)** comparison of the
+two Niño-3.4 box-mean SST series: where in the spectrum does their variance agree, and
+where does it diverge?
+
+A single query (`nino34_monthly_sst.sql`) reads **both** sources and inner-joins them on
+`(year, month)`, emitting one aligned row per month — `time, sst_ersst, sst_era5`.
+`psd_compare.py` then orders that series onto a gap-free monthly grid (sort, dedupe,
+reindex to month-start, interpolate any gap — spectral methods need even spacing) and
+estimates each spectrum.
+
+![Niño-3.4 monthly SST PSD — ERSST (true monthly mean) vs ERA5 (noon-of-15th proxy)](nino34_psd.png)
+
+The two spectra lie on top of each other through the bands that matter and separate only
+in the noise floor:
+
+| band | ERSST | ERA5 | ERA5 / ERSST |
+|---|---|---|---|
+| **ENSO (2–7 yr)** | 0.33 | 0.35 | **1.07** |
+| annual | 0.20 | 0.21 | 1.06 |
+| high-freq (2–8 mo periods) | 0.057 | 0.093 | **1.64** |
+
+*(band-integrated power, °C²; detrended-series variance 0.98 vs 1.05 °C².)*
+
+ENSO-band and annual power agree to **~7 %**. The ERA5 proxy carries **1.64×** the
+high-frequency power — a broadband floor at 2–8-month periods, which is exactly the
+spectral fingerprint of sub-monthly variability *folding down* (aliasing) under
+once-a-month sampling. But it is **small**: 0.09 vs 0.33 °C² in the ENSO band it must not
+disturb. So the one-hour proxy is faithful precisely where the ONI lives and only adds a
+little short-timescale scatter — the same conclusion the residual plot reaches in the
+time domain, now resolved by frequency.
+
+### Why Welch, and the parameters
+
+The naive estimator — one FFT of the whole record (the **periodogram**) — is
+*inconsistent*: its variance does not shrink as the record lengthens, so more data buys
+finer resolution but a spectrum just as jagged. **Welch's method** trades resolution for
+variance: split the series into overlapping segments, window and periodogram each, then
+**average**. Averaging K roughly-independent segment spectra cuts the variance ~K-fold —
+turning a useless jagged estimate into two smooth curves you can overlay and integrate,
+which is what a *comparison* needs.
+
+Alternatives, and why not here: **multitaper (Slepian/DPSS)** is the defensible upgrade
+if the goal were to *characterize* the ENSO peak (better bias–variance at fixed
+resolution) — overkill for a two-curve comparison; **parametric AR/Burg** gives very
+smooth spectra but a wrong model order *invents* peaks — a liability for a validation
+plot; **Lomb–Scargle** is for *uneven* sampling, moot once we regularize onto a monthly
+grid; **wavelets** are for *non-stationarity* (how ENSO power changes over decades), a
+different question than "averaged over the record, where is the variance."
+
+| parameter | value | why |
+|---|---|---|
+| `fs` | `12` /yr | monthly cadence → frequency axis in **cycles/year**; Nyquist = 6 c/yr (2-month period) |
+| `nperseg` | `256` (~21 yr) | the bias–variance dial: resolution `df ≈ 0.047` c/yr (≈8 cells across the ENSO band) with ~7 averaged segments over the record |
+| `window` | `hann` | tapers each segment to zero → suppresses spectral leakage (−31 dB sidelobes vs a rectangle's −13), so the huge annual peak can't bleed into the ENSO band |
+| `detrend` | `linear` (per segment) | removes the DC mean **and** the warming trend, which would otherwise dump red-noise power into the lowest bins and bias the low-frequency comparison |
+| `scaling` | `density` | units °C²·yr; obeys Parseval, so integrating over a band gives that band's **variance** (the table above) and the estimate is invariant to `nperseg`, keeping the two curves comparable |
+
+### What this proves — and what is deferred
+
+This is the **confounded** comparison: noon-15th ERA5 vs monthly-mean ERSST mixes two
+effects — the *sampling method* (one hour vs a true mean) and the *dataset* (ERA5 0.25°
+vs ERSST 2°). The 1.64× high-frequency excess is *consistent with* aliased sub-monthly
+energy, but could partly be ERA5 genuinely resolving finer structure. Monthly data also
+cannot show sub-monthly frequencies directly — only their aliased image.
+
+The **controlled** test isolates sampling from dataset: **ERA5 all-hours monthly mean vs
+ERA5 noon-15th, same dataset** (any gap between them is pure sampling penalty). That
+means averaging *every hourly step* per month — ~720× the timesteps the day-15/hour-12
+pushdown fetches — a scan large enough that it needs **distributed zarr-datafusion** to
+be practical. It is **deferred** until that lands.
+
+One related caveat this analysis surfaces: ERA5's SST is a *prescribed* boundary field
+(smoothed daily observational analyses), sharing an observational base with ERSST — so
+the two are a **different-product** cross-check, not a fully *independent* one.
+
+---
+
 ## Files
 
 | File | What it is |
@@ -225,6 +306,8 @@ result low variance alone cannot manufacture.
 | `oni_ersst.sql` | **ERSST v5** recipe — ONI over the VirtualiZarr NetCDF reference |
 | `oni_all_seasons.sql` | **ERA5** recipe — ONI over ARCO-ERA5 on GCS (day-15 sampled) |
 | `oni_all_seasons_full.sql` | ERA5 recipe, full hourly variant |
+| `nino34_monthly_sst.sql` | Both sources joined → monthly Niño-3.4 box-mean SST (`time, sst_ersst, sst_era5`) to CSV |
+| `psd_compare.py` | Power-spectral-density comparison of the two SST series (orders the series, renders `nino34_psd.png`) |
 | `scripts/download_ersst.sh` | Fetch ERSST v5 NetCDF from NOAA (NCEI/PSL) |
 | `scripts/virtualize_ersst.py` | NetCDF → VirtualiZarr kerchunk-parquet reference |
 | `oni_compare.py` | Our values vs NOAA — regression + classification metrics, per-recipe CSV |
@@ -233,7 +316,8 @@ result low variance alone cannot manufacture.
 | `oni_noaa_reference.txt` | Vendored NOAA CPC reference (`oni.ascii.txt`, `SEAS YR TOTAL ANOM`) |
 | `oni_ersst_computed.txt`, `oni_ersst_comparison.csv` | ERSST output + comparison |
 | `oni_computed.txt`, `oni_comparison.csv` | ERA5 output + comparison |
-| `oni_timeseries.png`, `oni_residual.png`, `oni_scatter.png` | Generated figures |
+| `oni_timeseries.png`, `oni_residual.png`, `oni_scatter.png` | Generated ONI figures |
+| `nino34_monthly_sst.csv`, `nino34_psd.png` | Two-source monthly SST series + its PSD comparison |
 
 ---
 
@@ -257,7 +341,11 @@ imbalance. Report the **confusion matrix** + **macro-F1**; **do not** lead with 
   agreement is a method check, not an independent one; ERA5 is the independent product,
   and its ~0.1–0.2 °C difference vs ERSSTv5 is most of its error.
 - **ERA5 monthly proxy:** a single **noon-of-the-15th** sample per month, not a true
-  monthly mean — adds scatter. (ERSST is already a monthly mean.)
+  monthly mean — adds scatter. (ERSST is already a monthly mean.) The spectral check
+  above shows the added variance is a small, broadband high-frequency floor (2–8-month
+  periods) that leaves the ENSO band untouched — but that comparison is confounded with
+  the dataset difference; the controlled ERA5-vs-ERA5 test is deferred pending
+  distributed execution.
 - **ERA5 base-period truncation:** ARCO-ERA5's record starts in **1940**, so the
   earliest base period (1936–1965) is effectively 1940–1965. ERSST covers 1854, so it
   has no such truncation — one reason ERSST matches NOAA more tightly in the deep past.
@@ -266,6 +354,16 @@ imbalance. Report the **confusion matrix** + **macro-F1**; **do not** lead with 
 
 **Further improvement (ERA5):** sample the true monthly mean instead of noon-15th to
 shave the remaining scatter, especially in the noisier deep past.
+
+**Follow-up — the full run is blocked on distributed mode.** The controlled spectral
+test (ERA5 all-hours monthly mean vs ERA5 noon-15th, same dataset) — and the true
+monthly-mean ONI it would enable — both require averaging *every* hourly step per month,
+~720× the data the day-15/hour-12 pushdown fetches. That scan is too large to run
+single-node in reasonable time/cost, so it is **parked until distributed
+zarr-datafusion is executable**. Once distributed scan-partitioning + GCS fan-out land,
+the plan is: (1) run `oni_all_seasons_full.sql` for a true-monthly-mean ERA5 ONI, and
+(2) extend `nino34_monthly_sst.sql` / `psd_compare.py` with an ERA5 all-hours column so
+the PSD comparison isolates sampling from dataset.
 
 ---
 

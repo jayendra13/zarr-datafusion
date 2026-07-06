@@ -31,7 +31,8 @@ THRESHOLD = 0.5  # degC, El Niño / La Niña cutoff
 
 ERSST_C = "#2c8a4a"   # green
 ERA5_C = "#c0392b"    # red
-NOAA_C = "0.25"       # dark grey
+NOAA_C = "0.55"       # medium grey — drawn as a wide underlay so it stays
+                      # visible as its own series even where ERSST traces it exactly
 
 
 def load(path):
@@ -59,8 +60,9 @@ def plot_timeseries(era5, ersst, out):
 
     mae_ersst, _ = stats(ersst)
     mae_era5, _ = stats(era5)
-    ax.plot(era5["t"], era5["noaa"], color=NOAA_C, lw=1.6, label="NOAA CPC (ERSSTv5)", zorder=2)
-    ax.plot(ersst["t"], ersst["ours"], color=ERSST_C, lw=1.0, alpha=0.9,
+    ax.plot(era5["t"], era5["noaa"], color=NOAA_C, lw=3.5, alpha=0.9,
+            solid_capstyle="round", label="NOAA CPC reference (ERSSTv5)", zorder=2)
+    ax.plot(ersst["t"], ersst["ours"], color=ERSST_C, lw=1.1, alpha=0.95,
             label=f"zarr-datafusion · ERSST v5  (MAE {mae_ersst:.3f} — exact)", zorder=3)
     ax.plot(era5["t"], era5["ours"], color=ERA5_C, lw=1.0, alpha=0.75,
             label=f"zarr-datafusion · ERA5  (MAE {mae_era5:.2f} — independent)", zorder=1)
