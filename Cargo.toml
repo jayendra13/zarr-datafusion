@@ -3,7 +3,7 @@ name = "zarr-datafusion"
 version = "0.1.0"
 edition = "2021"
 license = "Apache-2.0"
-rust-version = "1.88"
+rust-version = "1.91"
 description = "Extending DataFusion to do SQL queries on Zarr data."
 repository = "https://github.com/jayendra13/zarr-datafusion"
 homepage = "https://github.com/jayendra13/zarr-datafusion"
@@ -22,6 +22,16 @@ futures = "0.3.31"
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 zarrs = { version = "0.22.10", features = ["ndarray", "async", "zlib"] }
 zarrs_object_store = { version = "0.6", features = ["gcp", "aws", "http"] }
+# Icechunk store support. Optional: only pulled in by the `icechunk` feature
+# (~56 transitive crates), so the default build stays lean. zarrs_icechunk
+# provides AsyncIcechunkStore, a zarrs storage backend (zarrs_storage 0.4 traits
+# — the same our zarrs 0.22 uses, so no zarrs bump is needed). icechunk itself is
+# a direct dep because we call its Repository / storage constructors. Lean
+# backend set: local fs (synthetic spike), GCS (the repo lives there), and S3
+# (virtual HDF5 chunks on noaa-oar-mlwp-data) — avoiding the heavy aws-sdk `s3`
+# and azure/http backends.
+icechunk = { version = "2.0.1", default-features = false, features = ["object-store-fs", "object-store-gcs", "object-store-s3"], optional = true }
+zarrs_icechunk = { version = "0.5", default-features = false, optional = true }
 parquet = { version = "58", default-features = false, features = ["arrow", "async"] }
 glob = "0.3"
 url = "2"
@@ -39,6 +49,29 @@ tonic = { version = "0.14", optional = true }
 [features]
 # Enables the datafusion-distributed worker/head binaries.
 distributed = ["dep:datafusion-distributed", "dep:tonic"]
+# Enables icechunk store support (reading icechunk repos, incl. virtual chunks
+# into archival NetCDF/HDF5). Pulls the icechunk + zarrs_icechunk crate trees.
+icechunk = ["dep:icechunk", "dep:zarrs_icechunk"]
+
+[[example]]
+name = "icechunk_m0_probe"
+path = "examples/icechunk_m0_probe.rs"
+required-features = ["icechunk"]
+
+[[example]]
+name = "icechunk_read"
+path = "examples/icechunk_read.rs"
+required-features = ["icechunk"]
+
+[[example]]
+name = "icechunk_read_virtual"
+path = "examples/icechunk_read_virtual.rs"
+required-features = ["icechunk"]
+
+[[example]]
+name = "icechunk_read_cira"
+path = "examples/icechunk_read_cira.rs"
+required-features = ["icechunk"]
 
 [[example]]
 name = "query_era5"
