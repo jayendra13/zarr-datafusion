@@ -146,6 +146,26 @@ Commit hashes point at the change that introduced or settled the decision.
   forced by reality — ERA5's 277 arrays were doing 277 sequential HTTP probes
   (~72s → ~4s).
 
+### 14b. Icechunk stores via upstream crates, reusing the async read path
+- **Feature:** optional `icechunk` (off by default; ~56 transitive crates).
+- **Decision:** Depend on upstream `icechunk` + `zarrs_icechunk`. Detect an
+  icechunk repo by its on-disk layout (`snapshots/` + `repo` marker), open it
+  read-only at `main`, and expose the resulting `AsyncIcechunkStore` as a
+  `zarrs` `AsyncReadableListableStorage` — the same trait our object-store
+  backends satisfy. It drops into `ZarrTable`'s `cached_remote` slot, so the
+  existing async schema-inference and read paths need no icechunk-specific code.
+- **Rationale:** icechunk resolves native + virtual (archival HDF5/NetCDF) chunks
+  and versioning internally; reimplementing that in-house (as we did for
+  VirtualiZarr) would be a large, redundant effort. Reusing the async store
+  interface kept the integration to one new module plus a factory branch.
+- **Trade-offs / current limits:** icechunk performs its own object I/O, so the
+  `AsyncTrackedStore` byte stats don't cover these reads (CLI shows 0 disk bytes).
+  Only local, flat-at-root repos are wired today; the scan stays single-partition
+  (the sync outer-selection resolver can't drive the cached async store yet).
+  Remote (anonymous GCS/S3, incl. the S3-anon container workaround), group
+  addressing (e.g. CIRA's `/FOUR_v200_GFS`), and partitioned icechunk scans are
+  follow-ups.
+
 ---
 
 ## Distributed execution

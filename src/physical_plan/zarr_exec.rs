@@ -294,7 +294,9 @@ impl ExecutionPlan for ZarrExec {
                 self.coord_filters.clone(),
                 batch_size,
             )
-        } else if is_remote_url(&self.path) {
+        } else if is_remote_url(&self.path) || self.cached_remote.is_some() {
+            // A cached async store on a non-remote path is an icechunk store
+            // (opened by the factory): read it through the same async path.
             info!("Using remote (async) execution path");
             execute_remote(
                 self.path.clone(),

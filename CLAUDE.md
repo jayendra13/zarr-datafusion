@@ -19,6 +19,27 @@ cargo run --example query_era5       # Run ERA5 climate data example
 cargo run --example query_gcs        # Run GCS remote read example
 ```
 
+### Icechunk stores (optional `icechunk` feature)
+
+Icechunk (versioned Zarr) support is behind the optional `icechunk` Cargo feature,
+so the default build stays lean. Build/run with the feature to read icechunk repos:
+
+```bash
+cargo build --features icechunk
+cargo test  --features icechunk --test integration_icechunk   # local icechunk query tests
+# Query a local icechunk store from the CLI (feature required):
+cargo run --features icechunk --bin zarr-cli -- \
+  -c "CREATE EXTERNAL TABLE syn STORED AS ZARR LOCATION 'data/synthetic.icechunk';
+      SELECT COUNT(*) FROM syn;"
+```
+
+Detection is automatic: `LOCATION` pointing at an icechunk repo (a dir with
+`snapshots/` + a `repo` marker) is opened read-only at its `main` branch tip and
+exposed as a zarrs async store, reusing the normal async schema-inference/read
+path. Only local, flat-at-root repos work today (see `docs/design-decisions.md`);
+remote (GCS/S3) and grouped repos are follow-ups. Icechunk does its own object
+I/O, so the CLI's "disk bytes" stat reads 0 for these queries.
+
 ## Architecture
 
 ```

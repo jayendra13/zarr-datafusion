@@ -158,6 +158,15 @@ impl ZarrTable {
             return Vec::new();
         }
 
+        // Guard 1b: an icechunk store is a cached async store on a non-remote
+        // path. Partitioning the outer axis here would take the sync
+        // `resolve_outer_selection` branch below (which reopens `self.path` as a
+        // plain local Zarr store) and fail. Keep icechunk single-partition until
+        // outer-selection resolution learns to use the cached async store.
+        if !is_remote_url(&self.path) && self.cached_remote.is_some() {
+            return Vec::new();
+        }
+
         // Guard 2: we need metadata and a data variable to size the outer axis.
         let Some(meta) = &self.store_meta else {
             return Vec::new();

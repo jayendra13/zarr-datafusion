@@ -877,22 +877,31 @@ pub async fn detect_zarr_version_async(
     use zarrs::storage::AsyncListableStorageTraits;
     use zarrs::storage::StorePrefix;
 
-    // Check for root zarr.json (V3)
-    let zarr_json_path = format!("{}/zarr.json", prefix);
-    if store_key_exists(store, &zarr_json_path).await {
+    // Check for root zarr.json (V3). Store keys must be relative, so at the root
+    // (empty) prefix the key is `zarr.json`, not `/zarr.json`.
+    let root = prefix.as_ref().trim_end_matches('/');
+    let join = |name: &str| {
+        if root.is_empty() {
+            name.to_string()
+        } else {
+            format!("{root}/{name}")
+        }
+    };
+    if store_key_exists(store, &join("zarr.json")).await {
         return Ok(ZarrVersion::V3);
     }
 
     // Check for root .zgroup (V2)
-    let zgroup_path = format!("{}/.zgroup", prefix);
-    if store_key_exists(store, &zgroup_path).await {
+    if store_key_exists(store, &join(".zgroup")).await {
         return Ok(ZarrVersion::V2);
     }
 
     // List directories and check first one for version detection
-    // StorePrefix requires trailing slash
+    // StorePrefix requires a trailing slash, EXCEPT the root prefix which is the
+    // empty string (zarrs rejects a leading '/'). The root case is hit by stores
+    // whose arrays live at the top level, e.g. an icechunk repo.
     let prefix_str = if prefix.as_ref().is_empty() {
-        "/".to_string()
+        String::new()
     } else {
         format!("{}/", prefix.as_ref().trim_end_matches('/'))
     };
@@ -1053,9 +1062,11 @@ async fn discover_arrays_v2_async(
 
     let mut arrays: Vec<ZarrArrayMeta> = Vec::new();
 
-    // StorePrefix requires trailing slash
+    // StorePrefix requires a trailing slash, EXCEPT the root prefix which is the
+    // empty string (zarrs rejects a leading '/'). The root case is hit by stores
+    // whose arrays live at the top level, e.g. an icechunk repo.
     let prefix_str = if prefix.as_ref().is_empty() {
-        "/".to_string()
+        String::new()
     } else {
         format!("{}/", prefix.as_ref().trim_end_matches('/'))
     };
@@ -1137,9 +1148,11 @@ async fn discover_arrays_v3_async(
     use futures::future::join_all;
     use zarrs::storage::{AsyncListableStorageTraits, StorePrefix};
 
-    // StorePrefix requires trailing slash
+    // StorePrefix requires a trailing slash, EXCEPT the root prefix which is the
+    // empty string (zarrs rejects a leading '/'). The root case is hit by stores
+    // whose arrays live at the top level, e.g. an icechunk repo.
     let prefix_str = if prefix.as_ref().is_empty() {
-        "/".to_string()
+        String::new()
     } else {
         format!("{}/", prefix.as_ref().trim_end_matches('/'))
     };
