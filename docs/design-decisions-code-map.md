@@ -572,4 +572,3 @@ register_metric_udfs(&ctx);      // rmse / mae / ...
   (`split_selection`, `split_indices`) with `reader/zarr_reader.rs`
   (`resolve_outer_selection`, `bucket_outer_indices`).
 - **See the wiring:** `src/bin/zarr_cli/main.rs` (snippet above).
-</content>

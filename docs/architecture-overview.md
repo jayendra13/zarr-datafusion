@@ -217,4 +217,3 @@ udtf / udfs ──▶ reader (schema meta) ; registered by the CLI
 - **`optimizer`** — short-circuits `COUNT`/`MIN`/`MAX` and pushes `LIMIT` into the scan.
 - **`udtf` / `udfs`** — `zarr_describe()` and metric functions (`rmse`, `mae`).
 - **`distributed`** — ships `ZarrExec` to worker nodes over Arrow Flight.
-</content>
