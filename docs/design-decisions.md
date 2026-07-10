@@ -242,6 +242,22 @@ Commit hashes point at the change that introduced or settled the decision.
   inner axis keeps its `CoordFilters`-derived selection instead. Verified
   value-transparent end-to-end (a fanned-out aggregate equals the single-partition
   one) — `integration_multiaxis.rs`.
+- **Follow-ups (not yet done):**
+  - *H2 — split filtered inner axes.* Today a filtered inner axis is skipped. To
+    include it, generalize `resolve_outer_selection[_async]` to resolve any
+    coordinate's survivors, resolve the filtered inner candidates at plan time, and
+    split the *surviving* set (via `split_selection`, which already handles scattered
+    `Indices`) rather than the full extent — ranking axes by *surviving* chunk count.
+    Adds bounded plan-time coordinate reads (only when a multi-chunk inner axis is
+    filtered). Verify the reader's data path handles an `Indices` selection sitting in
+    `extra` on a non-outer axis.
+  - *H3 — distributed box execution (deferred).* The codec already round-trips
+    `PartitionSpec.extra` (unit-tested) and a worker's `execute()` path is identical to
+    local, so N-D boxes *should* run across `head`/`worker` unchanged — but this is not
+    yet exercised end-to-end. Add a `distributed`-gated test that plans a fanned query,
+    ships box specs to workers, and asserts value-transparency vs. single-node; audit
+    `distribute_specs_across_tasks`/`TaskEstimator` for any outer-only assumptions and
+    that the box-aware `PartitionSpec::is_empty()` packs/pads correctly.
 
 ---
 
