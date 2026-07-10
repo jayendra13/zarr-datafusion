@@ -450,6 +450,10 @@ src/
   behind the query engine, ADR-style, with rationale and trade-offs.
 - **[Design decisions — code map](docs/design-decisions-code-map.md)** — maps each
   decision to the files, traits, and functions that implement it.
+- **[Exact-cardinality optimization](docs/exact-cardinality-optimizer.md)** —
+  research direction: from the single-batch OOM and its streaming fix to a
+  structural cost model that *computes* cardinality exactly (and the polyhedral
+  connection), since gridded data has a known regular shape.
 
 ## Dependencies
 
@@ -498,6 +502,7 @@ src/
 
 ### Performance
 - [x] Chunk-level parallelism (partitioned scan, chunks read concurrently)
+- [x] Multi-axis partition fan-out (split inner axes when the outer axis is coarse)
 - [ ] Streaming RecordBatch output (multiple batches instead of one)
 - [ ] Zero-copy reads with memory-mapped I/O
 - [ ] Statistics-based chunk pruning (data-variable min/max)

@@ -11,8 +11,8 @@ use zarrs_object_store::object_store::path::Path as ObjectPath;
 
 use crate::physical_plan::partition::{plan_partitions, split_selection, PartitionSpec};
 use crate::physical_plan::zarr_exec::ZarrExec;
-use crate::reader::filter::{is_date_part_filter, parse_coord_filters, CoordFilters};
-use crate::reader::schema_inference::ZarrStoreMeta;
+use crate::reader::filter::{is_date_part_filter, parse_coord_filters, CoordFilters, CoordSelection};
+use crate::reader::schema_inference::{ZarrArrayMeta, ZarrStoreMeta};
 use crate::reader::storage::is_remote_url;
 use crate::reader::virtual_store::{is_virtualizarr_store, VirtualStoreAdapter};
 use crate::reader::zarr_reader::{
@@ -242,14 +242,12 @@ impl ZarrTable {
             resolve_outer_selection(&self.path, meta, coord_filters)
         };
 
-        match outer {
+        let outer_specs = match outer {
             // Partition the SURVIVING set so a narrow filter still fans out.
-            Ok(OuterSelection::Resolved(sel)) => {
-                split_selection(&sel, chunk_len, target_partitions)
-                    .into_iter()
-                    .map(|outer| PartitionSpec { outer })
-                    .collect()
-            }
+            Ok(OuterSelection::Resolved(sel)) => split_selection(&sel, chunk_len, target_partitions)
+                .into_iter()
+                .map(PartitionSpec::from_outer)
+                .collect(),
             // A present outer filter matched nothing: one empty partition.
             Ok(OuterSelection::Empty) => vec![PartitionSpec::range(0, 0)],
             // No outer filter: split the full axis geometrically (no coord read).
@@ -262,8 +260,104 @@ impl ZarrTable {
                 debug!(error = %e, "outer-selection resolution failed; using geometry partitioning");
                 plan_partitions(outer_len, chunk_len, target_partitions)
             }
+        };
+
+        // Multi-axis fan-out: if the outer axis alone under-parallelizes (fewer
+        // partitions than `target`), split the best *inner* axis too so a scan
+        // whose outer axis is coarsely chunked still uses the whole machine.
+        fan_out_inner(outer_specs, meta, data_var, coord_filters, target_partitions)
+    }
+}
+
+/// Map data-variable axis `axis` to its coordinate index in `meta.coords`, using
+/// the variable's `dimension_names`. Returns `None` when names are unavailable —
+/// inner fan-out then declines (a size-match fallback would be ambiguous when two
+/// axes share a length).
+fn coord_index_for_axis(
+    data_var: &ZarrArrayMeta,
+    axis: usize,
+    meta: &ZarrStoreMeta,
+) -> Option<usize> {
+    let name = data_var.dimensions.as_ref()?.get(axis)?;
+    meta.coords.iter().position(|c| &c.name == name)
+}
+
+/// Fan a scan out across an inner axis when the outer axis alone yields fewer
+/// partitions than `target`.
+///
+/// `outer_specs` are the outer-only partitions already planned. If they under-fill
+/// the parallelism target and an *unfiltered*, multiply-chunked inner axis exists,
+/// this splits that axis geometrically and returns the Cartesian product
+/// (`outer × inner`) as box partitions — never exceeding `target`, never splitting
+/// a chunk across partitions. Metadata-only: no coordinate reads. Declines (returns
+/// `outer_specs` unchanged) for a limited/empty plan, when already at target, when
+/// dimension names are missing, or when no inner axis offers extra parallelism.
+fn fan_out_inner(
+    outer_specs: Vec<PartitionSpec>,
+    meta: &ZarrStoreMeta,
+    data_var: &ZarrArrayMeta,
+    coord_filters: Option<&CoordFilters>,
+    target: usize,
+) -> Vec<PartitionSpec> {
+    let p_outer = outer_specs.len();
+    // Already at/over target, or a single empty partition (outer filter matched
+    // nothing) — nothing to gain from inner splitting.
+    if p_outer >= target || (p_outer == 1 && outer_specs[0].is_empty()) {
+        return outer_specs;
+    }
+    let inner_budget = target / p_outer;
+    if inner_budget <= 1 {
+        return outer_specs;
+    }
+
+    // Choose the inner axis (any axis but 0) that is unfiltered and offers the most
+    // chunk-level parallelism (>1 chunk). Skip filtered axes: their surviving set
+    // isn't resolved here, and `extra` would overwrite the filter selection.
+    let mut best: Option<(usize, usize, u64, u64)> = None; // (coord_idx, n_chunks, extent, chunk_len)
+    for axis in 1..data_var.shape.len() {
+        let Some(coord_idx) = coord_index_for_axis(data_var, axis, meta) else {
+            continue;
+        };
+        let coord_name = &meta.coords[coord_idx].name;
+        if coord_filters.is_some_and(|f| f.get(coord_name).is_some()) {
+            continue;
+        }
+        let extent = data_var.shape[axis];
+        let chunk_len = data_var
+            .chunks
+            .as_ref()
+            .and_then(|c| c.get(axis).copied())
+            .unwrap_or(extent)
+            .max(1);
+        let n_chunks = extent.div_ceil(chunk_len) as usize;
+        if n_chunks > 1 && best.is_none_or(|(_, best_n, _, _)| n_chunks > best_n) {
+            best = Some((coord_idx, n_chunks, extent, chunk_len));
         }
     }
+    let Some((inner_coord_idx, _, extent, chunk_len)) = best else {
+        return outer_specs;
+    };
+
+    // Geometry-split the inner axis into <= inner_budget chunk-aligned pieces.
+    let inner_pieces: Vec<CoordSelection> = plan_partitions(extent, chunk_len, inner_budget)
+        .into_iter()
+        .map(|p| p.outer)
+        .collect();
+    if inner_pieces.len() <= 1 {
+        return outer_specs;
+    }
+
+    // Cartesian product: each outer slice × each inner piece becomes a box.
+    let mut boxes = Vec::with_capacity(p_outer * inner_pieces.len());
+    for outer in &outer_specs {
+        for inner in &inner_pieces {
+            boxes.push(
+                PartitionSpec::from_outer(outer.outer.clone())
+                    .with_extra(vec![(inner_coord_idx, inner.clone())]),
+            );
+        }
+    }
+    boxes
 }
 
 #[async_trait]
@@ -501,5 +595,154 @@ fn scalar_values_from_f64(
             ScalarValue::Float64(Some(min)),
             ScalarValue::Float64(Some(max)),
         ),
+    }
+}
+
+#[cfg(test)]
+mod fanout_tests {
+    use super::*;
+    use crate::reader::filter::CoordSelection;
+
+    fn coord(name: &str, size: u64) -> ZarrArrayMeta {
+        ZarrArrayMeta {
+            name: name.into(),
+            data_type: "int64".into(),
+            shape: vec![size],
+            chunks: Some(vec![size]),
+            coord_min_max: None,
+            cf_time_attrs: None,
+            dimensions: Some(vec![name.into()]),
+        }
+    }
+
+    fn data_var(dims: &[&str], shape: &[u64], chunks: &[u64]) -> ZarrArrayMeta {
+        ZarrArrayMeta {
+            name: "t".into(),
+            data_type: "float32".into(),
+            shape: shape.to_vec(),
+            chunks: Some(chunks.to_vec()),
+            coord_min_max: None,
+            cf_time_attrs: None,
+            dimensions: Some(dims.iter().map(|s| s.to_string()).collect()),
+        }
+    }
+
+    fn meta(coords: Vec<ZarrArrayMeta>, dv: &ZarrArrayMeta) -> ZarrStoreMeta {
+        ZarrStoreMeta {
+            total_rows: 0,
+            coords,
+            data_vars: vec![dv.clone()],
+        }
+    }
+
+    /// Three outer (time) partitions, as the outer split would produce.
+    fn outer3() -> Vec<PartitionSpec> {
+        vec![
+            PartitionSpec::range(0, 1),
+            PartitionSpec::range(1, 2),
+            PartitionSpec::range(2, 3),
+        ]
+    }
+
+    #[test]
+    fn fans_out_across_best_inner_axis() {
+        // temperature[time=3, lat=721, lon=1440], lat has 4 chunks, lon 2.
+        let dv = data_var(&["time", "lat", "lon"], &[3, 721, 1440], &[1, 181, 720]);
+        let m = meta(vec![coord("time", 3), coord("lat", 721), coord("lon", 1440)], &dv);
+        // target 8, p_outer 3 => inner_budget 2 => split lat (4 chunks) into 2.
+        let out = fan_out_inner(outer3(), &m, &dv, None, 8);
+        assert_eq!(out.len(), 6, "3 outer × 2 inner");
+        // Every box restricts lat (coord index 1) and preserves its outer slice.
+        for b in &out {
+            assert_eq!(b.extra.len(), 1);
+            assert_eq!(b.extra[0].0, 1, "inner axis is lat (coord idx 1)");
+        }
+        // Union of inner pieces covers [0, 721).
+        let lat_ranges: Vec<_> = out[..2]
+            .iter()
+            .map(|b| b.extra[0].1.as_range().unwrap())
+            .collect();
+        assert_eq!(lat_ranges[0].0, 0);
+        assert_eq!(lat_ranges.last().unwrap().1, 721);
+    }
+
+    #[test]
+    fn never_exceeds_target() {
+        let dv = data_var(&["time", "lat", "lon"], &[3, 721, 1440], &[1, 181, 720]);
+        let m = meta(vec![coord("time", 3), coord("lat", 721), coord("lon", 1440)], &dv);
+        for target in 4..=32 {
+            let out = fan_out_inner(outer3(), &m, &dv, None, target);
+            assert!(out.len() <= target, "target {target} => {} boxes", out.len());
+        }
+    }
+
+    #[test]
+    fn declines_when_outer_already_at_target() {
+        let dv = data_var(&["time", "lat", "lon"], &[3, 721, 1440], &[1, 181, 720]);
+        let m = meta(vec![coord("time", 3), coord("lat", 721), coord("lon", 1440)], &dv);
+        // target 3 == p_outer 3 => no fan-out.
+        let out = fan_out_inner(outer3(), &m, &dv, None, 3);
+        assert_eq!(out.len(), 3);
+        assert!(out.iter().all(|b| b.extra.is_empty()));
+    }
+
+    #[test]
+    fn declines_when_inner_axes_single_chunked() {
+        // Inner lat/lon each one chunk (like synthetic) => nothing to split.
+        let dv = data_var(&["time", "lat", "lon"], &[3, 10, 10], &[1, 10, 10]);
+        let m = meta(vec![coord("time", 3), coord("lat", 10), coord("lon", 10)], &dv);
+        let out = fan_out_inner(outer3(), &m, &dv, None, 16);
+        assert_eq!(out.len(), 3);
+        assert!(out.iter().all(|b| b.extra.is_empty()));
+    }
+
+    #[test]
+    fn single_outer_chunk_parallelizes_on_inner() {
+        // The headline case: outer axis is one chunk -> without fan-out this is a
+        // single partition; with it, we split the multi-chunk inner axis.
+        let dv = data_var(&["time", "lat", "lon"], &[1, 721, 1440], &[1, 181, 720]);
+        let m = meta(vec![coord("time", 1), coord("lat", 721), coord("lon", 1440)], &dv);
+        let outer1 = vec![PartitionSpec::range(0, 1)];
+        let out = fan_out_inner(outer1, &m, &dv, None, 8);
+        assert_eq!(out.len(), 4, "1 outer × 4 lat chunks (budget 8 caps at chunks)");
+    }
+
+    #[test]
+    fn declines_for_empty_partition() {
+        let dv = data_var(&["time", "lat", "lon"], &[3, 721, 1440], &[1, 181, 720]);
+        let m = meta(vec![coord("time", 3), coord("lat", 721), coord("lon", 1440)], &dv);
+        let empty = vec![PartitionSpec::range(0, 0)];
+        let out = fan_out_inner(empty, &m, &dv, None, 8);
+        assert_eq!(out.len(), 1);
+        assert!(out[0].is_empty());
+    }
+
+    #[test]
+    fn declines_without_dimension_names() {
+        // No dimension_names => can't map axes unambiguously => no fan-out.
+        let mut dv = data_var(&["time", "lat", "lon"], &[3, 721, 1440], &[1, 181, 720]);
+        dv.dimensions = None;
+        let m = meta(vec![coord("time", 3), coord("lat", 721), coord("lon", 1440)], &dv);
+        let out = fan_out_inner(outer3(), &m, &dv, None, 8);
+        assert_eq!(out.len(), 3);
+        assert!(out.iter().all(|b| b.extra.is_empty()));
+    }
+
+    #[test]
+    fn skips_filtered_inner_axis() {
+        // lat (best, 4 chunks) is filtered => fall back to lon (2 chunks).
+        let dv = data_var(&["time", "lat", "lon"], &[3, 721, 1440], &[1, 181, 720]);
+        let m = meta(vec![coord("time", 3), coord("lat", 721), coord("lon", 1440)], &dv);
+        let mut filters = CoordFilters::default();
+        filters
+            .filters
+            .insert("lat".into(), vec![crate::reader::filter::CoordFilterKind::Eq(
+                datafusion::scalar::ScalarValue::Float64(Some(1.0)),
+            )]);
+        let out = fan_out_inner(outer3(), &m, &dv, Some(&filters), 8);
+        // lon has 2 chunks, budget 2 => split lon into 2 => 3×2 = 6 boxes on lon (idx 2).
+        assert_eq!(out.len(), 6);
+        assert!(out.iter().all(|b| b.extra[0].0 == 2), "fell back to lon (idx 2)");
+        let _ = CoordSelection::Range(0, 0); // keep import used
     }
 }

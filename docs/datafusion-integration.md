@@ -83,21 +83,38 @@ we own one leaf and a few pruning shears.**
 
 ### Owned by zarr-datafusion (the genuinely new logic)
 
-- **The leaf** — everything in `reader/`: Zarr decoding, the nD→2D flattening
-  model, CF-time, dtype mapping, dictionary coordinate encoding. DataFusion has no
-  concept of Zarr; this is 100% ours.
+Everything we own is plugged into DataFusion through one of its extension traits —
+that *is* the ownership boundary. Each owned type below is annotated with the
+DataFusion seam it implements (full list in the table up top):
+
+- **The data-source seam** — `ZarrTable` *implements* `TableProvider`,
+  constructed by `ZarrTableFactory` *implementing* `TableProviderFactory`. This is
+  how a Zarr store enters DataFusion as a SQL table.
+- **The execution seam** — `ZarrExec` *implements* `ExecutionPlan`: the leaf node
+  DataFusion executes, advertising `PlanProperties` and returning our stream from
+  `execute(partition)`.
+- **The leaf logic** — everything in `reader/`: Zarr decoding, the nD→2D flattening
+  model, CF-time, dtype mapping, dictionary coordinate encoding. Reached *through*
+  `ZarrExec` via `read_zarr` / `read_zarr_async`, but implements no DataFusion
+  trait itself — DataFusion has no concept of Zarr; this is 100% ours.
 - **Our own filter IR** — `CoordFilters` / `CoordFilterKind` / `CoordSelection`.
-  We *read* DataFusion's `Expr` but translate it into our own structures and
-  resolve them to array positions (`resolve_coord_selection`, set intersection).
-- **Domain-aware optimizations DataFusion can't make** — the statistics
-  constant-folding rules, and especially `ZarrLimitPushdownRule`: pushing `LIMIT`
-  *past* a filter, which the generic planner refuses (unsound in general) but which
-  is provably safe here.
+  We *read* DataFusion's `Expr` (and answer `TableProviderFilterPushDown` in
+  `supports_filters_pushdown`) but translate it into our own structures and resolve
+  them to array positions (`resolve_coord_selection`, set intersection).
+- **Domain-aware optimizations DataFusion can't make** — `ZarrLimitPushdownRule`
+  *implements* `PhysicalOptimizerRule` (pushing `LIMIT` *past* a filter, which the
+  generic planner refuses but which is provably safe here); `CountStatisticsRule` /
+  `MinMaxStatisticsRule` *implement* the logical `OptimizerRule` (constant-folding
+  aggregates from `ZarrStoreMeta`).
 - **Partitioning strategy** — `PartitionSpec`, `split_selection` / `split_indices`:
-  chunk-aware slicing of a scan.
+  chunk-aware slicing of a scan, surfaced through `ZarrExec`'s `Partitioning`.
+- **Distributed wiring** — `ZarrTaskEstimator` / `StaticWorkerResolver` *implement*
+  datafusion-distributed's `TaskEstimator` / `WorkerResolver`; `ZarrPhysicalCodec`
+  *implements* `PhysicalExtensionCodec` to serialize our `ZarrExec`.
+- **Functions** — `zarr_describe()` *implements* `TableFunctionImpl` (UDTF);
+  `rmse` / `mae` *implement* `ScalarUDF` / `AggregateUDF`.
 - **Observability** — `ZarrIoStats` + `TrackedStore` (compressed-vs-uncompressed
-  byte accounting).
-- **Serialization of our node** — `ZarrPhysicalCodec`.
+  byte accounting); pure internal logic, no DataFusion trait.
 
 ---
 
@@ -133,4 +150,3 @@ We are a **data source plus a small bundle of domain-specific optimizer rules**.
 We own the leaf of the plan (reading and flattening Zarr) and a few rewrites that
 exploit scientific-data invariants; DataFusion owns the entire query engine above
 the scan.
-</content>

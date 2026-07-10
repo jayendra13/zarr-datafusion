@@ -23,6 +23,7 @@ pub type CachedRemoteStore = Option<(AsyncReadableListableStorage, ObjectPath, Z
 /// Cached VirtualiZarr adapter (pre-loaded refs and metadata)
 pub type CachedVirtualiZarrAdapter = Option<Arc<VirtualStoreAdapter>>;
 
+#[derive(Clone)]
 pub struct ZarrExec {
     schema: SchemaRef,
     path: String,
@@ -41,6 +42,11 @@ pub struct ZarrExec {
     /// every existing `ZarrExec::new` caller (codec, tests) working unchanged.
     /// Populated by `with_partitions` from the planner in `ZarrTable::scan`.
     partitions: Vec<PartitionSpec>,
+    /// Memory budget in bytes, set by the cardinality optimizer rule (Phase 5).
+    /// `None` => the reader falls back to `ZARR_MEM_BUDGET_BYTES`, then `batch_size`
+    /// — i.e. unchanged from Phase 4. The reader converts bytes -> row target via
+    /// its own projected `row_width`.
+    stream_budget_bytes: Option<u64>,
 }
 
 impl std::fmt::Debug for ZarrExec {
@@ -116,6 +122,7 @@ impl ZarrExec {
             coord_filters,
             cached_virtualizarr,
             partitions: Vec::new(),
+            stream_budget_bytes: None,
         }
     }
 
@@ -195,6 +202,18 @@ impl ZarrExec {
         self.coord_filters.as_ref()
     }
 
+    /// Set the streaming memory budget in bytes (from the cardinality optimizer
+    /// rule). Builder idiom: `ZarrExec::new(..).with_stream_budget_bytes(Some(b))`.
+    pub fn with_stream_budget_bytes(mut self, bytes: Option<u64>) -> Self {
+        self.stream_budget_bytes = bytes;
+        self
+    }
+
+    /// The rule-set streaming memory budget in bytes, if any.
+    pub fn stream_budget_bytes(&self) -> Option<u64> {
+        self.stream_budget_bytes
+    }
+
     /// Get this scan's partition slices (empty == single unpartitioned read).
     /// Used by the distributed codec (to ship them) and the `TaskEstimator`
     /// (to split them across worker tasks).
@@ -217,6 +236,7 @@ impl ZarrExec {
         // keeps the same output partitioning. `.clone()` because `self` is
         // borrowed (`&self`) and we can't move the Vec out of it.
         .with_partitions(self.partitions.clone())
+        .with_stream_budget_bytes(self.stream_budget_bytes)
     }
 }
 impl ExecutionPlan for ZarrExec {
@@ -256,6 +276,13 @@ impl ExecutionPlan for ZarrExec {
         } else {
             Some(self.partitions[partition].outer.clone())
         };
+        // Inner-axis restrictions for a multi-axis (N-D box) partition; empty for
+        // an outer-only partition (single-axis, the common case).
+        let partition_extra: Vec<(usize, CoordSelection)> = if self.partitions.is_empty() {
+            Vec::new()
+        } else {
+            self.partitions[partition].extra.clone()
+        };
 
         info!(
             path = %self.path,
@@ -280,6 +307,7 @@ impl ExecutionPlan for ZarrExec {
                 self.io_stats.clone(),
                 self.coord_filters.clone(),
                 batch_size,
+                self.stream_budget_bytes,
             );
         }
 
@@ -293,6 +321,7 @@ impl ExecutionPlan for ZarrExec {
                 self.io_stats.clone(),
                 self.coord_filters.clone(),
                 batch_size,
+                self.stream_budget_bytes,
             )
         } else if is_remote_url(&self.path) || self.cached_remote.is_some() {
             // A cached async store on a non-remote path is an icechunk store
@@ -307,7 +336,9 @@ impl ExecutionPlan for ZarrExec {
                 self.cached_remote.clone(),
                 self.coord_filters.clone(),
                 partition_selection,
+                partition_extra,
                 batch_size,
+                self.stream_budget_bytes,
             )
         } else {
             info!("Using local (sync) execution path");
@@ -319,7 +350,9 @@ impl ExecutionPlan for ZarrExec {
                 Some(self.io_stats.clone()),
                 self.coord_filters.clone(),
                 partition_selection,
+                partition_extra,
                 batch_size,
+                self.stream_budget_bytes,
             )
         }
     }
@@ -356,8 +389,13 @@ struct AsyncReadParams {
     coord_filters: Option<CoordFilters>,
     /// Outer-axis selection for this partition; `None` => whole store.
     partition_selection: Option<CoordSelection>,
+    /// Inner-axis `(coord index, selection)` restrictions for a multi-axis (N-D
+    /// box) partition; empty for an outer-only partition.
+    partition_extra: Vec<(usize, CoordSelection)>,
     /// Target rows per emitted RecordBatch (DataFusion's batch_size).
     batch_size: usize,
+    /// Rule-set streaming row target (Phase 5); `None` => env/batch_size fallback.
+    stream_budget_bytes: Option<u64>,
 }
 
 /// Execute an async read with the given store setup function.
@@ -404,7 +442,9 @@ where
             cached_meta,
             params.coord_filters,
             params.partition_selection,
+            params.partition_extra,
             params.batch_size,
+            params.stream_budget_bytes,
         )
         .await?;
 
@@ -432,7 +472,9 @@ fn execute_remote(
     cached_remote: CachedRemoteStore,
     coord_filters: Option<CoordFilters>,
     partition_selection: Option<CoordSelection>,
+    partition_extra: Vec<(usize, CoordSelection)>,
     batch_size: usize,
+    stream_budget_bytes: Option<u64>,
 ) -> datafusion::error::Result<datafusion::execution::SendableRecordBatchStream> {
     use crate::reader::storage::create_async_store;
 
@@ -445,7 +487,9 @@ fn execute_remote(
         stats,
         coord_filters,
         partition_selection,
+        partition_extra,
         batch_size,
+        stream_budget_bytes,
     };
 
     execute_async_read(
@@ -468,6 +512,7 @@ fn execute_remote(
 }
 
 /// Execute read from VirtualiZarr Parquet reference store
+#[allow(clippy::too_many_arguments)]
 fn execute_virtualizarr(
     path: String,
     schema: SchemaRef,
@@ -476,6 +521,7 @@ fn execute_virtualizarr(
     stats: SharedIoStats,
     coord_filters: Option<CoordFilters>,
     batch_size: usize,
+    stream_budget_bytes: Option<u64>,
 ) -> datafusion::error::Result<datafusion::execution::SendableRecordBatchStream> {
     use crate::reader::schema_inference::discover_arrays;
 
@@ -492,7 +538,9 @@ fn execute_virtualizarr(
         coord_filters,
         // VirtualiZarr stays single-partition for now (scan() doesn't partition it).
         partition_selection: None,
+        partition_extra: Vec::new(),
         batch_size,
+        stream_budget_bytes,
     };
 
     execute_async_read(
@@ -509,6 +557,7 @@ fn execute_virtualizarr(
 }
 
 /// Execute read from a cached VirtualiZarr adapter (for remote VirtualiZarr stores)
+#[allow(clippy::too_many_arguments)]
 fn execute_virtualizarr_with_adapter(
     adapter: Arc<VirtualStoreAdapter>,
     schema: SchemaRef,
@@ -517,6 +566,7 @@ fn execute_virtualizarr_with_adapter(
     stats: SharedIoStats,
     coord_filters: Option<CoordFilters>,
     batch_size: usize,
+    stream_budget_bytes: Option<u64>,
 ) -> datafusion::error::Result<datafusion::execution::SendableRecordBatchStream> {
     debug!("Setting up remote VirtualiZarr execution with cached adapter");
 
@@ -527,7 +577,9 @@ fn execute_virtualizarr_with_adapter(
         stats,
         coord_filters,
         partition_selection: None,
+        partition_extra: Vec::new(),
         batch_size,
+        stream_budget_bytes,
     };
 
     execute_async_read(

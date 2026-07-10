@@ -24,7 +24,6 @@ use zarr_datafusion::optimizer::ZarrLimitPushdownRule;
 // The scan also splits into several partitions along the same (time) axis;
 // windowing subdivides each partition further, so the batch *count* depends on
 // the partition layout — tests assert on rows/contents, not raw batch counts.
-const INNER_ROWS: usize = 100;
 const TOTAL_ROWS: usize = 700;
 
 /// SessionContext whose scans emit at most `batch_size` rows per window.
@@ -140,16 +139,32 @@ async fn streaming_projection_is_transparent() {
 }
 
 #[tokio::test]
-async fn streaming_indivisible_plane_still_streams() {
-    // batch_size (32) < inner_rows (100): each window is a single outer (time) step
-    // = one lat*lon plane = 100 rows, so every batch necessarily exceeds batch_size
-    // — the Block 0 granularity bound. Still streams, still transparent.
+async fn streaming_tiles_inner_plane_to_batch_size() {
+    // batch_size (32) < inner_rows (100). The old outer-only path could not tile
+    // below one lat*lon plane (100 rows), so every batch exceeded batch_size — the
+    // Gap-1 floor. Phase 4 tiles an *inner* axis so each batch fits the target.
+    //
+    // Still transparent: order is preserved because plan_streaming single-steps
+    // every axis outside the pivot and keeps inner axes whole, so the plane is
+    // split into contiguous, in-order strips (assert_streams_transparently compares
+    // rendered rows in order).
     let batches = assert_streams_transparently(SYNTHETIC_V3, "SELECT * FROM data", 32).await;
     assert_eq!(total_rows(&batches), TOTAL_ROWS);
-    // Each plane (100 rows) exceeds batch_size (32): the indivisible-plane bound.
+    // Gap-1 fixed: every batch now fits batch_size instead of a 100-row plane.
     for b in &batches {
-        assert_eq!(b.num_rows(), INNER_ROWS, "one indivisible plane per window");
+        assert!(
+            b.num_rows() <= 32,
+            "Phase 4 should tile the inner plane to <= batch_size, got {}",
+            b.num_rows()
+        );
     }
+    // Tiling really happened: more batches than the 7 outer (time) steps that the
+    // outer-only path would have produced.
+    assert!(
+        batches.len() > 7,
+        "expected inner-axis tiling, got {} batches",
+        batches.len()
+    );
 }
 
 #[tokio::test]

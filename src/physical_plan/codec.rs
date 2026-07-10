@@ -531,12 +531,8 @@ mod tests {
 
         let schema = sample_schema();
         let specs = vec![
-            PartitionSpec {
-                outer: CoordSelection::Indices(vec![3, 17, 41]),
-            },
-            PartitionSpec {
-                outer: CoordSelection::Indices(vec![58, 90]),
-            },
+            PartitionSpec::from_outer(CoordSelection::Indices(vec![3, 17, 41])),
+            PartitionSpec::from_outer(CoordSelection::Indices(vec![58, 90])),
         ];
         let exec = ZarrExec::new(
             schema,

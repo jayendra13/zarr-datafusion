@@ -653,26 +653,53 @@ fn restrict_to_partition(
 fn apply_partition_selection(
     coord_ranges: Option<Vec<CoordSelection>>,
     partition_selection: Option<CoordSelection>,
+    partition_extra: &[(usize, CoordSelection)],
     store_meta: &super::schema_inference::ZarrStoreMeta,
     coord_sizes: &[usize],
 ) -> Option<Vec<CoordSelection>> {
-    let Some(sel) = partition_selection else {
-        return coord_ranges;
-    };
-    let outer_axis_len = store_meta
-        .data_vars
-        .first()
-        .and_then(|dv| dv.shape.first())
-        .copied();
-    let outer_coord_idx =
-        outer_axis_len.and_then(|len| coord_sizes.iter().position(|&s| s as u64 == len));
-    match outer_coord_idx {
-        Some(idx) => restrict_to_partition(coord_ranges, idx, &sel, coord_sizes),
-        // Can't identify the outer coordinate => can't safely slice. scan() only
-        // partitions when the dim is known, so this shouldn't happen; stay
-        // defensive and fall back to no slicing.
+    // Step 1: apply the outer-axis selection (the axis-0 coordinate, identified by
+    // size-match) — unchanged single-axis behavior, keeps the outer window read.
+    let after_outer = match partition_selection {
+        Some(sel) => {
+            let outer_axis_len = store_meta
+                .data_vars
+                .first()
+                .and_then(|dv| dv.shape.first())
+                .copied();
+            let outer_coord_idx =
+                outer_axis_len.and_then(|len| coord_sizes.iter().position(|&s| s as u64 == len));
+            match outer_coord_idx {
+                Some(idx) => restrict_to_partition(coord_ranges, idx, &sel, coord_sizes),
+                // Can't identify the outer coordinate => can't safely slice. scan()
+                // only partitions when the dim is known, so this shouldn't happen;
+                // stay defensive and fall back to no slicing.
+                None => coord_ranges,
+            }
+        }
         None => coord_ranges,
+    };
+
+    // Step 2: apply any inner-axis (multi-axis box) restrictions. Each is a
+    // chunk-aligned slice of the *surviving* set on that coordinate (the planner
+    // splits the resolved selection), so — like the outer axis — it is the
+    // authoritative subset for this partition and REPLACES that coord's selection.
+    // Inner coords are read in full (no window optimization), so the replacement
+    // is applied directly to the per-coord vector.
+    if partition_extra.is_empty() {
+        return after_outer;
     }
+    let mut sels = after_outer.unwrap_or_else(|| {
+        coord_sizes
+            .iter()
+            .map(|&size| CoordSelection::Range(0, size))
+            .collect()
+    });
+    for (idx, sel) in partition_extra {
+        if *idx < sels.len() {
+            sels[*idx] = sel.clone();
+        }
+    }
+    Some(sels)
 }
 
 /// Identify the OUTER coordinate (axis-0 of the first data var) by size-match.
@@ -1012,6 +1039,207 @@ fn window_outer_selection(sel: &CoordSelection, max_steps: usize) -> Vec<CoordSe
     }
 }
 
+/// One axis's window within a tiled batch: the sliced coordinate selection plus
+/// the survivor offset/len into that axis's filtered coordinate values (the same
+/// offset the single-axis path advances by today).
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct AxisWindow {
+    sel: CoordSelection,
+    offset: usize,
+    len: usize,
+}
+
+/// One axis's window list, tiled at `tile` steps, with cumulative survivor offsets.
+/// Reuses [`window_outer_selection`], so a `tile` covering the whole axis yields
+/// exactly one window.
+fn axis_windows(sel: &CoordSelection, tile: usize) -> Vec<AxisWindow> {
+    let mut offset = 0;
+    window_outer_selection(sel, tile)
+        .into_iter()
+        .map(|w| {
+            let len = w.len();
+            let aw = AxisWindow {
+                sel: w,
+                offset,
+                len,
+            };
+            offset += len;
+            aw
+        })
+        .collect()
+}
+
+/// A lazy, row-major (axis 0 slowest) odometer over the tile grid: the Cartesian
+/// product of each axis's windows. Yields on demand so a scan never materializes
+/// `n_batches` windows — the whole point on cubes where that count is huge. When
+/// every inner axis is whole (one window each), the grid collapses to the current
+/// outer-only line, reproducing today's behavior exactly.
+struct TileGrid {
+    per_axis: Vec<Vec<AxisWindow>>,
+    cursor: Vec<usize>,
+    done: bool,
+}
+
+impl TileGrid {
+    fn new(sels: &[CoordSelection], tiles: &[usize]) -> Self {
+        let per_axis: Vec<Vec<AxisWindow>> = sels
+            .iter()
+            .zip(tiles)
+            .map(|(s, &t)| axis_windows(s, t))
+            .collect();
+        let cursor = vec![0; per_axis.len()];
+        TileGrid {
+            per_axis,
+            cursor,
+            done: false,
+        }
+    }
+
+    /// Total batches = product of per-axis window counts.
+    fn n_batches(&self) -> usize {
+        self.per_axis.iter().map(|w| w.len()).product()
+    }
+
+    /// The current batch's per-axis windows, then advance the odometer (innermost
+    /// axis fastest). `None` once the grid is exhausted.
+    fn next(&mut self) -> Option<Vec<AxisWindow>> {
+        if self.done {
+            return None;
+        }
+        let batch: Vec<AxisWindow> = self
+            .cursor
+            .iter()
+            .enumerate()
+            .map(|(ax, &i)| self.per_axis[ax][i].clone())
+            .collect();
+
+        // Odometer carry, from the innermost axis outward.
+        let mut ax = self.cursor.len();
+        loop {
+            if ax == 0 {
+                self.done = true;
+                break;
+            }
+            ax -= 1;
+            self.cursor[ax] += 1;
+            if self.cursor[ax] < self.per_axis[ax].len() {
+                break;
+            }
+            self.cursor[ax] = 0;
+        }
+        Some(batch)
+    }
+}
+
+#[cfg(test)]
+mod tilegrid_tests {
+    use super::*;
+    use std::collections::HashSet;
+
+    fn sel_members(s: &CoordSelection) -> Vec<usize> {
+        match s {
+            CoordSelection::Range(a, b) => (*a..*b).collect(),
+            CoordSelection::Indices(v) => v.clone(),
+        }
+    }
+
+    /// The Cartesian product of per-axis members = the selection's index tuples.
+    fn tuple_set(sels: &[CoordSelection]) -> HashSet<Vec<usize>> {
+        let members: Vec<Vec<usize>> = sels.iter().map(sel_members).collect();
+        let mut out = HashSet::new();
+        if members.iter().any(|m| m.is_empty()) {
+            return out; // an empty axis -> no tuples
+        }
+        let mut cur = vec![0usize; members.len()];
+        fn rec(m: &[Vec<usize>], ax: usize, cur: &mut Vec<usize>, out: &mut HashSet<Vec<usize>>) {
+            if ax == m.len() {
+                out.insert(cur.clone());
+                return;
+            }
+            for &v in &m[ax] {
+                cur[ax] = v;
+                rec(m, ax + 1, cur, out);
+            }
+        }
+        rec(&members, 0, &mut cur, &mut out);
+        out
+    }
+
+    #[test]
+    fn tilegrid_reproduces_full_row_set() {
+        let sels = vec![
+            CoordSelection::Range(0, 5),
+            CoordSelection::Indices(vec![1, 3, 4, 7]),
+            CoordSelection::Range(2, 9),
+        ];
+        let tiles = [2usize, 3, 4]; // every axis tiled
+        let expected_batches: usize = sels
+            .iter()
+            .zip(&tiles)
+            .map(|(s, &t)| axis_windows(s, t).len())
+            .product();
+
+        let mut grid = TileGrid::new(&sels, &tiles);
+        assert_eq!(grid.n_batches(), expected_batches);
+
+        let full = tuple_set(&sels);
+        let mut seen: HashSet<Vec<usize>> = HashSet::new();
+        let mut n = 0;
+        while let Some(batch) = grid.next() {
+            n += 1;
+            // each window's len <= its tile
+            for (aw, &t) in batch.iter().zip(&tiles) {
+                assert!(aw.len <= t, "window len {} exceeds tile {}", aw.len, t);
+            }
+            let batch_sels: Vec<CoordSelection> = batch.iter().map(|w| w.sel.clone()).collect();
+            for tup in tuple_set(&batch_sels) {
+                assert!(seen.insert(tup), "batches overlap");
+            }
+        }
+        assert_eq!(n, expected_batches);
+        assert_eq!(seen, full); // disjoint exact cover
+    }
+
+    #[test]
+    fn tilegrid_degenerates_to_outer_only() {
+        let sels = vec![CoordSelection::Range(0, 10), CoordSelection::Range(0, 4)];
+        let tiles = [3usize, 4]; // inner axis whole (extent 4)
+        let mut grid = TileGrid::new(&sels, &tiles);
+        let outer = window_outer_selection(&sels[0], 3);
+        assert_eq!(grid.n_batches(), outer.len());
+        for w in &outer {
+            let b = grid.next().unwrap();
+            assert_eq!(b[0].sel, *w);
+            assert_eq!(b[1].sel, CoordSelection::Range(0, 4)); // inner untouched
+        }
+        assert!(grid.next().is_none());
+    }
+
+    #[test]
+    fn axis_windows_offsets_and_bounds() {
+        let ws = axis_windows(&CoordSelection::Range(0, 7), 3);
+        assert_eq!(
+            ws.iter().map(|w| (w.offset, w.len)).collect::<Vec<_>>(),
+            vec![(0, 3), (3, 3), (6, 1)]
+        );
+        // Indices tile: chunks with cumulative offsets.
+        let wi = axis_windows(&CoordSelection::Indices(vec![2, 5, 8, 11, 14]), 2);
+        assert_eq!(
+            wi.iter().map(|w| (w.offset, w.len)).collect::<Vec<_>>(),
+            vec![(0, 2), (2, 2), (4, 1)]
+        );
+    }
+
+    #[test]
+    fn tilegrid_empty_selection_yields_one_empty_batch() {
+        let sels = vec![CoordSelection::Range(3, 3), CoordSelection::Range(0, 4)];
+        let mut grid = TileGrid::new(&sels, &[4usize, 4]);
+        let b = grid.next().unwrap();
+        assert_eq!(b[0].len, 0);
+        assert!(grid.next().is_none());
+    }
+}
+
 /// Lazy, memory-bounded scan state: produces one `RecordBatch` per outer-axis
 /// window on demand (Block 0 Phase 2). Owns everything `build_batch` needs so the
 /// stream can outlive `read_zarr`'s stack frame; a fresh `BatchCtx` borrowing this
@@ -1029,62 +1257,58 @@ struct WindowedScan {
     query_coord_sizes: Vec<usize>,
     filtered_coord_values: Vec<CoordValues>,
     coord_ranges: Option<Vec<CoordSelection>>,
-    windows: Vec<CoordSelection>,
-    /// Coord-space index of the outer (most-significant) effective coordinate.
-    outer_coord_idx: usize,
-    /// Product of the non-outer effective sizes (rows per outer step).
-    inner_rows: usize,
+    /// Lazy odometer over the per-axis tile grid (effective-axis order). Replaces
+    /// the old single outer-axis cursor.
+    grid: TileGrid,
     limit: Option<usize>,
-    // Cursor.
-    widx: usize,
-    /// Survivor offset of the next window into the outer coord's filtered values.
-    offset: usize,
     /// Rows emitted so far (drives the LIMIT stop).
     emitted: usize,
 }
 
 impl WindowedScan {
-    /// Build the next window's batch, or `None` when the windows are exhausted or
-    /// the LIMIT has been reached (later windows are never read — laziness).
+    /// Build the next tile's batch, or `None` when the grid is exhausted or the
+    /// LIMIT has been reached (later tiles are never read — laziness).
     fn next_batch(&mut self) -> Option<Result<RecordBatch>> {
-        if self.widx >= self.windows.len() {
-            return None;
-        }
         if let Some(limit) = self.limit {
             if self.emitted >= limit {
                 return None;
             }
         }
 
-        let window = self.windows[self.widx].clone();
-        let wlen = window.len();
-        let window_rows = wlen * self.inner_rows;
-        let off = self.offset;
+        // The next tile: one window per effective axis (effective-axis order).
+        let aw = self.grid.next()?;
+        let window_rows: usize = aw.iter().map(|w| w.len).product();
 
-        // Narrow the resolved selection to this window: the outer coord's size, its
-        // filtered values, and the data-var read ranges all shrink to the window.
+        // Narrow the resolved selection to this tile. `query_coord_sizes` and `aw`
+        // are effective-ordered; `filtered_coord_values` / `coord_ranges` /
+        // `coord_sizes` are coord-index-ordered, bridged by effective_coord_indices.
         let mut query_coord_sizes = self.query_coord_sizes.clone();
-        query_coord_sizes[0] = wlen;
+        for (j, w) in aw.iter().enumerate() {
+            query_coord_sizes[j] = w.len;
+        }
         let filtered_coord_values: Vec<CoordValues> = self
             .filtered_coord_values
             .iter()
             .enumerate()
-            .map(|(i, v)| {
-                if i == self.outer_coord_idx {
-                    v.slice(off, off + wlen)
-                } else {
-                    v.clone()
-                }
-            })
+            .map(
+                |(c, v)| match self.effective_coord_indices.iter().position(|&ec| ec == c) {
+                    Some(j) => v.slice(aw[j].offset, aw[j].offset + aw[j].len),
+                    None => v.clone(),
+                },
+            )
             .collect();
-        let coord_ranges = restrict_to_partition(
-            self.coord_ranges.clone(),
-            self.outer_coord_idx,
-            &window,
-            &self.coord_sizes,
-        );
+        let mut sels = self.coord_ranges.clone().unwrap_or_else(|| {
+            self.coord_sizes
+                .iter()
+                .map(|&s| CoordSelection::Range(0, s))
+                .collect()
+        });
+        for (j, w) in aw.iter().enumerate() {
+            sels[self.effective_coord_indices[j]] = w.sel.clone();
+        }
+        let coord_ranges = Some(sels);
 
-        // LIMIT as a running cap: this window contributes at most the rows still owed.
+        // LIMIT as a running cap: this tile contributes at most the rows still owed.
         let (final_rows, limit_w) = match self.limit {
             Some(limit) => {
                 let remaining = limit - self.emitted;
@@ -1114,8 +1338,6 @@ impl WindowedScan {
             window_rows,
         );
 
-        self.widx += 1;
-        self.offset += wlen;
         if let Ok(ref b) = batch {
             self.emitted += b.num_rows();
         }
@@ -1135,9 +1357,15 @@ pub fn read_zarr(
     // selection). `None` => read the whole (filtered) store, the legacy
     // single-partition path. (Plain `//`: doc comments aren't allowed on params.)
     partition_selection: Option<CoordSelection>,
+    // Inner-axis `(coord index, selection)` restrictions for a multi-axis (N-D
+    // box) partition; empty for an outer-only partition. See PartitionSpec::extra.
+    partition_extra: Vec<(usize, CoordSelection)>,
     // Target rows per emitted RecordBatch (DataFusion's batch_size). Drives the
     // outer-axis windowing of the streaming scan.
     batch_size: usize,
+    // Rule-set memory budget in bytes (Phase 5); `None` => ZARR_MEM_BUDGET_BYTES,
+    // then batch_size. Converted to a row target by the reader's own row_width.
+    stream_budget_bytes: Option<u64>,
 ) -> Result<SendableRecordBatchStream> {
     let fs_store = Arc::new(FilesystemStore::new(store_path).map_err(zarr_err)?);
 
@@ -1249,7 +1477,13 @@ pub fn read_zarr(
     // selections carry ABSOLUTE outer-axis indices (they drive the data-var
     // reads), so keep them distinct from the relative `extract_selections` below.
     let coord_ranges =
-        apply_partition_selection(coord_ranges, partition_selection, &store_meta, &coord_sizes);
+        apply_partition_selection(
+            coord_ranges,
+            partition_selection,
+            &partition_extra,
+            &store_meta,
+            &coord_sizes,
+        );
 
     // Calculate effective sizes based on filters
     let (effective_coord_sizes, effective_rows) =
@@ -1337,6 +1571,22 @@ pub fn read_zarr(
         &effective_coord_indices,
     );
 
+    // Observe-only (Phase 2/3 exact-cardinality): at debug level log exact
+    // cardinality/inner-rows/touched-chunks/fallback; and, if a memory budget is
+    // configured, warn when the predicted peak exceeds it. Drives no decision.
+    crate::optimizer::cardinality::predicate::observe_scan(
+        &store_meta.coords,
+        &effective_coord_indices,
+        coord_ranges.as_deref(),
+        &coord_sizes,
+        &schema,
+        &projected_indices,
+        &coord_names,
+        &store_meta.data_vars,
+        &projected_schema,
+        batch_size,
+    );
+
     // Plan outer-axis windows. Windowing slices the OUTER (most-significant)
     // effective coordinate, scaling every read by the window — which is only
     // transparent when each projected data var spans the full *effective*
@@ -1357,23 +1607,55 @@ pub fn read_zarr(
                 .find(|v| &v.name == name)
                 .is_some_and(|v| v.shape.len() == effective_coord_indices.len())
     });
-    let windows =
+    // Build the tile grid from the budget-driven streaming plan. Windowing is only
+    // safe when every projected var spans the full effective coord set
+    // (`all_full_cube`); otherwise fall through to the single-batch path.
+    let grid =
         if all_full_cube && !effective_coord_indices.is_empty() && !query_coord_sizes.is_empty() {
-            let outer_coord_idx = effective_coord_indices[0];
-            let inner_rows = query_coord_sizes[1..].iter().product::<usize>().max(1);
-            let max_steps = (batch_size / inner_rows).max(1);
-            let outer_sel = match &coord_ranges {
-                Some(sels) => sels[outer_coord_idx].clone(),
-                None => CoordSelection::Range(0, query_coord_sizes[0]),
-            };
-            window_outer_selection(&outer_sel, max_steps)
+            // Phase 4.3: a byte budget (ZARR_MEM_BUDGET_BYTES) drives multi-axis tiling;
+            // absent one, the target is batch_size and this reproduces the previous
+            // outer-only `max_steps = batch_size / inner_rows`.
+            let row_width =
+                crate::optimizer::cardinality::cost::row_width(&projected_schema).max(1);
+            // Budget precedence: rule-set bytes (Phase 5) -> env bytes. The single
+            // bytes -> rows division (by the authoritative projected row_width)
+            // happens here; absent any budget the target is batch_size.
+            let budget_bytes = stream_budget_bytes.or_else(|| {
+                crate::optimizer::cardinality::budget::MemoryBudget::from_env().map(|b| b.bytes)
+            });
+            let target = budget_bytes
+                .map(|bytes| (bytes / row_width as u64).max(1))
+                .unwrap_or(batch_size as u64);
+            let sizes: Vec<u64> = query_coord_sizes.iter().map(|&s| s as u64).collect();
+            let tiles: Vec<usize> =
+                crate::optimizer::cardinality::budget::plan_streaming(&sizes, target)
+                    .tiles
+                    .iter()
+                    .map(|&t| t as usize)
+                    .collect();
+            let effective_sels: Vec<CoordSelection> = (0..effective_coord_indices.len())
+                .map(|j| match &coord_ranges {
+                    Some(sels) => sels[effective_coord_indices[j]].clone(),
+                    None => CoordSelection::Range(0, query_coord_sizes[j]),
+                })
+                .collect();
+            Some(TileGrid::new(&effective_sels, &tiles))
         } else {
-            Vec::new()
+            None
         };
 
-    // Single window (small result, mixed dimensionality, or no windowable axis):
+    // Single batch (small result, mixed dimensionality, or no windowable axis):
     // one batch, byte-identical to the un-windowed path.
-    if windows.len() <= 1 {
+    if grid.as_ref().map(|g| g.n_batches()).unwrap_or(1) <= 1 {
+        // Phase 4.4: this path cannot tile (small result, or the mixed-dim fallback
+        // that streaming can't window). If enforcement is on and a budget is set,
+        // reject an over-budget batch (the Gap-2 case) instead of OOMing. No-op
+        // unless ZARR_MEM_ENFORCE is set.
+        crate::optimizer::cardinality::budget::admit_single_batch(
+            final_rows,
+            crate::optimizer::cardinality::cost::row_width(&projected_schema),
+        )
+        .map_err(|inf| DataFusionError::ResourcesExhausted(inf.to_string()))?;
         let ctx = BatchCtx {
             store: &store,
             store_meta: &store_meta,
@@ -1401,13 +1683,12 @@ pub fn read_zarr(
         )));
     }
 
-    // Multiple windows: emit one batch per window, lazily, bounding peak memory to
-    // ~one window instead of the whole selection.
-    let outer_coord_idx = effective_coord_indices[0];
-    let inner_rows = query_coord_sizes[1..].iter().product::<usize>().max(1);
+    // Multiple tiles: emit one batch per tile, lazily, bounding peak memory to
+    // ~one tile instead of the whole selection.
+    let grid = grid.expect("grid is Some when n_batches > 1");
     info!(
-        num_windows = windows.len(),
-        inner_rows, batch_size, "Streaming scan: windowing outer axis"
+        num_batches = grid.n_batches(),
+        batch_size, "Streaming scan: tiling selection"
     );
     let scan = WindowedScan {
         store,
@@ -1422,12 +1703,8 @@ pub fn read_zarr(
         query_coord_sizes,
         filtered_coord_values,
         coord_ranges,
-        windows,
-        outer_coord_idx,
-        inner_rows,
+        grid,
         limit,
-        widx: 0,
-        offset: 0,
         emitted: 0,
     };
     let stream = stream::unfold(scan, |mut scan| async move {
@@ -1582,52 +1859,53 @@ struct AsyncWindowedScan {
     query_coord_sizes: Vec<usize>,
     filtered_coord_values: Vec<CoordValues>,
     coord_ranges: Option<Vec<CoordSelection>>,
-    windows: Vec<CoordSelection>,
-    outer_coord_idx: usize,
-    inner_rows: usize,
+    /// Lazy odometer over the per-axis tile grid (effective-axis order).
+    grid: TileGrid,
     limit: Option<usize>,
     total_rows: usize,
-    widx: usize,
-    offset: usize,
+    /// Rows emitted so far (drives the LIMIT stop).
     emitted: usize,
 }
 
 impl AsyncWindowedScan {
     async fn next_batch(&mut self) -> Option<Result<RecordBatch>> {
-        if self.widx >= self.windows.len() {
-            return None;
-        }
         if let Some(limit) = self.limit {
             if self.emitted >= limit {
                 return None;
             }
         }
 
-        let window = self.windows[self.widx].clone();
-        let wlen = window.len();
-        let window_rows = wlen * self.inner_rows;
-        let off = self.offset;
+        // The next tile: one window per effective axis (effective-axis order).
+        let aw = self.grid.next()?;
+        let window_rows: usize = aw.iter().map(|w| w.len).product();
 
+        // sizes/aw are effective-ordered; coord values / read-ranges are
+        // coord-index-ordered, bridged by effective_coord_indices.
         let mut query_coord_sizes = self.query_coord_sizes.clone();
-        query_coord_sizes[0] = wlen;
+        for (j, w) in aw.iter().enumerate() {
+            query_coord_sizes[j] = w.len;
+        }
         let filtered_coord_values: Vec<CoordValues> = self
             .filtered_coord_values
             .iter()
             .enumerate()
-            .map(|(i, v)| {
-                if i == self.outer_coord_idx {
-                    v.slice(off, off + wlen)
-                } else {
-                    v.clone()
-                }
-            })
+            .map(
+                |(c, v)| match self.effective_coord_indices.iter().position(|&ec| ec == c) {
+                    Some(j) => v.slice(aw[j].offset, aw[j].offset + aw[j].len),
+                    None => v.clone(),
+                },
+            )
             .collect();
-        let coord_ranges = restrict_to_partition(
-            self.coord_ranges.clone(),
-            self.outer_coord_idx,
-            &window,
-            &self.coord_sizes,
-        );
+        let mut sels = self.coord_ranges.clone().unwrap_or_else(|| {
+            self.coord_sizes
+                .iter()
+                .map(|&s| CoordSelection::Range(0, s))
+                .collect()
+        });
+        for (j, w) in aw.iter().enumerate() {
+            sels[self.effective_coord_indices[j]] = w.sel.clone();
+        }
+        let coord_ranges = Some(sels);
 
         let (final_rows, limit_w) = match self.limit {
             Some(limit) => {
@@ -1661,8 +1939,6 @@ impl AsyncWindowedScan {
         )
         .await;
 
-        self.widx += 1;
-        self.offset += wlen;
         if let Ok(ref b) = batch {
             self.emitted += b.num_rows();
         }
@@ -1684,9 +1960,15 @@ pub async fn read_zarr_async(
     coord_filters: Option<CoordFilters>,
     // Outer-axis selection for this partition; `None` => whole store.
     partition_selection: Option<CoordSelection>,
+    // Inner-axis `(coord index, selection)` restrictions for a multi-axis (N-D
+    // box) partition; empty for an outer-only partition. See PartitionSpec::extra.
+    partition_extra: Vec<(usize, CoordSelection)>,
     // Target rows per emitted RecordBatch (DataFusion's batch_size). Drives the
     // outer-axis windowing of the streaming scan.
     batch_size: usize,
+    // Rule-set memory budget in bytes (Phase 5); `None` => ZARR_MEM_BUDGET_BYTES,
+    // then batch_size. Converted to a row target by the reader's own row_width.
+    stream_budget_bytes: Option<u64>,
 ) -> Result<SendableRecordBatchStream> {
     info!("Starting async Zarr read");
 
@@ -1819,7 +2101,13 @@ pub async fn read_zarr_async(
     // selections carry ABSOLUTE outer-axis indices (they drive the data-var
     // reads), so keep them distinct from the relative `extract_selections` below.
     let coord_ranges =
-        apply_partition_selection(coord_ranges, partition_selection, &store_meta, &coord_sizes);
+        apply_partition_selection(
+            coord_ranges,
+            partition_selection,
+            &partition_extra,
+            &store_meta,
+            &coord_sizes,
+        );
 
     // Calculate effective sizes based on filters
     let (effective_coord_sizes, rows_after_filter) =
@@ -1926,6 +2214,20 @@ pub async fn read_zarr_async(
         &effective_coord_indices,
     );
 
+    // Observe-only (Phase 2/3 exact-cardinality): see the sync path for rationale.
+    crate::optimizer::cardinality::predicate::observe_scan(
+        &store_meta.coords,
+        &effective_coord_indices,
+        coord_ranges.as_deref(),
+        &coord_sizes,
+        &schema,
+        &projected_indices,
+        &coord_names,
+        &store_meta.data_vars,
+        &projected_schema,
+        batch_size,
+    );
+
     // Plan outer-axis windows — same logic and safety gate as the sync path
     // (`read_zarr`): window only when every projected data var spans the full
     // *effective* coordinate set, so a var missing an effective coord (broadcast
@@ -1939,24 +2241,49 @@ pub async fn read_zarr_async(
                 .find(|v| &v.name == name)
                 .is_some_and(|v| v.shape.len() == effective_coord_indices.len())
     });
-    let windows =
+    // Build the tile grid from the budget-driven streaming plan (see the sync path
+    // in `read_zarr` for the rationale); only safe when `all_full_cube`.
+    let grid =
         if all_full_cube && !effective_coord_indices.is_empty() && !query_coord_sizes.is_empty() {
-            let outer_coord_idx = effective_coord_indices[0];
-            let inner_rows = query_coord_sizes[1..].iter().product::<usize>().max(1);
-            let max_steps = (batch_size / inner_rows).max(1);
-            let outer_sel = match &coord_ranges {
-                Some(sels) => sels[outer_coord_idx].clone(),
-                None => CoordSelection::Range(0, query_coord_sizes[0]),
-            };
-            window_outer_selection(&outer_sel, max_steps)
+            let row_width =
+                crate::optimizer::cardinality::cost::row_width(&projected_schema).max(1);
+            // Budget precedence: rule-set bytes (Phase 5) -> env bytes. The single
+            // bytes -> rows division (by the authoritative projected row_width)
+            // happens here; absent any budget the target is batch_size.
+            let budget_bytes = stream_budget_bytes.or_else(|| {
+                crate::optimizer::cardinality::budget::MemoryBudget::from_env().map(|b| b.bytes)
+            });
+            let target = budget_bytes
+                .map(|bytes| (bytes / row_width as u64).max(1))
+                .unwrap_or(batch_size as u64);
+            let sizes: Vec<u64> = query_coord_sizes.iter().map(|&s| s as u64).collect();
+            let tiles: Vec<usize> =
+                crate::optimizer::cardinality::budget::plan_streaming(&sizes, target)
+                    .tiles
+                    .iter()
+                    .map(|&t| t as usize)
+                    .collect();
+            let effective_sels: Vec<CoordSelection> = (0..effective_coord_indices.len())
+                .map(|j| match &coord_ranges {
+                    Some(sels) => sels[effective_coord_indices[j]].clone(),
+                    None => CoordSelection::Range(0, query_coord_sizes[j]),
+                })
+                .collect();
+            Some(TileGrid::new(&effective_sels, &tiles))
         } else {
-            Vec::new()
+            None
         };
 
-    // Single window (small result, mixed dimensionality, or no windowable axis):
+    // Single batch (small result, mixed dimensionality, or no windowable axis):
     // one batch, byte-identical to the un-windowed path (incl. the no-filter
     // limit-subset read optimization inside build_batch_async).
-    if windows.len() <= 1 {
+    if grid.as_ref().map(|g| g.n_batches()).unwrap_or(1) <= 1 {
+        // Phase 4.4: same enforcement as the sync path (see `read_zarr`).
+        crate::optimizer::cardinality::budget::admit_single_batch(
+            final_rows,
+            crate::optimizer::cardinality::cost::row_width(&projected_schema),
+        )
+        .map_err(|inf| DataFusionError::ResourcesExhausted(inf.to_string()))?;
         let ctx = AsyncBatchCtx {
             store: &store,
             prefix,
@@ -1987,13 +2314,12 @@ pub async fn read_zarr_async(
         )));
     }
 
-    // Multiple windows: emit one batch per window, lazily, bounding peak memory to
-    // ~one window instead of the whole selection.
-    let outer_coord_idx = effective_coord_indices[0];
-    let inner_rows = query_coord_sizes[1..].iter().product::<usize>().max(1);
+    // Multiple tiles: emit one batch per tile, lazily, bounding peak memory to
+    // ~one tile instead of the whole selection.
+    let grid = grid.expect("grid is Some when n_batches > 1");
     info!(
-        num_windows = windows.len(),
-        inner_rows, batch_size, "Streaming async scan: windowing outer axis"
+        num_batches = grid.n_batches(),
+        batch_size, "Streaming async scan: tiling selection"
     );
     let scan = AsyncWindowedScan {
         store,
@@ -2009,13 +2335,9 @@ pub async fn read_zarr_async(
         query_coord_sizes,
         filtered_coord_values,
         coord_ranges,
-        windows,
-        outer_coord_idx,
-        inner_rows,
+        grid,
         limit,
         total_rows,
-        widx: 0,
-        offset: 0,
         emitted: 0,
     };
     let stream = stream::unfold(scan, |mut scan| async move {
@@ -2337,7 +2659,9 @@ mod outer_read_tests {
             None,
             None,
             partition,
+            Vec::new(),
             8192,
+            None,
         )
         .unwrap();
         let batches: Vec<RecordBatch> = block_on(stream.try_collect()).unwrap();
@@ -2385,6 +2709,104 @@ mod outer_read_tests {
     #[test]
     fn empty_partition_yields_no_rows() {
         assert_eq!(read(Some(CoordSelection::Range(2, 2))).num_rows(), 0);
+    }
+
+    // ── multi-axis (N-D box) partition transparency ──────────────────────────
+    //
+    // `partition_extra` restricts INNER axes so a partition reads an N-D box of
+    // chunks. Coords follow the data var's native dimension order [time(0),
+    // lat(1), lon(2)]; time is the outer axis, so lat/lon are the inner axes.
+    // These prove a box read returns exactly the right rows.
+    const LAT: usize = 1;
+
+    /// Read one box: `outer` on the outer axis, `extra` on inner axes.
+    fn read_box(outer: Option<CoordSelection>, extra: Vec<(usize, CoordSelection)>) -> RecordBatch {
+        let schema = Arc::new(infer_schema(STORE).unwrap());
+        let stream = read_zarr(
+            STORE,
+            schema.clone(),
+            None,
+            None,
+            None,
+            None,
+            outer,
+            extra,
+            8192,
+            None,
+        )
+        .unwrap();
+        let batches: Vec<RecordBatch> = block_on(stream.try_collect()).unwrap();
+        concat_batches(&batches[0].schema(), &batches).unwrap()
+    }
+
+    /// Order-independent fingerprint of the `temperature` column (i64/f32/f64).
+    fn temp_sum(rb: &RecordBatch) -> f64 {
+        use arrow::array::{Float32Array, Float64Array, Int64Array};
+        let idx = rb.schema().index_of("temperature").unwrap();
+        let col = rb.column(idx);
+        if let Some(a) = col.as_any().downcast_ref::<Int64Array>() {
+            (0..a.len()).map(|i| a.value(i) as f64).sum()
+        } else if let Some(a) = col.as_any().downcast_ref::<Float32Array>() {
+            (0..a.len()).map(|i| a.value(i) as f64).sum()
+        } else if let Some(a) = col.as_any().downcast_ref::<Float64Array>() {
+            (0..a.len()).map(|i| a.value(i)).sum()
+        } else {
+            panic!("unexpected temperature type: {:?}", col.data_type());
+        }
+    }
+
+    #[test]
+    fn full_range_extra_is_noop() {
+        // An inner restriction spanning the whole lat axis must be identical to no
+        // restriction at all (same rows, same order).
+        let full = read(None);
+        let same = read_box(
+            Some(CoordSelection::Range(0, 7)),
+            vec![(LAT, CoordSelection::Range(0, 10))],
+        );
+        assert_eq!(full, same);
+    }
+
+    #[test]
+    fn inner_axis_box_partitions_reconstruct_full() {
+        // Split the INNER lat axis into [0,5) and [5,10), each spanning all time &
+        // lon. Together they must reconstruct the full read — verified by row count
+        // and an order-independent column sum (lat-split rows interleave, so a plain
+        // concat wouldn't match order).
+        let full = read(None);
+        let a = read_box(None, vec![(LAT, CoordSelection::Range(0, 5))]);
+        let b = read_box(None, vec![(LAT, CoordSelection::Range(5, 10))]);
+        assert_eq!(a.num_rows(), 350, "7 time × 5 lat × 10 lon");
+        assert_eq!(b.num_rows(), 350);
+        assert_eq!(a.num_rows() + b.num_rows(), full.num_rows());
+        let union = temp_sum(&a) + temp_sum(&b);
+        assert!(
+            (union - temp_sum(&full)).abs() < 1e-2,
+            "box union sum {union} != full {}",
+            temp_sum(&full)
+        );
+    }
+
+    #[test]
+    fn outer_and_inner_box_grid_reconstructs_full() {
+        // A 2×2 grid over (time, lat) — the real multi-axis case — reconstructs the
+        // full cube exactly (row count + order-independent sum).
+        let full = read(None);
+        let grid = [
+            (CoordSelection::Range(0, 3), CoordSelection::Range(0, 5)),
+            (CoordSelection::Range(0, 3), CoordSelection::Range(5, 10)),
+            (CoordSelection::Range(3, 7), CoordSelection::Range(0, 5)),
+            (CoordSelection::Range(3, 7), CoordSelection::Range(5, 10)),
+        ];
+        let mut rows = 0usize;
+        let mut sum = 0.0f64;
+        for (t, lat) in grid {
+            let rb = read_box(Some(t), vec![(LAT, lat)]);
+            rows += rb.num_rows();
+            sum += temp_sum(&rb);
+        }
+        assert_eq!(rows, full.num_rows());
+        assert!((sum - temp_sum(&full)).abs() < 1e-2);
     }
 }
 
@@ -2516,7 +2938,9 @@ mod async_streaming_tests {
             Some(meta),
             None,
             None,
+            Vec::new(),
             batch_size,
+            None,
         )
         .await
         .unwrap();

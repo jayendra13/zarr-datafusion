@@ -9,19 +9,41 @@ pub struct PartitionSpec {
     /// Today the planner only emits chunk-aligned `Range`s; `Indices` becomes
     /// reachable once a resolved date-part selection is split across partitions.
     pub outer: CoordSelection,
+    /// Additional per-axis chunk-aligned slices this partition restricts, as
+    /// `(coordinate index, selection)` pairs — the *inner* axes of a multi-axis
+    /// (N-D box) partition. Empty for a plain outer-only partition (the common
+    /// case, and every plan produced before multi-axis fan-out). `serde(default)`
+    /// keeps the distributed codec compatible with specs that predate this field.
+    #[serde(default)]
+    pub extra: Vec<(usize, CoordSelection)>,
 }
 
 impl PartitionSpec {
-    /// A contiguous half-open `[start, end)` slice on the outer axis.
+    /// A contiguous half-open `[start, end)` slice on the outer axis (no inner
+    /// restriction).
     pub fn range(start: u64, end: u64) -> Self {
+        Self::from_outer(CoordSelection::Range(start as usize, end as usize))
+    }
+
+    /// An outer-only partition from a resolved outer selection.
+    pub fn from_outer(outer: CoordSelection) -> Self {
         Self {
-            outer: CoordSelection::Range(start as usize, end as usize),
+            outer,
+            extra: Vec::new(),
         }
     }
 
+    /// Attach inner-axis `(coord index, selection)` restrictions, turning an
+    /// outer-only slice into a multi-axis box partition.
+    pub fn with_extra(mut self, extra: Vec<(usize, CoordSelection)>) -> Self {
+        self.extra = extra;
+        self
+    }
+
     /// True when this partition reads nothing (used for uniform-length padding).
+    /// A box partition is empty if any of its axes selects nothing.
     pub fn is_empty(&self) -> bool {
-        self.outer.is_empty()
+        self.outer.is_empty() || self.extra.iter().any(|(_, s)| s.is_empty())
     }
 
     /// `(start, end)` if the outer selection is a contiguous range.

@@ -217,6 +217,30 @@ Commit hashes point at the change that introduced or settled the decision.
 - **Rationale:** Avoid redundant chunk reads and decompression across the cluster
   while keeping partitions balanced.
 
+### 18b. Multi-axis (N-D box) partition fan-out when the outer axis under-parallelizes
+- **Decision:** When splitting the outer axis alone yields fewer partitions than
+  `target_partitions` (its chunk grid is coarse — e.g. a single-chunked time axis),
+  the planner (`fan_out_inner` in `datasource/zarr.rs`) also splits the best *inner*
+  axis and emits the Cartesian product as **box partitions**. `PartitionSpec` gains
+  `extra: Vec<(coord_index, CoordSelection)>` — the inner-axis restrictions
+  (`#[serde(default)]` for distributed-codec back-compat); the reader
+  (`apply_partition_selection`) restricts every listed coordinate, not just the
+  outer. The "best" inner axis is the unfiltered one with the most chunks (`>1`),
+  mapped via `dimension_names`; the split is geometric and **metadata-only** (no
+  coordinate reads). Total partitions never exceed `target_partitions` and never
+  split a chunk across partitions.
+- **Rationale:** Outer-only partitioning (§16) leaves the machine idle whenever the
+  outer chunk grid is coarser than the core count — the pathological case is a
+  single outer chunk (one partition, no parallelism) over an array whose inner axes
+  hold thousands of chunks. Counting *total* touched chunks to shrink the count is a
+  proven no-op (outer-only partitioning is already capped at surviving outer chunks,
+  which is `≤` total), so the win is the opposite direction: *add* inner-axis
+  parallelism. Only unfiltered inner axes are split because their surviving set isn't
+  resolved at plan time and `extra` REPLACES a coordinate's selection; a filtered
+  inner axis keeps its `CoordFilters`-derived selection instead. Verified
+  value-transparent end-to-end (a fanned-out aggregate equals the single-partition
+  one) — `integration_multiaxis.rs`.
+
 ---
 
 ## Interface and ergonomics
@@ -256,5 +280,9 @@ direction:
   timestep over the full global grid stays on one worker.
 - **Aggregate pushdown** (push `SUM`/`AVG`/`COUNT` to chunk level) and **Top-K**
   (`ORDER BY x LIMIT k` without a full sort) are not yet implemented.
-</content>
-</invoke>
+- **Unbounded single-batch scan** — the scan emits the whole selection as one
+  RecordBatch, so a query whose *selection* is large OOMs even when the *result*
+  is tiny (e.g. a true monthly mean over hourly ERA5). The generic fix is a
+  streaming scan that honors `batch_size`. This, and a broader vision of a
+  structural exact-cardinality optimizer, are explored in
+  [Exact-cardinality optimization](exact-cardinality-optimizer.md).
