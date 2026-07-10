@@ -495,7 +495,12 @@ fn discover_arrays_v3(
                         .get("attributes")
                         .and_then(parse_cf_time_from_attrs)
                         .or_else(|| infer_nanosecond_epoch_from_raw_dtype(dtype_raw));
-                    let dimensions = meta.get("attributes").and_then(parse_array_dimensions);
+                    // Prefer the xarray V2 attribute; fall back to the native V3
+                    // `dimension_names` field (used by e.g. the CIRA forecast).
+                    let dimensions = meta
+                        .get("attributes")
+                        .and_then(parse_array_dimensions)
+                        .or_else(|| parse_v3_dimension_names(&meta));
 
                     arrays.push(ZarrArrayMeta {
                         name,
@@ -810,6 +815,20 @@ fn parse_array_dimensions(attrs: &serde_json::Value) -> Option<Vec<String>> {
                 .filter_map(|v| v.as_str().map(|s| s.to_string()))
                 .collect()
         })
+}
+
+/// Parse the native Zarr **V3** `dimension_names` top-level field from a zarr.json
+/// value (distinct from the V2 `_ARRAY_DIMENSIONS` xarray attribute).
+///
+/// Per the V3 spec each entry may be `null`; we only return the names when ALL
+/// are present, since a partial mapping can't be trusted to order coordinates.
+/// This is what lets us read stores like the CIRA forecast, whose arrays carry
+/// native `dimension_names` (e.g. `["init_time","lead_time","latitude","longitude"]`)
+/// rather than the xarray attribute.
+fn parse_v3_dimension_names(zarr_json: &serde_json::Value) -> Option<Vec<String>> {
+    let arr = zarr_json.get("dimension_names")?.as_array()?;
+    let names: Option<Vec<String>> = arr.iter().map(|v| v.as_str().map(str::to_string)).collect();
+    names.filter(|n| !n.is_empty())
 }
 
 // =============================================================================
@@ -1233,7 +1252,12 @@ async fn discover_arrays_v3_async(
                     .get("attributes")
                     .and_then(parse_cf_time_from_attrs)
                     .or_else(|| infer_nanosecond_epoch_from_raw_dtype(dtype_raw));
-                let dimensions = meta.get("attributes").and_then(parse_array_dimensions);
+                // Prefer the xarray V2 attribute; fall back to the native V3
+                // `dimension_names` field (used by e.g. the CIRA forecast).
+                let dimensions = meta
+                    .get("attributes")
+                    .and_then(parse_array_dimensions)
+                    .or_else(|| parse_v3_dimension_names(&meta));
 
                 arrays.push(ZarrArrayMeta {
                     name,
@@ -1330,6 +1354,38 @@ pub async fn infer_schema_with_meta_async(
 mod tests {
     use super::*;
     use arrow::datatypes::DataType;
+
+    // ==================== dimension-name parsing tests ====================
+
+    #[test]
+    fn parses_native_v3_dimension_names() {
+        // Zarr V3 stores dimension names in a top-level `dimension_names` array
+        // (this is how the CIRA forecast arrays are written), not under attributes.
+        let z = serde_json::json!({
+            "node_type": "array",
+            "shape": [4083, 41, 721, 1440],
+            "dimension_names": ["init_time", "lead_time", "latitude", "longitude"],
+        });
+        assert_eq!(
+            parse_v3_dimension_names(&z),
+            Some(vec![
+                "init_time".to_string(),
+                "lead_time".to_string(),
+                "latitude".to_string(),
+                "longitude".to_string(),
+            ])
+        );
+    }
+
+    #[test]
+    fn native_v3_dimension_names_absent_or_partial_is_none() {
+        // No field at all.
+        assert_eq!(parse_v3_dimension_names(&serde_json::json!({})), None);
+        // A null entry (allowed by the V3 spec) means the mapping is incomplete
+        // and must not be trusted for coordinate ordering.
+        let partial = serde_json::json!({ "dimension_names": ["time", null, "lon"] });
+        assert_eq!(parse_v3_dimension_names(&partial), None);
+    }
 
     // ==================== detect_zarr_version tests ====================
 

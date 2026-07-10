@@ -138,3 +138,59 @@ async fn value_exact_at_coordinate() {
         .value(0);
     assert_eq!(v, 345.0);
 }
+
+// ==================== remote CIRA (network-gated) ====================
+
+/// End-to-end read of the real CIRA FourCastNetv2 forecast from the public
+/// ExtremeWeatherBench icechunk repo: anonymous GCS repo metadata + anonymous-S3
+/// virtual HDF5 chunk decode, group addressing, and the mixed-dimensionality cube
+/// (t2 is 4-D, resolved via native V3 `dimension_names`).
+///
+/// Ignored by default: it needs network access (anonymous GCS + S3) and reads a
+/// few byte-ranges out of the 7.5 GB archival HDF5s. Run explicitly with:
+///   cargo test --features icechunk --test integration_icechunk -- --ignored remote_cira
+#[tokio::test]
+#[ignore = "requires network: anonymous GCS + S3 reads of the public CIRA repo"]
+async fn remote_cira_narrow_t2_read() {
+    const CIRA: &str = "gs://extremeweatherbench/cira-icechunk";
+    let ctx = ctx();
+    ctx.sql(&format!(
+        "CREATE EXTERNAL TABLE cira STORED AS ZARR LOCATION '{CIRA}' \
+         OPTIONS ('group' 'FOUR_v200_GFS')"
+    ))
+    .await
+    .expect("CREATE over remote icechunk repo")
+    .collect()
+    .await
+    .expect("execute CREATE");
+
+    // Narrow filter on all four of t2's coordinates -> a single-cell read (no
+    // OOM despite the ~173-billion-row surface cube).
+    let batches = ctx
+        .sql(
+            "SELECT t2 FROM cira \
+             WHERE init_time = TIMESTAMP '2020-09-30T12:00:00Z' \
+               AND lead_time = 0 AND latitude = 40.0 AND longitude = 280.0",
+        )
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    let total: usize = batches.iter().map(|b| b.num_rows()).sum();
+    assert_eq!(total, 1, "expected exactly one matching cell");
+    let k = batches
+        .iter()
+        .find(|b| b.num_rows() > 0)
+        .unwrap()
+        .column(0)
+        .as_any()
+        .downcast_ref::<arrow::array::Float32Array>()
+        .unwrap()
+        .value(0);
+    // Surface air temperature in Kelvin: sane range for a mid-latitude land point.
+    assert!(
+        (230.0..=330.0).contains(&k),
+        "t2 = {k} K is outside the plausible surface range"
+    );
+}

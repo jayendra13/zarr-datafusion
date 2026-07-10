@@ -34,6 +34,12 @@ pub struct ZarrTable {
     store_meta: Option<ZarrStoreMeta>,
     /// Cached VirtualiZarr adapter for remote VirtualiZarr stores
     cached_virtualizarr: CachedVirtualiZarrAdapter,
+    /// True when the cached store is an icechunk store (local or remote). Icechunk
+    /// reads go through the async path (via `cached_remote`) but the scan stays
+    /// single-partition — the outer-selection resolver can't drive the cached
+    /// async store yet, and for a local icechunk path it would wrongly reopen the
+    /// path as a plain Zarr store.
+    icechunk: bool,
 }
 
 impl std::fmt::Debug for ZarrTable {
@@ -65,6 +71,7 @@ impl ZarrTable {
             cached_remote: None,
             store_meta: None,
             cached_virtualizarr: None,
+            icechunk: false,
         }
     }
 
@@ -80,6 +87,7 @@ impl ZarrTable {
             cached_remote: None,
             store_meta: Some(metadata),
             cached_virtualizarr: None,
+            icechunk: false,
         }
     }
 
@@ -97,6 +105,7 @@ impl ZarrTable {
             cached_remote: Some((store, prefix, metadata.clone())),
             store_meta: Some(metadata),
             cached_virtualizarr: None,
+            icechunk: false,
         }
     }
 
@@ -113,6 +122,30 @@ impl ZarrTable {
             cached_remote: None,
             store_meta: Some(metadata),
             cached_virtualizarr: Some(adapter),
+            icechunk: false,
+        }
+    }
+
+    /// Create a ZarrTable backed by an icechunk store (local or remote).
+    ///
+    /// The icechunk store is parked in the `cached_remote` slot (keyed at
+    /// `prefix`, which is the group path within the repo, or root) so schema
+    /// inference and the async read path treat it like any other remote store.
+    /// The `icechunk` marker keeps the scan single-partition.
+    pub fn with_cached_icechunk(
+        schema: SchemaRef,
+        path: impl Into<String>,
+        store: AsyncReadableListableStorage,
+        prefix: ObjectPath,
+        metadata: ZarrStoreMeta,
+    ) -> Self {
+        Self {
+            schema,
+            path: path.into(),
+            cached_remote: Some((store, prefix, metadata.clone())),
+            store_meta: Some(metadata),
+            cached_virtualizarr: None,
+            icechunk: true,
         }
     }
 
@@ -158,12 +191,11 @@ impl ZarrTable {
             return Vec::new();
         }
 
-        // Guard 1b: an icechunk store is a cached async store on a non-remote
-        // path. Partitioning the outer axis here would take the sync
-        // `resolve_outer_selection` branch below (which reopens `self.path` as a
-        // plain local Zarr store) and fail. Keep icechunk single-partition until
-        // outer-selection resolution learns to use the cached async store.
-        if !is_remote_url(&self.path) && self.cached_remote.is_some() {
+        // Guard 1b: icechunk stores (local or remote) stay single-partition for
+        // now — the outer-selection resolver can't drive the cached async store
+        // yet, and for a local icechunk path the sync branch below would wrongly
+        // reopen `self.path` as a plain Zarr store.
+        if self.icechunk {
             return Vec::new();
         }
 

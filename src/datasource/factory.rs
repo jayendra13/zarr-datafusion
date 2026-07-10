@@ -20,6 +20,59 @@ use zarrs_object_store::object_store::path::Path as ObjectPath;
 #[derive(Debug, Default)]
 pub struct ZarrTableFactory;
 
+/// Look up a `CREATE EXTERNAL TABLE` option, accepting both the bare key and the
+/// `format.`-namespaced key DataFusion assigns to custom-provider OPTIONS.
+#[cfg(feature = "icechunk")]
+fn table_option<'a>(
+    options: &'a std::collections::HashMap<String, String>,
+    key: &str,
+) -> Option<&'a String> {
+    options
+        .get(key)
+        .or_else(|| options.get(&format!("format.{key}")))
+}
+
+/// Build a `ZarrTable` over an already-opened icechunk store (local or remote).
+///
+/// The `group` table option selects a subgroup within the repo (used as the
+/// schema-inference / read prefix); absent, arrays are read from the repo root.
+#[cfg(feature = "icechunk")]
+async fn build_icechunk_table(
+    location: &str,
+    options: &std::collections::HashMap<String, String>,
+    store: zarrs::storage::AsyncReadableListableStorage,
+) -> Result<Arc<dyn TableProvider>> {
+    let group = table_option(options, "group");
+    let prefix = match group {
+        Some(g) => ObjectPath::from(g.trim_matches('/')),
+        None => ObjectPath::default(),
+    };
+    let (schema, metadata) = infer_schema_with_meta_async(&store, &prefix)
+        .await
+        .map_err(DataFusionError::External)?;
+    let schema = Arc::new(schema);
+
+    if schema.fields().is_empty() {
+        let group_hint = if group.is_some() {
+            String::new()
+        } else {
+            " (this repo may use groups — try OPTIONS ('group' '<name>'))".to_string()
+        };
+        return Err(DataFusionError::Plan(format!(
+            "No arrays found in icechunk store at '{location}'{group_hint}."
+        )));
+    }
+
+    info!(
+        num_fields = schema.fields().len(),
+        group = ?group,
+        "Icechunk table created successfully"
+    );
+    Ok(Arc::new(ZarrTable::with_cached_icechunk(
+        schema, location, store, prefix, metadata,
+    )))
+}
+
 #[async_trait]
 impl TableProviderFactory for ZarrTableFactory {
     #[instrument(level = "info", skip_all)]
@@ -36,37 +89,11 @@ impl TableProviderFactory for ZarrTableFactory {
         // (parked in ZarrTable's cached_remote slot, keyed at the root prefix).
         #[cfg(feature = "icechunk")]
         if crate::reader::icechunk_store::is_icechunk_store(&cmd.location) {
-            info!("Icechunk store detected");
+            info!("Local icechunk store detected");
             let store = crate::reader::icechunk_store::open_icechunk_async(&cmd.location)
                 .await
                 .map_err(DataFusionError::External)?;
-            // The synthetic store is flat at the repo root, so arrays live at
-            // `<name>/zarr.json` with no prefix.
-            let prefix = ObjectPath::default();
-            let (schema, metadata) = infer_schema_with_meta_async(&store, &prefix)
-                .await
-                .map_err(DataFusionError::External)?;
-            let schema = Arc::new(schema);
-
-            if schema.fields().is_empty() {
-                return Err(DataFusionError::Plan(format!(
-                    "No arrays found in icechunk store at '{}'. \
-                     Check that the path is a valid icechunk repository.",
-                    cmd.location
-                )));
-            }
-
-            info!(
-                num_fields = schema.fields().len(),
-                "Icechunk table created successfully"
-            );
-            return Ok(Arc::new(ZarrTable::with_cached_remote(
-                schema,
-                &cmd.location,
-                store,
-                prefix,
-                metadata,
-            )));
+            return build_icechunk_table(&cmd.location, &cmd.options, store).await;
         }
 
         if is_remote_url(&cmd.location) {
@@ -74,6 +101,23 @@ impl TableProviderFactory for ZarrTableFactory {
             let (store, prefix) = create_async_store(&cmd.location)
                 .await
                 .map_err(|e| DataFusionError::External(Box::new(e)))?;
+
+            // Remote icechunk repo? Detect on the plain object store before the
+            // VirtualiZarr / plain-Zarr branches, then reopen via the icechunk API.
+            #[cfg(feature = "icechunk")]
+            if crate::reader::icechunk_store::is_icechunk_store_async(&store, &prefix).await {
+                info!("Remote icechunk store detected");
+                let anonymous = table_option(&cmd.options, "anonymous")
+                    .map(|v| {
+                        !matches!(v.trim().to_ascii_lowercase().as_str(), "false" | "0" | "no")
+                    })
+                    .unwrap_or(true);
+                let ic_store =
+                    crate::reader::icechunk_store::open_icechunk_remote(&cmd.location, anonymous)
+                        .await
+                        .map_err(DataFusionError::External)?;
+                return build_icechunk_table(&cmd.location, &cmd.options, ic_store).await;
+            }
 
             // Check if this is a remote VirtualiZarr store
             if is_virtualizarr_store_async(&store, &prefix).await {

@@ -8,9 +8,12 @@
 //! store exactly like any other remote Zarr store — it drops straight into
 //! `ZarrTable`'s `cached_remote` slot.
 //!
-//! This module is deliberately narrow: detection + open. It does not know about
-//! virtual chunks (icechunk resolves those internally) or groups (the first
-//! integration target, `data/synthetic.icechunk`, is flat at the store root).
+//! This module is deliberately narrow: detection + open, for both local and
+//! remote (`gs://`/`s3://`) repos. Group addressing is handled by the caller via
+//! the schema-inference/read prefix (see the factory's `group` option), not here.
+//! Virtual chunks (byte-range references into archival HDF5/NetCDF) are resolved
+//! by icechunk internally; for remote repos we do rewrite persisted S3 virtual-
+//! chunk containers to anonymous access (see `open_icechunk_remote`).
 //!
 //! Known trade-off: icechunk performs its own object I/O, so our
 //! `AsyncTrackedStore` byte statistics do not cover reads that go through here.
@@ -19,14 +22,23 @@ use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
 
+use icechunk::config::{Credentials, S3Options};
 use icechunk::repository::VersionInfo;
-use icechunk::{new_local_filesystem_storage, Repository, RepositoryConfig};
-use tracing::{debug, info};
+use icechunk::storage::{
+    new_gcs_storage, new_s3_object_store_storage, GcsCredentials, S3Credentials, Storage,
+};
+use icechunk::virtual_chunks::VirtualChunkContainer;
+use icechunk::{new_local_filesystem_storage, ObjectStoreConfig, Repository, RepositoryConfig};
+use tracing::{debug, info, warn};
 use zarrs::storage::AsyncReadableListableStorage;
 use zarrs_icechunk::AsyncIcechunkStore;
 
 /// Error opening an icechunk store.
 type BoxError = Box<dyn std::error::Error + Send + Sync>;
+
+/// Default S3 region for a virtual-chunk container that doesn't declare one.
+/// (The NOAA archival bucket CIRA references lives in us-east-1.)
+const DEFAULT_S3_REGION: &str = "us-east-1";
 
 /// Detect a local icechunk repository by its on-disk layout.
 ///
@@ -69,6 +81,177 @@ pub async fn open_icechunk_async(path: &str) -> Result<AsyncReadableListableStor
     debug!(
         path,
         "Opened icechunk readonly session at branch tip 'main'"
+    );
+    Ok(store)
+}
+
+/// A parsed `gs://bucket/prefix` or `s3://bucket/prefix` icechunk repo location.
+struct RemoteRepoUrl {
+    scheme: String,
+    bucket: String,
+    /// Object prefix of the repo within the bucket (no leading/trailing '/'), or
+    /// empty if the repo is at the bucket root.
+    prefix: Option<String>,
+}
+
+/// Parse a `gs://`/`s3://` URL into (scheme, bucket, repo-prefix).
+fn parse_remote_repo_url(location: &str) -> Result<RemoteRepoUrl, BoxError> {
+    let url = url::Url::parse(location)?;
+    let scheme = url.scheme().to_string();
+    if scheme != "gs" && scheme != "s3" {
+        return Err(
+            format!("unsupported icechunk scheme '{scheme}://' (expected gs:// or s3://)").into(),
+        );
+    }
+    let bucket = url
+        .host_str()
+        .ok_or_else(|| format!("missing bucket in icechunk URL '{location}'"))?
+        .to_string();
+    let prefix = url.path().trim_matches('/');
+    Ok(RemoteRepoUrl {
+        scheme,
+        bucket,
+        prefix: if prefix.is_empty() {
+            None
+        } else {
+            Some(prefix.to_string())
+        },
+    })
+}
+
+/// Probe whether the object store rooted at `prefix` looks like an icechunk repo.
+///
+/// Icechunk lays down a `snapshots/` "directory" in every backend layout (local
+/// and object-store alike), so we list one level under the repo prefix and look
+/// for a `snapshots/` child. This runs on the plain object store (the same one
+/// used for Zarr/VirtualiZarr detection), before we commit to opening the repo
+/// through the icechunk API.
+pub async fn is_icechunk_store_async(
+    store: &AsyncReadableListableStorage,
+    prefix: &zarrs_object_store::object_store::path::Path,
+) -> bool {
+    use zarrs::storage::{AsyncListableStorageTraits, StorePrefix};
+
+    let prefix_str = if prefix.as_ref().is_empty() {
+        String::new()
+    } else {
+        format!("{}/", prefix.as_ref().trim_end_matches('/'))
+    };
+    let Ok(store_prefix) = StorePrefix::new(&prefix_str) else {
+        return false;
+    };
+    let Ok(entries) = store.list_dir(&store_prefix).await else {
+        return false;
+    };
+    entries.prefixes().iter().any(|p| {
+        let name = p
+            .as_str()
+            .trim_start_matches(&prefix_str)
+            .trim_end_matches('/');
+        name == "snapshots" || name == "refs"
+    })
+}
+
+/// Open a REMOTE icechunk repository (`gs://` or `s3://`) read-only at `main`.
+///
+/// `anonymous` controls both the primary store credentials and how virtual-chunk
+/// containers are authorized. When true (the default for public archives like
+/// ExtremeWeatherBench's CIRA forecast) we open anonymously AND rewrite every
+/// persisted S3 virtual-chunk container to `anonymous: true`, working around an
+/// icechunk 2.1.0 bug where a container's persisted `anonymous: false` clobbers
+/// the Anonymous credential's skip-signature back off (so the request gets signed
+/// and the anonymous fetch fails). See `examples/icechunk_read_cira.rs`.
+pub async fn open_icechunk_remote(
+    location: &str,
+    anonymous: bool,
+) -> Result<AsyncReadableListableStorage, BoxError> {
+    let RemoteRepoUrl {
+        scheme,
+        bucket,
+        prefix,
+    } = parse_remote_repo_url(location)?;
+    info!(
+        location,
+        scheme,
+        bucket,
+        ?prefix,
+        anonymous,
+        "Opening remote icechunk store"
+    );
+
+    let storage: Arc<dyn Storage + Send + Sync> = match scheme.as_str() {
+        "gs" => {
+            let creds = if anonymous {
+                Some(GcsCredentials::Anonymous)
+            } else {
+                None // FromEnv
+            };
+            new_gcs_storage(bucket.clone(), prefix.clone(), creds, None)?
+        }
+        "s3" => {
+            let opts = S3Options::default()
+                .with_region(DEFAULT_S3_REGION)
+                .with_anonymous(anonymous);
+            let creds = if anonymous {
+                Some(S3Credentials::Anonymous)
+            } else {
+                None
+            };
+            new_s3_object_store_storage(opts, bucket.clone(), prefix.clone(), creds).await?
+        }
+        other => return Err(format!("unsupported icechunk scheme '{other}'").into()),
+    };
+
+    // Phase 1: open with the persisted config to discover virtual-chunk containers.
+    let repo0 = Repository::open(None, storage.clone(), HashMap::new()).await?;
+
+    // Phase 2: build an override config + authorization map. Copy every persisted
+    // container through; for S3 ones, flip `anonymous: true` (the workaround) and
+    // authorize with anonymous S3 credentials.
+    let mut config = RepositoryConfig::default();
+    let mut authorize: HashMap<String, Option<Credentials>> = HashMap::new();
+    if let Some(containers) = repo0.config().virtual_chunk_containers.as_ref() {
+        for (url_prefix, container) in containers {
+            match &container.store {
+                ObjectStoreConfig::S3(opts) | ObjectStoreConfig::S3Compatible(opts) => {
+                    let opts = if anonymous {
+                        opts.clone().with_anonymous(true)
+                    } else {
+                        opts.clone()
+                    };
+                    config.set_virtual_chunk_container(VirtualChunkContainer::new(
+                        url_prefix.clone(),
+                        ObjectStoreConfig::S3(opts),
+                    )?)?;
+                    let creds = if anonymous {
+                        Some(Credentials::S3(S3Credentials::Anonymous))
+                    } else {
+                        None
+                    };
+                    authorize.insert(url_prefix.clone(), creds);
+                }
+                other => {
+                    // Preserve non-S3 containers unchanged; leave them
+                    // unauthorized (they error clearly only if actually read).
+                    warn!(
+                        url_prefix,
+                        ?other,
+                        "icechunk virtual-chunk container is not S3; passing through unauthorized"
+                    );
+                    config.set_virtual_chunk_container(container.clone())?;
+                }
+            }
+        }
+    }
+
+    let repo = Repository::open(Some(config), storage, authorize).await?;
+    let session = repo
+        .readonly_session(&VersionInfo::BranchTipRef("main".to_string()))
+        .await?;
+    let store: AsyncReadableListableStorage = Arc::new(AsyncIcechunkStore::new(session));
+    debug!(
+        location,
+        "Opened remote icechunk readonly session at branch tip 'main'"
     );
     Ok(store)
 }

@@ -158,13 +158,26 @@ Commit hashes point at the change that introduced or settled the decision.
   and versioning internally; reimplementing that in-house (as we did for
   VirtualiZarr) would be a large, redundant effort. Reusing the async store
   interface kept the integration to one new module plus a factory branch.
+- **Remote + groups + mixed dimensionality:** `gs://`/`s3://` repos are detected by
+  probing the object store for a `snapshots/`/`refs/` child, then opened through
+  the icechunk API (anonymously by default). `OPTIONS('group' '<name>')` selects a
+  subgroup, reused as the schema-inference/read prefix. For S3-backed virtual
+  chunks we rewrite the persisted containers to `anonymous: true` (the icechunk
+  2.1.0 skip-signature workaround, applied generically by reading the persisted
+  container list). Crucially, the schema layer now reads native Zarr **V3**
+  `dimension_names` (not just the V2 `_ARRAY_DIMENSIONS` attribute), so a
+  mixed-dimensionality store like CIRA — 6 shared coordinates but 4-D surface and
+  5-D pressure-level variables — maps each variable to its own dims. Validated
+  end-to-end against the real CIRA forecast (`t2 ≈ 281.6 K` for one init/lead/grid
+  cell).
 - **Trade-offs / current limits:** icechunk performs its own object I/O, so the
   `AsyncTrackedStore` byte stats don't cover these reads (CLI shows 0 disk bytes).
-  Only local, flat-at-root repos are wired today; the scan stays single-partition
-  (the sync outer-selection resolver can't drive the cached async store yet).
-  Remote (anonymous GCS/S3, incl. the S3-anon container workaround), group
-  addressing (e.g. CIRA's `/FOUR_v200_GFS`), and partitioned icechunk scans are
-  follow-ups.
+  Scans stay single-partition (the outer-selection resolver can't drive the cached
+  async store yet). The flatten-to-one-batch model means an unfiltered scan over a
+  huge cube OOMs — callers must filter every coordinate of the variable they read
+  (a query-time cube restriction / streaming-by-variable model is the real fix).
+  Partitioned icechunk scans, non-anonymous credential plumbing beyond a simple
+  flag, and writing remain follow-ups.
 
 ---
 

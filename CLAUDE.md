@@ -31,14 +31,44 @@ cargo test  --features icechunk --test integration_icechunk   # local icechunk q
 cargo run --features icechunk --bin zarr-cli -- \
   -c "CREATE EXTERNAL TABLE syn STORED AS ZARR LOCATION 'data/synthetic.icechunk';
       SELECT COUNT(*) FROM syn;"
+
+# Query a REMOTE icechunk repo (public, anonymous). LOCATION is the repo root;
+# OPTIONS('group' ...) selects a subgroup. Filter every coordinate of the target
+# variable so the read stays tiny (see the OOM caveat below):
+cargo run --features icechunk --bin zarr-cli -- \
+  -c "CREATE EXTERNAL TABLE cira STORED AS ZARR
+        LOCATION 'gs://extremeweatherbench/cira-icechunk'
+        OPTIONS ('group' 'FOUR_v200_GFS');
+      SELECT t2 FROM cira
+        WHERE init_time = TIMESTAMP '2020-09-30T12:00:00Z'
+          AND lead_time = 0 AND latitude = 40.0 AND longitude = 280.0;"
+# The network-gated remote test is #[ignore]'d; run it explicitly with:
+#   cargo test --features icechunk --test integration_icechunk -- --ignored remote_cira
 ```
 
-Detection is automatic: `LOCATION` pointing at an icechunk repo (a dir with
-`snapshots/` + a `repo` marker) is opened read-only at its `main` branch tip and
-exposed as a zarrs async store, reusing the normal async schema-inference/read
-path. Only local, flat-at-root repos work today (see `docs/design-decisions.md`);
-remote (GCS/S3) and grouped repos are follow-ups. Icechunk does its own object
-I/O, so the CLI's "disk bytes" stat reads 0 for these queries.
+Detection is automatic for both local and remote:
+- **Local**: `LOCATION` is a dir with `snapshots/` + a `repo` marker.
+- **Remote** (`gs://` / `s3://`): probed on the object store for a `snapshots/`
+  or `refs/` child under the repo prefix.
+
+Either is opened read-only at its `main` branch tip and exposed as a zarrs async
+store, reusing the normal async schema-inference/read path. Remote repos open
+**anonymously** by default (target: public archives like ExtremeWeatherBench);
+pass `OPTIONS('anonymous' 'false')` to use environment credentials instead. For a
+repo whose data-variable chunks are virtual references into archival HDF5 on S3
+(e.g. CIRA → `s3://noaa-oar-mlwp-data/`), we rewrite the persisted S3 containers to
+`anonymous: true` (working around an icechunk 2.1.0 skip-signature bug — see
+`examples/icechunk_read_cira.rs`). Icechunk does its own object I/O, so the CLI's
+"disk bytes" stat reads 0.
+
+**OOM caveat**: the scan flattens the selected variable's full coordinate cube
+into one batch, so an unfiltered `SELECT` (or one with `ORDER BY` but no filter)
+over a large store like CIRA (a ~173-billion-row surface cube) will OOM. Filter
+every coordinate of the variable you read (or read coordinate columns alone with a
+plain `LIMIT`, which takes the coordinate-only fast path). Note the store is
+**mixed-dimensionality** (surface vars are 4-D, pressure-level vars are 5-D with
+`level`), which works only because arrays carry native V3 `dimension_names`; see
+`docs/design-decisions.md` §14b.
 
 ## Architecture
 
