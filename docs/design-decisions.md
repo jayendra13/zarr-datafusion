@@ -220,15 +220,17 @@ Commit hashes point at the change that introduced or settled the decision.
 ### 18b. Multi-axis (N-D box) partition fan-out when the outer axis under-parallelizes
 - **Decision:** When splitting the outer axis alone yields fewer partitions than
   `target_partitions` (its chunk grid is coarse — e.g. a single-chunked time axis),
-  the planner (`fan_out_inner` in `datasource/zarr.rs`) also splits the best *inner*
-  axis and emits the Cartesian product as **box partitions**. `PartitionSpec` gains
-  `extra: Vec<(coord_index, CoordSelection)>` — the inner-axis restrictions
-  (`#[serde(default)]` for distributed-codec back-compat); the reader
+  the planner (`fan_out_inner` in `datasource/zarr.rs`) also splits one or more
+  *inner* axes and emits the Cartesian product as **N-D box partitions**.
+  `PartitionSpec` gains `extra: Vec<(coord_index, CoordSelection)>` — the inner-axis
+  restrictions (`#[serde(default)]` for distributed-codec back-compat); the reader
   (`apply_partition_selection`) restricts every listed coordinate, not just the
-  outer. The "best" inner axis is the unfiltered one with the most chunks (`>1`),
-  mapped via `dimension_names`; the split is geometric and **metadata-only** (no
-  coordinate reads). Total partitions never exceed `target_partitions` and never
-  split a chunk across partitions.
+  outer. Candidate inner axes are the unfiltered, multiply-chunked ones (mapped via
+  `dimension_names`), split **most-chunked first, greedily**, until the inner budget
+  (`target_partitions / p_outer`) is spent — so a cube whose axes are individually too
+  coarse (e.g. lat=4 chunks, lon=2) can still fill the machine (4×2 boxes). The split
+  is geometric and **metadata-only** (no coordinate reads). Total partitions never
+  exceed `target_partitions` and never split a chunk across partitions.
 - **Rationale:** Outer-only partitioning (§16) leaves the machine idle whenever the
   outer chunk grid is coarser than the core count — the pathological case is a
   single outer chunk (one partition, no parallelism) over an array whose inner axes

@@ -286,12 +286,17 @@ fn coord_index_for_axis(
 /// partitions than `target`.
 ///
 /// `outer_specs` are the outer-only partitions already planned. If they under-fill
-/// the parallelism target and an *unfiltered*, multiply-chunked inner axis exists,
-/// this splits that axis geometrically and returns the Cartesian product
-/// (`outer × inner`) as box partitions — never exceeding `target`, never splitting
-/// a chunk across partitions. Metadata-only: no coordinate reads. Declines (returns
-/// `outer_specs` unchanged) for a limited/empty plan, when already at target, when
-/// dimension names are missing, or when no inner axis offers extra parallelism.
+/// the parallelism target, this splits one or more *unfiltered*, multiply-chunked
+/// inner axes geometrically and returns the Cartesian product
+/// (`outer × inner₁ × inner₂ × …`) as N-D box partitions — never exceeding
+/// `target`, never splitting a chunk across partitions. Inner axes are split most-
+/// chunked first, greedily, until the inner budget (`target / p_outer`) is used up,
+/// so a cube whose axes are individually too coarse can still fill the machine.
+/// Metadata-only: no coordinate reads. Skips filtered axes (their surviving set
+/// isn't resolved here, and `extra` would overwrite the filter selection — see H2).
+/// Declines (returns `outer_specs` unchanged) for a limited/empty plan, when already
+/// at target, when dimension names are missing, or when no inner axis offers extra
+/// parallelism.
 fn fan_out_inner(
     outer_specs: Vec<PartitionSpec>,
     meta: &ZarrStoreMeta,
@@ -310,10 +315,10 @@ fn fan_out_inner(
         return outer_specs;
     }
 
-    // Choose the inner axis (any axis but 0) that is unfiltered and offers the most
+    // Gather candidate inner axes (any axis but 0) that are unfiltered and offer
     // chunk-level parallelism (>1 chunk). Skip filtered axes: their surviving set
     // isn't resolved here, and `extra` would overwrite the filter selection.
-    let mut best: Option<(usize, usize, u64, u64)> = None; // (coord_idx, n_chunks, extent, chunk_len)
+    let mut candidates: Vec<(usize, usize, u64, u64)> = Vec::new(); // (coord_idx, n_chunks, extent, chunk_len)
     for axis in 1..data_var.shape.len() {
         let Some(coord_idx) = coord_index_for_axis(data_var, axis, meta) else {
             continue;
@@ -330,31 +335,58 @@ fn fan_out_inner(
             .unwrap_or(extent)
             .max(1);
         let n_chunks = extent.div_ceil(chunk_len) as usize;
-        if n_chunks > 1 && best.is_none_or(|(_, best_n, _, _)| n_chunks > best_n) {
-            best = Some((coord_idx, n_chunks, extent, chunk_len));
+        if n_chunks > 1 {
+            candidates.push((coord_idx, n_chunks, extent, chunk_len));
         }
     }
-    let Some((inner_coord_idx, _, extent, chunk_len)) = best else {
-        return outer_specs;
-    };
+    // Most-chunked first (deterministic tie-break by coord index).
+    candidates.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
 
-    // Geometry-split the inner axis into <= inner_budget chunk-aligned pieces.
-    let inner_pieces: Vec<CoordSelection> = plan_partitions(extent, chunk_len, inner_budget)
-        .into_iter()
-        .map(|p| p.outer)
-        .collect();
-    if inner_pieces.len() <= 1 {
+    // Greedily split axes until the inner budget is spent. `acc` is the running
+    // product of the splits chosen so far; `allowed` is how many more factors we
+    // may still multiply in without exceeding the budget.
+    let mut split_axes: Vec<(usize, Vec<CoordSelection>)> = Vec::new();
+    let mut acc = 1usize;
+    for (coord_idx, n_chunks, extent, chunk_len) in candidates {
+        let allowed = inner_budget / acc;
+        if allowed <= 1 {
+            break;
+        }
+        let k = n_chunks.min(allowed);
+        let pieces: Vec<CoordSelection> = plan_partitions(extent, chunk_len, k)
+            .into_iter()
+            .map(|p| p.outer)
+            .collect();
+        if pieces.len() <= 1 {
+            continue;
+        }
+        acc *= pieces.len();
+        split_axes.push((coord_idx, pieces));
+    }
+    if split_axes.is_empty() {
         return outer_specs;
     }
 
-    // Cartesian product: each outer slice × each inner piece becomes a box.
-    let mut boxes = Vec::with_capacity(p_outer * inner_pieces.len());
+    // Cartesian product of the per-axis piece lists -> one `extra` list per inner
+    // box (each entry a distinct coordinate's chunk-aligned slice).
+    let mut inner_combos: Vec<Vec<(usize, CoordSelection)>> = vec![Vec::new()];
+    for (coord_idx, pieces) in &split_axes {
+        let mut next = Vec::with_capacity(inner_combos.len() * pieces.len());
+        for combo in &inner_combos {
+            for piece in pieces {
+                let mut c = combo.clone();
+                c.push((*coord_idx, piece.clone()));
+                next.push(c);
+            }
+        }
+        inner_combos = next;
+    }
+
+    // Each outer slice × each inner box.
+    let mut boxes = Vec::with_capacity(p_outer * inner_combos.len());
     for outer in &outer_specs {
-        for inner in &inner_pieces {
-            boxes.push(
-                PartitionSpec::from_outer(outer.outer.clone())
-                    .with_extra(vec![(inner_coord_idx, inner.clone())]),
-            );
+        for combo in &inner_combos {
+            boxes.push(PartitionSpec::from_outer(outer.outer.clone()).with_extra(combo.clone()));
         }
     }
     boxes
@@ -699,12 +731,43 @@ mod fanout_tests {
     #[test]
     fn single_outer_chunk_parallelizes_on_inner() {
         // The headline case: outer axis is one chunk -> without fan-out this is a
-        // single partition; with it, we split the multi-chunk inner axis.
+        // single partition; with it, we fan out across the inner axes. Budget 8,
+        // lat has 4 chunks and lon has 2, so N-D fan-out uses both: 4 × 2 = 8.
         let dv = data_var(&["time", "lat", "lon"], &[1, 721, 1440], &[1, 181, 720]);
         let m = meta(vec![coord("time", 1), coord("lat", 721), coord("lon", 1440)], &dv);
         let outer1 = vec![PartitionSpec::range(0, 1)];
         let out = fan_out_inner(outer1, &m, &dv, None, 8);
-        assert_eq!(out.len(), 4, "1 outer × 4 lat chunks (budget 8 caps at chunks)");
+        assert_eq!(out.len(), 8, "1 outer × (4 lat × 2 lon)");
+        assert!(out.iter().all(|b| b.extra.len() == 2), "boxes span 2 inner axes");
+    }
+
+    #[test]
+    fn nd_fan_out_splits_multiple_inner_axes_most_chunked_first() {
+        // Two splittable inner axes; budget lets us use both. lat (4 chunks) is
+        // split before lon (2) — most-chunked first — and the product caps at budget.
+        let dv = data_var(&["time", "lat", "lon"], &[2, 721, 1440], &[1, 181, 720]);
+        let m = meta(vec![coord("time", 2), coord("lat", 721), coord("lon", 1440)], &dv);
+        // 2 outer × budget 8 (target 16 / p_outer 2 = 8) => lat 4 × lon 2 = 8 inner.
+        let outer = vec![PartitionSpec::range(0, 1), PartitionSpec::range(1, 2)];
+        let out = fan_out_inner(outer, &m, &dv, None, 16);
+        assert_eq!(out.len(), 16, "2 outer × 4 lat × 2 lon");
+        // Every box restricts both inner axes; coord indices are lat(1) and lon(2).
+        for b in &out {
+            assert_eq!(b.extra.len(), 2);
+            let idxs: Vec<usize> = b.extra.iter().map(|(i, _)| *i).collect();
+            assert_eq!(idxs, vec![1, 2], "lat then lon (most-chunked first)");
+        }
+    }
+
+    #[test]
+    fn nd_fan_out_stops_at_budget() {
+        // Budget only affords one extra factor beyond the first axis: lat (4) alone
+        // fills budget 4, so lon is NOT split.
+        let dv = data_var(&["time", "lat", "lon"], &[1, 721, 1440], &[1, 181, 720]);
+        let m = meta(vec![coord("time", 1), coord("lat", 721), coord("lon", 1440)], &dv);
+        let out = fan_out_inner(vec![PartitionSpec::range(0, 1)], &m, &dv, None, 4);
+        assert_eq!(out.len(), 4, "1 outer × 4 lat; budget 4 spent on lat alone");
+        assert!(out.iter().all(|b| b.extra.len() == 1));
     }
 
     #[test]

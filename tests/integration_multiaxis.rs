@@ -51,6 +51,49 @@ async fn single_partition_when_target_matches_outer() {
 }
 
 #[tokio::test]
+async fn fans_out_across_multiple_inner_axes() {
+    // With a high enough target the fan-out spans several inner axes (N-D boxes).
+    // temperature[time=3, hybrid=2, latitude=721, longitude=1440] chunked
+    // [1,1,181,720] => outer time=3; inner_budget=24/3=8; latitude(4)×hybrid(2)=8.
+    let ctx = ctx_with_target(24);
+    register_zarr_table(&ctx, "era5", ERA5_V3);
+    let plan = get_physical_plan(&ctx, "SELECT temperature FROM era5").await;
+    let zarr = find_zarr_exec(&plan).expect("plan contains a ZarrExec");
+    assert_eq!(
+        zarr.partitions().len(),
+        24,
+        "expected 3 outer × (4 lat × 2 hybrid) = 24 partitions"
+    );
+    assert!(
+        zarr.partitions().iter().all(|p| p.extra.len() == 2),
+        "each N-D box restricts two inner axes"
+    );
+}
+
+#[tokio::test]
+async fn nd_fan_out_is_value_transparent() {
+    // A multi-inner-axis fan-out must still tile the cube exactly.
+    let sql = "SELECT CAST(SUM(temperature) AS DOUBLE) AS s, COUNT(*) AS c \
+               FROM era5 WHERE longitude = 0.0";
+
+    let single = ctx_with_target(1);
+    register_zarr_table(&single, "era5", ERA5_V3);
+    let base = execute_query(&single, sql).await;
+
+    let fanned = ctx_with_target(24);
+    register_zarr_table(&fanned, "era5", ERA5_V3);
+    let plan = get_physical_plan(&fanned, "SELECT temperature FROM era5 WHERE longitude = 0.0").await;
+    let boxes = find_zarr_exec(&plan).unwrap();
+    assert!(
+        boxes.partitions().iter().any(|p| p.extra.len() >= 2),
+        "expected N-D boxes (≥2 inner axes) under target 24"
+    );
+
+    let got = execute_query(&fanned, sql).await;
+    assert_eq!(format!("{:?}", base), format!("{:?}", got));
+}
+
+#[tokio::test]
 async fn fan_out_is_value_transparent() {
     // The same aggregate must be identical whether the scan runs single-partition
     // or fanned out into inner-axis boxes — proving the boxes tile the cube exactly
