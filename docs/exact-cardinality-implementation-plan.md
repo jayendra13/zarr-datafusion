@@ -301,13 +301,20 @@ gate the core.
 
 **Work.**
 - `backend/isl.rs`: implement `IndexSet` over `isl` sets; `cardinality` via
-  `isl_set_card` (barvinok) → evaluate the piecewise quasi-polynomial at the known
-  extents. `apply` becomes real (affine maps via `isl_map`).
+  `isl_set_count_val` for bounded sets (or `isl_set_card` → evaluate the piecewise
+  quasi-polynomial at the known extents for parametric families). `apply` becomes
+  real (affine maps via `isl_map`).
 - Gate behind cargo feature `polyhedral` (off by default). Without it, a coupled
   predicate falls back to a conservative upper bound (product of axis extents) and
   the optimizer skips the exact-count-dependent decision rather than failing.
-- Prototype path first: shell out to `iscc` to de-risk before committing to
-  `bindgen`/`isl-rs` FFI (see `isl-theory-primer.md`).
+- **FFI/linking de-risked (spike done, glibc):** a one-function C shim + `build.rs`
+  (`static=barvinok,isl` + `dylib=gmp,ntl,stdc++`) links and counts a coupled band
+  exactly from Rust. Prefer this shim over `isl-rs` (dodges isl-version skew).
+  **Corrections from the spike:** modern barvinok **requires NTL** (C++) — there is
+  no `--without-ntl`; and **static-musl (the CLI release target) is not viable as-is**
+  (no musl toolchain + glibc-built chain; NTL/C++ is the blocker) → ship `polyhedral`
+  glibc-only, or drop NTL via an older barvinok first. Full recipe + verdicts:
+  [`isl-theory-primer.md`](isl-theory-primer.md).
 
 **What we achieve.** Exact cardinality for the non-separable cases where
 product-of-extents is meaningless — coupled/diagonal/join predicates — without any
@@ -352,8 +359,9 @@ product-of-extents and are the ones worth building for; the triangle (5-full) an
   `Statistics`* first — until that small bridge exists, the join plan is byte-identical
   and only Level 1 differs.
 
-**Effort deconstruction.** W1 — `barvinok → isl → GMP` build/FFI (M–L, **high** risk,
-static-musl CLI especially; `iscc` prototype first). W2 — `backend/isl.rs` (M;
+**Effort deconstruction.** W1 — `barvinok → isl → GMP (+ NTL, C++)` build/FFI —
+**glibc de-risked** (spike: builds, links, counts a coupled band from Rust); the
+remaining W1 risk is **static-musl** (not viable as-is — see the primer verdicts). W2 — `backend/isl.rs` (M;
 `touched_tiles` under floor-division is the fiddly method). W3 — *the consumer gap*
 (M–L): nothing produces coupled predicates today (filters are `coord op value`) and the
 reader can't read non-box selections, so a value-delivering Phase 8 also needs a
