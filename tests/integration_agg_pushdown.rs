@@ -110,8 +110,18 @@ fn contains_node<T: ExecutionPlan + 'static>(plan: &Arc<dyn ExecutionPlan>) -> b
 
 async fn run(ctx: &SessionContext, sql: &str) -> String {
     register_zarr_table(ctx, "t", SYNTHETIC_V3);
-    let batch = execute_query_single(ctx, sql).await;
-    format!("{batch:?}")
+    let batches = execute_query(ctx, sql).await;
+    // Compare on the rendered table: `pretty_format_batches` decodes dictionary
+    // columns to their values (so different dict encodings compare equal) and is
+    // independent of how rows are split across batches. Zero rows (empty grouped
+    // selection: 0 batches vs. one 0-row batch) canonicalizes to a single token.
+    let total: usize = batches.iter().map(|b| b.num_rows()).sum();
+    if total == 0 {
+        return "EMPTY".to_string();
+    }
+    arrow::util::pretty::pretty_format_batches(&batches)
+        .unwrap()
+        .to_string()
 }
 
 #[tokio::test]
@@ -144,6 +154,40 @@ async fn global_aggregates_are_value_equivalent() {
         "SELECT SUM(temperature) AS v FROM t WHERE lat = -10.0",
         // Empty selection — aggregates of nothing.
         "SELECT SUM(temperature) AS s, COUNT(*) AS c, MIN(temperature) AS m FROM t WHERE time = 99999",
+    ];
+    for sql in queries {
+        let baseline = run(&SessionContext::new(), sql).await;
+        let pushed = run(&ctx_pushdown(), sql).await;
+        assert_eq!(baseline, pushed, "value mismatch for `{sql}`");
+    }
+}
+
+// ---- Phase 7.4: GROUP BY coordinate axis ----
+
+#[tokio::test]
+async fn group_by_coordinate_rewritten_to_zarr_aggregate() {
+    let ctx = ctx_pushdown();
+    register_zarr_table(&ctx, "t", SYNTHETIC_V3);
+    let plan = get_physical_plan(&ctx, "SELECT lat, AVG(temperature) AS a FROM t GROUP BY lat").await;
+    assert!(contains_node::<ZarrAggregateExec>(&plan));
+    assert!(!contains_node::<AggregateExec>(&plan));
+}
+
+#[tokio::test]
+async fn group_by_coordinate_is_value_equivalent() {
+    // ORDER BY makes the (otherwise unordered) grouped output deterministic so the
+    // pushed and baseline results compare directly.
+    let queries = [
+        "SELECT lat, COUNT(*) AS c FROM t GROUP BY lat ORDER BY lat",
+        "SELECT lat, AVG(temperature) AS a FROM t GROUP BY lat ORDER BY lat",
+        "SELECT lat, SUM(temperature) AS s, MIN(temperature) AS mn, MAX(temperature) AS mx \
+         FROM t GROUP BY lat ORDER BY lat",
+        // Two grouping coordinates (100 groups).
+        "SELECT lat, lon, AVG(temperature) AS a FROM t GROUP BY lat, lon ORDER BY lat, lon",
+        // Group by the outer coordinate under a filter on another.
+        "SELECT time, SUM(temperature) AS s FROM t WHERE lat = 5 GROUP BY time ORDER BY time",
+        // Empty grouped selection => zero groups on both sides.
+        "SELECT lat, COUNT(*) AS c FROM t WHERE time = 99999 GROUP BY lat ORDER BY lat",
     ];
     for sql in queries {
         let baseline = run(&SessionContext::new(), sql).await;

@@ -112,15 +112,19 @@ impl CardinalityRule {
         }
         let (inner_agg, zarr) = descend_to_zarr(plan, None)?;
         let cand = recognize(inner_agg, zarr)?;
-        if !cand.group_keys.is_empty() {
-            return None; // GROUP BY is Phase 7.4/7.5.
-        }
+        // Global (7.3) and coordinate GROUP BY (7.4) are handled; the recognizer only
+        // yields coordinate-axis group keys (periodic is 7.5).
         let meta = zarr.store_meta()?;
         if max_group_count(&cand, meta) > max_groups() {
-            return None;
+            return None; // group table wouldn't fit — leave it to DataFusion.
         }
         let input: Arc<dyn ExecutionPlan> = Arc::new(zarr.clone());
-        Some(Arc::new(ZarrAggregateExec::new(input, cand.aggs, top.schema())))
+        Some(Arc::new(ZarrAggregateExec::new(
+            input,
+            cand.group_names,
+            cand.aggs,
+            top.schema(),
+        )))
     }
 
     /// Recursively stamp every `ZarrExec` with the budget; leave all else untouched.

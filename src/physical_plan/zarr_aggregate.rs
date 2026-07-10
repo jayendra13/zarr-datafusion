@@ -1,16 +1,18 @@
-//! `ZarrAggregateExec` — global aggregate pushdown (Phase 7.3).
+//! `ZarrAggregateExec` — aggregate pushdown (Phases 7.3 global, 7.4 GROUP BY coord).
 //!
-//! A recognized `SUM`/`COUNT`/`AVG`/`MIN`/`MAX` over a `ZarrExec` with no `GROUP BY`
-//! is rewritten (by [`crate::optimizer::CardinalityRule`]) into this operator, which
-//! **replaces the whole `AggregateExec ← ZarrExec` subtree**. It drives the
-//! (data-variable-projected, streaming) `ZarrExec` child and folds its batches into
-//! accumulators instead of letting DataFusion hash-aggregate flattened rows — the
-//! group count is exactly 1, so the fold is trivially memory-bounded. Emits a single
-//! final row in the aggregate's output schema.
+//! A recognized `SUM`/`COUNT`/`AVG`/`MIN`/`MAX` over a `ZarrExec` — with no `GROUP BY`
+//! (7.3) or grouped on coordinate columns (7.4) — is rewritten (by
+//! [`crate::optimizer::CardinalityRule`]) into this operator, which **replaces the
+//! whole `AggregateExec ← ZarrExec` subtree**. It drives the (projected, streaming)
+//! `ZarrExec` child and folds its batches into per-group accumulators instead of
+//! letting DataFusion hash-aggregate flattened rows. The group count is computed
+//! exactly (`group_cardinality`) and admitted against a budget, so the group table is
+//! known to fit. Emits one row per group in the aggregate's output schema
+//! (`[group cols…, agg cols…]`).
 //!
-//! This is the self-contained "approach A" foundation; `GROUP BY` (per-axis and
-//! periodic) builds on it in Phases 7.4/7.5.
+//! Periodic grouping (month-of-time, …) is Phase 7.5.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use arrow::array::{Array, ArrayRef, Float64Array, Int64Array};
@@ -25,6 +27,7 @@ use datafusion::physical_plan::{
     DisplayAs, DisplayFormatType, ExecutionPlan, Partitioning, PlanProperties,
     SendableRecordBatchStream,
 };
+use datafusion::scalar::ScalarValue;
 use futures::TryStreamExt;
 
 use crate::optimizer::cardinality::pushdown::{AggKind, AggSpec};
@@ -47,21 +50,45 @@ impl Acc {
         self.min = Some(self.min.map_or(v, |m| m.min(v)));
         self.max = Some(self.max.map_or(v, |m| m.max(v)));
     }
+
+    /// The finalized value as the aggregate's *natural* array (one element), before
+    /// casting to DataFusion's declared output type.
+    fn finalize_one(&self, kind: AggKind) -> ArrayRef {
+        match kind {
+            AggKind::Count => Arc::new(Int64Array::from(vec![self.count as i64])),
+            AggKind::Sum => Arc::new(Float64Array::from(vec![(self.count > 0).then_some(self.sum)])),
+            AggKind::Avg => Arc::new(Float64Array::from(vec![
+                (self.count > 0).then(|| self.sum / self.count as f64),
+            ])),
+            AggKind::Min => Arc::new(Float64Array::from(vec![self.min])),
+            AggKind::Max => Arc::new(Float64Array::from(vec![self.max])),
+        }
+    }
 }
 
-/// Physical operator: fold a `ZarrExec` scan into one row of global aggregates.
+/// The accumulator set for one group (parallel to the aggregate list).
+type Group = Vec<Acc>;
+
+/// Physical operator: fold a `ZarrExec` scan into grouped aggregates.
 pub struct ZarrAggregateExec {
-    /// The scan to read (already projected to the aggregates' argument columns).
+    /// The scan to read (already projected to the group + aggregate columns).
     input: Arc<dyn ExecutionPlan>,
-    /// Aggregates to compute, in the output schema's column order.
+    /// `GROUP BY` coordinate column names, in output-schema order. Empty => global.
+    group_cols: Vec<String>,
+    /// Aggregates to compute, in output-schema order (after the group columns).
     aggs: Vec<AggSpec>,
-    /// The aggregate's output schema (one row).
+    /// The aggregate's output schema: `[group cols…, agg cols…]`.
     schema: SchemaRef,
     properties: Arc<PlanProperties>,
 }
 
 impl ZarrAggregateExec {
-    pub fn new(input: Arc<dyn ExecutionPlan>, aggs: Vec<AggSpec>, schema: SchemaRef) -> Self {
+    pub fn new(
+        input: Arc<dyn ExecutionPlan>,
+        group_cols: Vec<String>,
+        aggs: Vec<AggSpec>,
+        schema: SchemaRef,
+    ) -> Self {
         let properties = Arc::new(PlanProperties::new(
             EquivalenceProperties::new(schema.clone()),
             Partitioning::UnknownPartitioning(1),
@@ -70,85 +97,168 @@ impl ZarrAggregateExec {
         ));
         Self {
             input,
+            group_cols,
             aggs,
             schema,
             properties,
         }
     }
 
-    /// Fold one input batch into `accs` (parallel to `self.aggs`).
-    // TODO(phase7): folds the streamed one-column data batches, so the reader still
-    // materializes each window's data column. A bespoke chunk-fold reader (fold during
-    // decode, never building an Arrow column) would be strictly leaner — modest win
-    // for the global case, larger once GROUP BY (7.4/7.5) avoids the coordinate column.
-    fn fold_batch(accs: &mut [Acc], aggs: &[AggSpec], batch: &RecordBatch) -> Result<()> {
-        for (i, spec) in aggs.iter().enumerate() {
-            match (spec.kind, spec.column.as_deref()) {
-                // COUNT(*) counts every row.
-                (AggKind::Count, None) => accs[i].count += batch.num_rows() as u128,
-                (kind, Some(name)) => {
+    fn new_group(&self) -> Group {
+        vec![Acc::default(); self.aggs.len()]
+    }
+
+    /// Fold one aggregate at `row` of its (pre-cast) column into `acc`.
+    fn fold_cell(acc: &mut Acc, kind: AggKind, col: Option<&Float64Array>, row: usize) {
+        match (kind, col) {
+            (AggKind::Count, None) => acc.count += 1, // COUNT(*)
+            (AggKind::Count, Some(a)) => {
+                if a.is_valid(row) {
+                    acc.count += 1; // COUNT(col): non-null only
+                }
+            }
+            (_, Some(a)) => {
+                if a.is_valid(row) {
+                    acc.push(a.value(row));
+                }
+            }
+            (_, None) => {} // non-count without a column — recognizer never emits this
+        }
+    }
+
+    /// Fold one batch into `groups`.
+    // TODO(phase7): folds the streamed data batches, so the reader still materializes
+    // each window's data column, and (grouped) builds the coordinate column. A bespoke
+    // chunk-fold reader keyed on the axis index would avoid both.
+    fn fold_batch(
+        &self,
+        groups: &mut HashMap<Vec<ScalarValue>, Group>,
+        batch: &RecordBatch,
+    ) -> Result<()> {
+        // Cast each aggregate's argument column to f64 once per batch (None = COUNT(*)).
+        let agg_cols: Vec<Option<Float64Array>> = self
+            .aggs
+            .iter()
+            .map(|spec| match spec.column.as_deref() {
+                None => Ok(None),
+                Some(name) => {
                     let array = batch.column_by_name(name).ok_or_else(|| {
                         DataFusionError::Internal(format!("aggregate column {name} not in scan"))
                     })?;
                     let f64arr = arrow::compute::cast(array, &DataType::Float64)?;
-                    let vals = f64arr
-                        .as_any()
-                        .downcast_ref::<Float64Array>()
-                        .expect("cast to Float64");
-                    match kind {
-                        // COUNT(col) counts non-null values only.
-                        AggKind::Count => accs[i].count += (vals.len() - vals.null_count()) as u128,
-                        _ => {
-                            for j in 0..vals.len() {
-                                if vals.is_valid(j) {
-                                    accs[i].push(vals.value(j));
-                                }
-                            }
-                        }
-                    }
-                }
-                // Non-count aggregate with no column — recognizer never emits this.
-                (_, None) => {
-                    return Err(DataFusionError::Internal(
-                        "non-count aggregate without a column".into(),
+                    Ok(Some(
+                        f64arr
+                            .as_any()
+                            .downcast_ref::<Float64Array>()
+                            .expect("cast to Float64")
+                            .clone(),
                     ))
                 }
+            })
+            .collect::<Result<_>>()?;
+
+        // Global (no GROUP BY): one accumulator set, no per-row keying.
+        if self.group_cols.is_empty() {
+            let group = groups.get_mut(&Vec::new()).expect("global group pre-inserted");
+            for (i, spec) in self.aggs.iter().enumerate() {
+                for row in 0..batch.num_rows() {
+                    Self::fold_cell(&mut group[i], spec.kind, agg_cols[i].as_ref(), row);
+                }
+            }
+            return Ok(());
+        }
+
+        // Grouped: key each row by its group-column values.
+        let group_arrays: Vec<&ArrayRef> = self
+            .group_cols
+            .iter()
+            .map(|name| {
+                batch.column_by_name(name).ok_or_else(|| {
+                    DataFusionError::Internal(format!("group column {name} not in scan"))
+                })
+            })
+            .collect::<Result<_>>()?;
+
+        for row in 0..batch.num_rows() {
+            let key: Vec<ScalarValue> = group_arrays
+                .iter()
+                .map(|arr| ScalarValue::try_from_array(arr, row))
+                .collect::<Result<_>>()?;
+            let group = groups.entry(key).or_insert_with(|| self.new_group());
+            for (i, spec) in self.aggs.iter().enumerate() {
+                Self::fold_cell(&mut group[i], spec.kind, agg_cols[i].as_ref(), row);
             }
         }
         Ok(())
     }
 
-    /// Build the single output row from finalized accumulators.
-    fn finalize(schema: &SchemaRef, aggs: &[AggSpec], accs: &[Acc]) -> Result<RecordBatch> {
-        let mut columns: Vec<ArrayRef> = Vec::with_capacity(aggs.len());
-        for (i, spec) in aggs.iter().enumerate() {
-            let acc = &accs[i];
-            let natural: ArrayRef = match spec.kind {
-                AggKind::Count => Arc::new(Int64Array::from(vec![acc.count as i64])),
-                AggKind::Sum => Arc::new(Float64Array::from(vec![(acc.count > 0).then_some(acc.sum)])),
-                AggKind::Avg => Arc::new(Float64Array::from(vec![
-                    (acc.count > 0).then(|| acc.sum / acc.count as f64),
-                ])),
-                AggKind::Min => Arc::new(Float64Array::from(vec![acc.min])),
-                AggKind::Max => Arc::new(Float64Array::from(vec![acc.max])),
-            };
-            // Match DataFusion's declared output type (e.g. SUM(int64) -> Int64).
-            let field_ty = schema.field(i).data_type();
-            let col = if natural.data_type() == field_ty {
-                natural
+    /// Build the output batch: one row per group, `[group cols…, agg cols…]`.
+    fn finalize(&self, groups: &HashMap<Vec<ScalarValue>, Group>) -> Result<RecordBatch> {
+        let n_group = self.group_cols.len();
+        // Fix a stable group order (map iteration order, materialized once).
+        let keys: Vec<&Vec<ScalarValue>> = groups.keys().collect();
+
+        let mut columns: Vec<ArrayRef> = Vec::with_capacity(n_group + self.aggs.len());
+
+        // Group columns from the keys (empty when no group survived the selection).
+        for j in 0..n_group {
+            let field_ty = self.schema.field(j).data_type();
+            let col = if keys.is_empty() {
+                arrow::array::new_empty_array(field_ty)
             } else {
-                arrow::compute::cast(&natural, field_ty)?
+                let arr = ScalarValue::iter_to_array(keys.iter().map(|k| k[j].clone()))?;
+                cast_to(&arr, field_ty)?
             };
             columns.push(col);
         }
-        RecordBatch::try_new(schema.clone(), columns)
+
+        // Aggregate columns: finalize each group, concatenate.
+        for (i, spec) in self.aggs.iter().enumerate() {
+            let per_group: Vec<ArrayRef> = keys
+                .iter()
+                .map(|k| groups[*k][i].finalize_one(spec.kind))
+                .collect();
+            let refs: Vec<&dyn Array> = per_group.iter().map(|a| a.as_ref()).collect();
+            let natural = if refs.is_empty() {
+                // No groups (e.g. empty grouped selection): an empty column.
+                spec.kind.empty_array()
+            } else {
+                arrow::compute::concat(&refs).map_err(|e| DataFusionError::ArrowError(Box::new(e), None))?
+            };
+            columns.push(cast_to(&natural, self.schema.field(n_group + i).data_type())?);
+        }
+
+        RecordBatch::try_new(self.schema.clone(), columns)
             .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))
+    }
+}
+
+impl AggKind {
+    /// A zero-row array of this aggregate's natural type (for the no-groups case).
+    fn empty_array(self) -> ArrayRef {
+        match self {
+            AggKind::Count => Arc::new(Int64Array::from(Vec::<i64>::new())),
+            _ => Arc::new(Float64Array::from(Vec::<Option<f64>>::new())),
+        }
+    }
+}
+
+/// Cast `arr` to `ty` only when needed (identity types skip the copy).
+fn cast_to(arr: &ArrayRef, ty: &DataType) -> Result<ArrayRef> {
+    if arr.data_type() == ty {
+        Ok(arr.clone())
+    } else {
+        Ok(arrow::compute::cast(arr, ty)?)
     }
 }
 
 impl std::fmt::Debug for ZarrAggregateExec {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "ZarrAggregateExec(aggs={:?})", self.aggs)
+        write!(
+            f,
+            "ZarrAggregateExec(group={:?}, aggs={:?})",
+            self.group_cols, self.aggs
+        )
     }
 }
 
@@ -159,7 +269,16 @@ impl DisplayAs for ZarrAggregateExec {
             .iter()
             .map(|a| format!("{:?}({})", a.kind, a.column.as_deref().unwrap_or("*")))
             .collect();
-        write!(f, "ZarrAggregateExec: {}", names.join(", "))
+        if self.group_cols.is_empty() {
+            write!(f, "ZarrAggregateExec: {}", names.join(", "))
+        } else {
+            write!(
+                f,
+                "ZarrAggregateExec: {} GROUP BY [{}]",
+                names.join(", "),
+                self.group_cols.join(", ")
+            )
+        }
     }
 }
 
@@ -182,6 +301,7 @@ impl ExecutionPlan for ZarrAggregateExec {
     ) -> Result<Arc<dyn ExecutionPlan>> {
         Ok(Arc::new(ZarrAggregateExec::new(
             children[0].clone(),
+            self.group_cols.clone(),
             self.aggs.clone(),
             self.schema.clone(),
         )))
@@ -197,24 +317,32 @@ impl ExecutionPlan for ZarrAggregateExec {
                 "ZarrAggregateExec has one output partition, got {partition}"
             )));
         }
+        // Clone the small config into the fold future.
+        let this = ZarrAggregateExec::new(
+            self.input.clone(),
+            self.group_cols.clone(),
+            self.aggs.clone(),
+            self.schema.clone(),
+        );
         let input = self.input.clone();
-        let aggs = self.aggs.clone();
-        let schema = self.schema.clone();
         let n_in = input.properties().output_partitioning().partition_count();
 
         let fut = async move {
-            let mut accs = vec![Acc::default(); aggs.len()];
-            // Fold every input partition into the single group.
+            let mut groups: HashMap<Vec<ScalarValue>, Group> = HashMap::new();
+            // A global aggregate always emits exactly one row, even over no data.
+            if this.group_cols.is_empty() {
+                groups.insert(Vec::new(), this.new_group());
+            }
             // TODO(phase7): partitions are folded sequentially, serializing the scan.
-            // Fold each partition into its own accumulators concurrently and combine,
-            // to keep the multi-partition (fan-out) scan parallelism.
+            // Fold each partition concurrently into its own map and merge to keep the
+            // multi-partition (fan-out) scan parallelism.
             for p in 0..n_in {
                 let mut stream = input.execute(p, context.clone())?;
                 while let Some(batch) = stream.try_next().await? {
-                    Self::fold_batch(&mut accs, &aggs, &batch)?;
+                    this.fold_batch(&mut groups, &batch)?;
                 }
             }
-            Self::finalize(&schema, &aggs, &accs)
+            this.finalize(&groups)
         };
 
         let stream = futures::stream::once(fut);
