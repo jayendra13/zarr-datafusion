@@ -1,0 +1,918 @@
+year,season,oni_c,enso_phase
+1950,DJF,-0.95,La Niña
+1950,JFM,-0.86,La Niña
+1950,FMA,-0.87,La Niña
+1950,MAM,-0.72,La Niña
+1950,AMJ,-0.65,La Niña
+1950,MJJ,-0.63,La Niña
+1950,JJA,-0.6,La Niña
+1950,JAS,-0.72,La Niña
+1950,ASO,-0.65,La Niña
+1950,SON,-0.68,La Niña
+1950,OND,-0.53,La Niña
+1950,NDJ,-0.67,La Niña
+1951,DJF,-0.57,La Niña
+1951,JFM,-0.6,La Niña
+1951,FMA,-0.22,Neutral
+1951,MAM,0.15,Neutral
+1951,AMJ,0.38,Neutral
+1951,MJJ,0.87,El Niño
+1951,JJA,0.95,El Niño
+1951,JAS,1.13,El Niño
+1951,ASO,1.03,El Niño
+1951,SON,1.23,El Niño
+1951,OND,1.49,El Niño
+1951,NDJ,1.39,El Niño
+1952,DJF,1.19,El Niño
+1952,JFM,0.79,El Niño
+1952,FMA,0.76,El Niño
+1952,MAM,0.46,Neutral
+1952,AMJ,0.21,Neutral
+1952,MJJ,-0.23,Neutral
+1952,JJA,-0.31,Neutral
+1952,JAS,-0.19,Neutral
+1952,ASO,-0.07,Neutral
+1952,SON,0.04,Neutral
+1952,OND,0.21,Neutral
+1952,NDJ,0.45,Neutral
+1953,DJF,0.57,El Niño
+1953,JFM,0.6,El Niño
+1953,FMA,0.55,El Niño
+1953,MAM,0.71,El Niño
+1953,AMJ,0.68,El Niño
+1953,MJJ,0.71,El Niño
+1953,JJA,0.58,El Niño
+1953,JAS,0.91,El Niño
+1953,ASO,0.9,El Niño
+1953,SON,0.76,El Niño
+1953,OND,0.3,Neutral
+1953,NDJ,0.34,Neutral
+1954,DJF,0.29,Neutral
+1954,JFM,0.25,Neutral
+1954,FMA,-0.2,Neutral
+1954,MAM,-0.47,Neutral
+1954,AMJ,-0.63,La Niña
+1954,MJJ,-0.79,La Niña
+1954,JJA,-0.73,La Niña
+1954,JAS,-0.82,La Niña
+1954,ASO,-0.67,La Niña
+1954,SON,-0.72,La Niña
+1954,OND,-0.76,La Niña
+1954,NDJ,-0.93,La Niña
+1955,DJF,-0.97,La Niña
+1955,JFM,-0.81,La Niña
+1955,FMA,-0.82,La Niña
+1955,MAM,-0.78,La Niña
+1955,AMJ,-0.98,La Niña
+1955,MJJ,-0.87,La Niña
+1955,JJA,-0.93,La Niña
+1955,JAS,-0.91,La Niña
+1955,ASO,-1.3,La Niña
+1955,SON,-1.63,La Niña
+1955,OND,-1.88,La Niña
+1955,NDJ,-1.52,La Niña
+1956,DJF,-1.26,La Niña
+1956,JFM,-0.91,La Niña
+1956,FMA,-0.79,La Niña
+1956,MAM,-0.85,La Niña
+1956,AMJ,-0.92,La Niña
+1956,MJJ,-1.0,La Niña
+1956,JJA,-0.77,La Niña
+1956,JAS,-0.61,La Niña
+1956,ASO,-0.64,La Niña
+1956,SON,-0.66,La Niña
+1956,OND,-0.74,La Niña
+1956,NDJ,-0.6,La Niña
+1957,DJF,-0.42,Neutral
+1957,JFM,0.05,Neutral
+1957,FMA,0.32,Neutral
+1957,MAM,0.86,El Niño
+1957,AMJ,0.97,El Niño
+1957,MJJ,1.17,El Niño
+1957,JJA,1.02,El Niño
+1957,JAS,1.14,El Niño
+1957,ASO,1.17,El Niño
+1957,SON,1.22,El Niño
+1957,OND,1.07,El Niño
+1957,NDJ,1.36,El Niño
+1958,DJF,1.36,El Niño
+1958,JFM,1.41,El Niño
+1958,FMA,0.96,El Niño
+1958,MAM,0.81,El Niño
+1958,AMJ,0.59,El Niño
+1958,MJJ,0.55,El Niño
+1958,JJA,0.37,Neutral
+1958,JAS,0.1,Neutral
+1958,ASO,0.01,Neutral
+1958,SON,0.03,Neutral
+1958,OND,0.13,Neutral
+1958,NDJ,0.32,Neutral
+1959,DJF,0.4,Neutral
+1959,JFM,0.71,El Niño
+1959,FMA,0.65,El Niño
+1959,MAM,0.73,El Niño
+1959,AMJ,0.58,El Niño
+1959,MJJ,0.32,Neutral
+1959,JJA,0.16,Neutral
+1959,JAS,-0.08,Neutral
+1959,ASO,0.11,Neutral
+1959,SON,-0.09,Neutral
+1959,OND,0.04,Neutral
+1959,NDJ,0.03,Neutral
+1960,DJF,0.04,Neutral
+1960,JFM,0.17,Neutral
+1960,FMA,0.03,Neutral
+1960,MAM,0.13,Neutral
+1960,AMJ,-0.05,Neutral
+1960,MJJ,-0.0,Neutral
+1960,JJA,-0.02,Neutral
+1960,JAS,0.08,Neutral
+1960,ASO,0.1,Neutral
+1960,SON,0.06,Neutral
+1960,OND,-0.01,Neutral
+1960,NDJ,0.1,Neutral
+1961,DJF,0.27,Neutral
+1961,JFM,0.3,Neutral
+1961,FMA,-0.02,Neutral
+1961,MAM,-0.08,Neutral
+1961,AMJ,-0.22,Neutral
+1961,MJJ,-0.1,Neutral
+1961,JJA,-0.18,Neutral
+1961,JAS,-0.17,Neutral
+1961,ASO,-0.23,Neutral
+1961,SON,-0.3,Neutral
+1961,OND,-0.21,Neutral
+1961,NDJ,-0.35,Neutral
+1962,DJF,-0.35,Neutral
+1962,JFM,-0.6,La Niña
+1962,FMA,-0.55,La Niña
+1962,MAM,-0.6,La Niña
+1962,AMJ,-0.51,La Niña
+1962,MJJ,-0.58,La Niña
+1962,JJA,-0.52,La Niña
+1962,JAS,-0.61,La Niña
+1962,ASO,-0.4,Neutral
+1962,SON,-0.46,Neutral
+1962,OND,-0.41,Neutral
+1962,NDJ,-0.56,La Niña
+1963,DJF,-0.8,La Niña
+1963,JFM,-0.78,La Niña
+1963,FMA,-0.74,La Niña
+1963,MAM,-0.57,La Niña
+1963,AMJ,-0.39,Neutral
+1963,MJJ,-0.05,Neutral
+1963,JJA,0.33,Neutral
+1963,JAS,0.38,Neutral
+1963,ASO,0.52,El Niño
+1963,SON,0.75,El Niño
+1963,OND,0.98,El Niño
+1963,NDJ,0.89,El Niño
+1964,DJF,0.69,El Niño
+1964,JFM,0.21,Neutral
+1964,FMA,-0.13,Neutral
+1964,MAM,-0.52,La Niña
+1964,AMJ,-0.67,La Niña
+1964,MJJ,-0.85,La Niña
+1964,JJA,-0.93,La Niña
+1964,JAS,-1.04,La Niña
+1964,ASO,-1.01,La Niña
+1964,SON,-0.95,La Niña
+1964,OND,-0.82,La Niña
+1964,NDJ,-0.76,La Niña
+1965,DJF,-0.65,La Niña
+1965,JFM,-0.36,Neutral
+1965,FMA,0.06,Neutral
+1965,MAM,0.54,El Niño
+1965,AMJ,0.87,El Niño
+1965,MJJ,0.89,El Niño
+1965,JJA,0.97,El Niño
+1965,JAS,1.03,El Niño
+1965,ASO,1.55,El Niño
+1965,SON,1.72,El Niño
+1965,OND,1.89,El Niño
+1965,NDJ,1.61,El Niño
+1966,DJF,1.41,El Niño
+1966,JFM,1.42,El Niño
+1966,FMA,1.22,El Niño
+1966,MAM,0.93,El Niño
+1966,AMJ,0.55,El Niño
+1966,MJJ,0.51,El Niño
+1966,JJA,0.5,El Niño
+1966,JAS,0.44,Neutral
+1966,ASO,0.42,Neutral
+1966,SON,0.37,Neutral
+1966,OND,0.43,Neutral
+1966,NDJ,0.15,Neutral
+1967,DJF,-0.03,Neutral
+1967,JFM,-0.21,Neutral
+1967,FMA,-0.05,Neutral
+1967,MAM,0.13,Neutral
+1967,AMJ,0.32,Neutral
+1967,MJJ,0.25,Neutral
+1967,JJA,0.11,Neutral
+1967,JAS,-0.02,Neutral
+1967,ASO,-0.21,Neutral
+1967,SON,-0.04,Neutral
+1967,OND,-0.2,Neutral
+1967,NDJ,-0.28,Neutral
+1968,DJF,-0.52,La Niña
+1968,JFM,-0.79,La Niña
+1968,FMA,-0.6,La Niña
+1968,MAM,-0.53,La Niña
+1968,AMJ,-0.25,Neutral
+1968,MJJ,-0.19,Neutral
+1968,JJA,0.08,Neutral
+1968,JAS,0.39,Neutral
+1968,ASO,0.8,El Niño
+1968,SON,1.08,El Niño
+1968,OND,1.47,El Niño
+1968,NDJ,1.41,El Niño
+1969,DJF,1.44,El Niño
+1969,JFM,1.22,El Niño
+1969,FMA,1.12,El Niño
+1969,MAM,0.96,El Niño
+1969,AMJ,0.95,El Niño
+1969,MJJ,0.72,El Niño
+1969,JJA,0.51,El Niño
+1969,JAS,0.11,Neutral
+1969,ASO,0.12,Neutral
+1969,SON,0.18,Neutral
+1969,OND,0.27,Neutral
+1969,NDJ,0.18,Neutral
+1970,DJF,0.02,Neutral
+1970,JFM,-0.08,Neutral
+1970,FMA,-0.01,Neutral
+1970,MAM,-0.1,Neutral
+1970,AMJ,-0.05,Neutral
+1970,MJJ,-0.38,Neutral
+1970,JJA,-0.66,La Niña
+1970,JAS,-0.92,La Niña
+1970,ASO,-0.91,La Niña
+1970,SON,-0.95,La Niña
+1970,OND,-1.18,La Niña
+1970,NDJ,-1.34,La Niña
+1971,DJF,-1.51,La Niña
+1971,JFM,-1.56,La Niña
+1971,FMA,-1.43,La Niña
+1971,MAM,-1.17,La Niña
+1971,AMJ,-1.06,La Niña
+1971,MJJ,-0.84,La Niña
+1971,JJA,-0.62,La Niña
+1971,JAS,-0.46,Neutral
+1971,ASO,-0.79,La Niña
+1971,SON,-1.0,La Niña
+1971,OND,-1.06,La Niña
+1971,NDJ,-0.89,La Niña
+1972,DJF,-0.61,La Niña
+1972,JFM,-0.31,Neutral
+1972,FMA,0.17,Neutral
+1972,MAM,0.42,Neutral
+1972,AMJ,0.81,El Niño
+1972,MJJ,1.07,El Niño
+1972,JJA,1.54,El Niño
+1972,JAS,1.88,El Niño
+1972,ASO,2.08,El Niño
+1972,SON,1.98,El Niño
+1972,OND,2.04,El Niño
+1972,NDJ,2.0,El Niño
+1973,DJF,1.84,El Niño
+1973,JFM,1.44,El Niño
+1973,FMA,0.72,El Niño
+1973,MAM,0.41,Neutral
+1973,AMJ,-0.06,Neutral
+1973,MJJ,0.08,Neutral
+1973,JJA,-0.28,Neutral
+1973,JAS,-0.49,Neutral
+1973,ASO,-1.09,La Niña
+1973,SON,-1.2,La Niña
+1973,OND,-1.4,La Niña
+1973,NDJ,-1.52,La Niña
+1974,DJF,-1.75,La Niña
+1974,JFM,-1.5,La Niña
+1974,FMA,-1.14,La Niña
+1974,MAM,-0.74,La Niña
+1974,AMJ,-0.57,La Niña
+1974,MJJ,-0.49,Neutral
+1974,JJA,-0.37,Neutral
+1974,JAS,-0.15,Neutral
+1974,ASO,-0.33,Neutral
+1974,SON,-0.43,Neutral
+1974,OND,-0.86,La Niña
+1974,NDJ,-0.74,La Niña
+1975,DJF,-0.74,La Niña
+1975,JFM,-0.5,La Niña
+1975,FMA,-0.43,Neutral
+1975,MAM,-0.67,La Niña
+1975,AMJ,-0.86,La Niña
+1975,MJJ,-1.04,La Niña
+1975,JJA,-0.92,La Niña
+1975,JAS,-1.11,La Niña
+1975,ASO,-1.36,La Niña
+1975,SON,-1.53,La Niña
+1975,OND,-1.63,La Niña
+1975,NDJ,-1.75,La Niña
+1976,DJF,-1.76,La Niña
+1976,JFM,-1.5,La Niña
+1976,FMA,-0.9,La Niña
+1976,MAM,-0.48,Neutral
+1976,AMJ,-0.1,Neutral
+1976,MJJ,0.36,Neutral
+1976,JJA,0.38,Neutral
+1976,JAS,0.48,Neutral
+1976,ASO,0.3,Neutral
+1976,SON,0.58,El Niño
+1976,OND,0.37,Neutral
+1976,NDJ,0.52,El Niño
+1977,DJF,0.43,Neutral
+1977,JFM,0.48,Neutral
+1977,FMA,-0.07,Neutral
+1977,MAM,-0.28,Neutral
+1977,AMJ,-0.24,Neutral
+1977,MJJ,0.11,Neutral
+1977,JJA,0.06,Neutral
+1977,JAS,0.21,Neutral
+1977,ASO,0.17,Neutral
+1977,SON,0.44,Neutral
+1977,OND,0.4,Neutral
+1977,NDJ,0.73,El Niño
+1978,DJF,0.76,El Niño
+1978,JFM,0.59,El Niño
+1978,FMA,0.05,Neutral
+1978,MAM,-0.39,Neutral
+1978,AMJ,-0.54,La Niña
+1978,MJJ,-0.28,Neutral
+1978,JJA,-0.07,Neutral
+1978,JAS,0.14,Neutral
+1978,ASO,-0.06,Neutral
+1978,SON,-0.15,Neutral
+1978,OND,-0.14,Neutral
+1978,NDJ,-0.0,Neutral
+1979,DJF,0.09,Neutral
+1979,JFM,0.21,Neutral
+1979,FMA,0.17,Neutral
+1979,MAM,0.27,Neutral
+1979,AMJ,0.18,Neutral
+1979,MJJ,0.04,Neutral
+1979,JJA,0.09,Neutral
+1979,JAS,0.26,Neutral
+1979,ASO,0.47,Neutral
+1979,SON,0.51,El Niño
+1979,OND,0.59,El Niño
+1979,NDJ,0.81,El Niño
+1980,DJF,0.78,El Niño
+1980,JFM,0.5,El Niño
+1980,FMA,0.41,Neutral
+1980,MAM,0.25,Neutral
+1980,AMJ,0.28,Neutral
+1980,MJJ,-0.14,Neutral
+1980,JJA,-0.41,Neutral
+1980,JAS,-0.43,Neutral
+1980,ASO,-0.25,Neutral
+1980,SON,-0.11,Neutral
+1980,OND,-0.07,Neutral
+1980,NDJ,-0.34,Neutral
+1981,DJF,-0.59,La Niña
+1981,JFM,-0.79,La Niña
+1981,FMA,-0.64,La Niña
+1981,MAM,-0.53,La Niña
+1981,AMJ,-0.66,La Niña
+1981,MJJ,-0.67,La Niña
+1981,JJA,-0.64,La Niña
+1981,JAS,-0.41,Neutral
+1981,ASO,-0.41,Neutral
+1981,SON,-0.33,Neutral
+1981,OND,-0.34,Neutral
+1981,NDJ,-0.34,Neutral
+1982,DJF,-0.26,Neutral
+1982,JFM,-0.17,Neutral
+1982,FMA,0.19,Neutral
+1982,MAM,0.43,Neutral
+1982,AMJ,0.7,El Niño
+1982,MJJ,0.81,El Niño
+1982,JJA,1.03,El Niño
+1982,JAS,1.29,El Niño
+1982,ASO,1.81,El Niño
+1982,SON,2.23,El Niño
+1982,OND,2.59,El Niño
+1982,NDJ,2.56,El Niño
+1983,DJF,2.4,El Niño
+1983,JFM,2.08,El Niño
+1983,FMA,1.69,El Niño
+1983,MAM,1.33,El Niño
+1983,AMJ,0.98,El Niño
+1983,MJJ,0.5,El Niño
+1983,JJA,0.01,Neutral
+1983,JAS,-0.25,Neutral
+1983,ASO,-0.31,Neutral
+1983,SON,-0.51,La Niña
+1983,OND,-0.79,La Niña
+1983,NDJ,-0.86,La Niña
+1984,DJF,-0.61,La Niña
+1984,JFM,-0.58,La Niña
+1984,FMA,-0.44,Neutral
+1984,MAM,-0.47,Neutral
+1984,AMJ,-0.51,La Niña
+1984,MJJ,-0.63,La Niña
+1984,JJA,-0.55,La Niña
+1984,JAS,-0.29,Neutral
+1984,ASO,-0.24,Neutral
+1984,SON,-0.68,La Niña
+1984,OND,-1.15,La Niña
+1984,NDJ,-1.36,La Niña
+1985,DJF,-1.23,La Niña
+1985,JFM,-0.89,La Niña
+1985,FMA,-0.84,La Niña
+1985,MAM,-0.79,La Niña
+1985,AMJ,-0.79,La Niña
+1985,MJJ,-0.75,La Niña
+1985,JJA,-0.57,La Niña
+1985,JAS,-0.57,La Niña
+1985,ASO,-0.48,Neutral
+1985,SON,-0.52,La Niña
+1985,OND,-0.51,La Niña
+1985,NDJ,-0.65,La Niña
+1986,DJF,-0.67,La Niña
+1986,JFM,-0.63,La Niña
+1986,FMA,-0.4,Neutral
+1986,MAM,-0.3,Neutral
+1986,AMJ,-0.11,Neutral
+1986,MJJ,-0.02,Neutral
+1986,JJA,0.25,Neutral
+1986,JAS,0.36,Neutral
+1986,ASO,0.7,El Niño
+1986,SON,0.98,El Niño
+1986,OND,1.24,El Niño
+1986,NDJ,1.37,El Niño
+1987,DJF,1.32,El Niño
+1987,JFM,1.39,El Niño
+1987,FMA,1.2,El Niño
+1987,MAM,1.11,El Niño
+1987,AMJ,1.08,El Niño
+1987,MJJ,1.31,El Niño
+1987,JJA,1.63,El Niño
+1987,JAS,1.74,El Niño
+1987,ASO,1.72,El Niño
+1987,SON,1.43,El Niño
+1987,OND,1.21,El Niño
+1987,NDJ,0.99,El Niño
+1988,DJF,0.86,El Niño
+1988,JFM,0.59,El Niño
+1988,FMA,0.26,Neutral
+1988,MAM,-0.32,Neutral
+1988,AMJ,-0.85,La Niña
+1988,MJJ,-1.38,La Niña
+1988,JJA,-1.46,La Niña
+1988,JAS,-1.54,La Niña
+1988,ASO,-1.7,La Niña
+1988,SON,-1.98,La Niña
+1988,OND,-2.14,La Niña
+1988,NDJ,-2.04,La Niña
+1989,DJF,-1.7,La Niña
+1989,JFM,-1.39,La Niña
+1989,FMA,-1.15,La Niña
+1989,MAM,-0.99,La Niña
+1989,AMJ,-0.74,La Niña
+1989,MJJ,-0.47,Neutral
+1989,JJA,-0.42,Neutral
+1989,JAS,-0.51,La Niña
+1989,ASO,-0.54,La Niña
+1989,SON,-0.41,Neutral
+1989,OND,-0.3,Neutral
+1989,NDJ,-0.16,Neutral
+1990,DJF,-0.02,Neutral
+1990,JFM,0.01,Neutral
+1990,FMA,0.15,Neutral
+1990,MAM,0.22,Neutral
+1990,AMJ,0.38,Neutral
+1990,MJJ,0.3,Neutral
+1990,JJA,0.28,Neutral
+1990,JAS,0.28,Neutral
+1990,ASO,0.35,Neutral
+1990,SON,0.22,Neutral
+1990,OND,0.2,Neutral
+1990,NDJ,0.26,Neutral
+1991,DJF,0.36,Neutral
+1991,JFM,0.33,Neutral
+1991,FMA,0.26,Neutral
+1991,MAM,0.41,Neutral
+1991,AMJ,0.65,El Niño
+1991,MJJ,0.61,El Niño
+1991,JJA,0.47,Neutral
+1991,JAS,0.31,Neutral
+1991,ASO,0.5,El Niño
+1991,SON,0.79,El Niño
+1991,OND,1.23,El Niño
+1991,NDJ,1.53,El Niño
+1992,DJF,1.75,El Niño
+1992,JFM,1.64,El Niño
+1992,FMA,1.47,El Niño
+1992,MAM,1.17,El Niño
+1992,AMJ,0.85,El Niño
+1992,MJJ,0.57,El Niño
+1992,JJA,0.2,Neutral
+1992,JAS,0.05,Neutral
+1992,ASO,-0.23,Neutral
+1992,SON,-0.21,Neutral
+1992,OND,-0.11,Neutral
+1992,NDJ,0.19,Neutral
+1993,DJF,0.28,Neutral
+1993,JFM,0.33,Neutral
+1993,FMA,0.46,Neutral
+1993,MAM,0.78,El Niño
+1993,AMJ,0.89,El Niño
+1993,MJJ,0.8,El Niño
+1993,JJA,0.47,Neutral
+1993,JAS,0.3,Neutral
+1993,ASO,0.23,Neutral
+1993,SON,0.31,Neutral
+1993,OND,0.29,Neutral
+1993,NDJ,0.17,Neutral
+1994,DJF,0.09,Neutral
+1994,JFM,0.07,Neutral
+1994,FMA,0.06,Neutral
+1994,MAM,0.06,Neutral
+1994,AMJ,0.09,Neutral
+1994,MJJ,0.11,Neutral
+1994,JJA,0.32,Neutral
+1994,JAS,0.25,Neutral
+1994,ASO,0.51,El Niño
+1994,SON,0.71,El Niño
+1994,OND,1.08,El Niño
+1994,NDJ,1.09,El Niño
+1995,DJF,0.85,El Niño
+1995,JFM,0.55,El Niño
+1995,FMA,0.42,Neutral
+1995,MAM,0.16,Neutral
+1995,AMJ,0.06,Neutral
+1995,MJJ,-0.13,Neutral
+1995,JJA,-0.25,Neutral
+1995,JAS,-0.55,La Niña
+1995,ASO,-0.84,La Niña
+1995,SON,-1.07,La Niña
+1995,OND,-1.17,La Niña
+1995,NDJ,-1.09,La Niña
+1996,DJF,-0.97,La Niña
+1996,JFM,-0.74,La Niña
+1996,FMA,-0.62,La Niña
+1996,MAM,-0.57,La Niña
+1996,AMJ,-0.62,La Niña
+1996,MJJ,-0.54,La Niña
+1996,JJA,-0.37,Neutral
+1996,JAS,-0.27,Neutral
+1996,ASO,-0.28,Neutral
+1996,SON,-0.26,Neutral
+1996,OND,-0.34,Neutral
+1996,NDJ,-0.49,Neutral
+1997,DJF,-0.54,La Niña
+1997,JFM,-0.48,Neutral
+1997,FMA,-0.17,Neutral
+1997,MAM,0.18,Neutral
+1997,AMJ,0.72,El Niño
+1997,MJJ,1.26,El Niño
+1997,JJA,1.71,El Niño
+1997,JAS,2.03,El Niño
+1997,ASO,2.3,El Niño
+1997,SON,2.57,El Niño
+1997,OND,2.84,El Niño
+1997,NDJ,2.85,El Niño
+1998,DJF,2.65,El Niño
+1998,JFM,2.19,El Niño
+1998,FMA,1.56,El Niño
+1998,MAM,1.0,El Niño
+1998,AMJ,0.17,Neutral
+1998,MJJ,-0.61,La Niña
+1998,JJA,-1.31,La Niña
+1998,JAS,-1.41,La Niña
+1998,ASO,-1.31,La Niña
+1998,SON,-1.4,La Niña
+1998,OND,-1.63,La Niña
+1998,NDJ,-1.77,La Niña
+1999,DJF,-1.73,La Niña
+1999,JFM,-1.39,La Niña
+1999,FMA,-1.15,La Niña
+1999,MAM,-0.86,La Niña
+1999,AMJ,-0.91,La Niña
+1999,MJJ,-0.85,La Niña
+1999,JJA,-0.96,La Niña
+1999,JAS,-1.01,La Niña
+1999,ASO,-1.07,La Niña
+1999,SON,-1.18,La Niña
+1999,OND,-1.38,La Niña
+1999,NDJ,-1.71,La Niña
+2000,DJF,-1.72,La Niña
+2000,JFM,-1.47,La Niña
+2000,FMA,-1.05,La Niña
+2000,MAM,-0.71,La Niña
+2000,AMJ,-0.54,La Niña
+2000,MJJ,-0.5,La Niña
+2000,JJA,-0.48,Neutral
+2000,JAS,-0.43,Neutral
+2000,ASO,-0.45,Neutral
+2000,SON,-0.56,La Niña
+2000,OND,-0.67,La Niña
+2000,NDJ,-0.62,La Niña
+2001,DJF,-0.54,La Niña
+2001,JFM,-0.36,Neutral
+2001,FMA,-0.24,Neutral
+2001,MAM,-0.13,Neutral
+2001,AMJ,-0.06,Neutral
+2001,MJJ,0.04,Neutral
+2001,JJA,0.03,Neutral
+2001,JAS,-0.08,Neutral
+2001,ASO,-0.23,Neutral
+2001,SON,-0.31,Neutral
+2001,OND,-0.36,Neutral
+2001,NDJ,-0.28,Neutral
+2002,DJF,-0.02,Neutral
+2002,JFM,0.22,Neutral
+2002,FMA,0.24,Neutral
+2002,MAM,0.18,Neutral
+2002,AMJ,0.35,Neutral
+2002,MJJ,0.55,El Niño
+2002,JJA,0.77,El Niño
+2002,JAS,0.86,El Niño
+2002,ASO,1.03,El Niño
+2002,SON,1.25,El Niño
+2002,OND,1.39,El Niño
+2002,NDJ,1.42,El Niño
+2003,DJF,1.2,El Niño
+2003,JFM,1.0,El Niño
+2003,FMA,0.58,El Niño
+2003,MAM,0.13,Neutral
+2003,AMJ,-0.21,Neutral
+2003,MJJ,-0.21,Neutral
+2003,JJA,-0.07,Neutral
+2003,JAS,-0.0,Neutral
+2003,ASO,0.06,Neutral
+2003,SON,0.11,Neutral
+2003,OND,0.2,Neutral
+2003,NDJ,0.21,Neutral
+2004,DJF,0.25,Neutral
+2004,JFM,0.16,Neutral
+2004,FMA,0.08,Neutral
+2004,MAM,0.08,Neutral
+2004,AMJ,0.09,Neutral
+2004,MJJ,0.2,Neutral
+2004,JJA,0.31,Neutral
+2004,JAS,0.52,El Niño
+2004,ASO,0.57,El Niño
+2004,SON,0.62,El Niño
+2004,OND,0.62,El Niño
+2004,NDJ,0.66,El Niño
+2005,DJF,0.53,El Niño
+2005,JFM,0.47,Neutral
+2005,FMA,0.23,Neutral
+2005,MAM,0.23,Neutral
+2005,AMJ,0.18,Neutral
+2005,MJJ,0.32,Neutral
+2005,JJA,0.2,Neutral
+2005,JAS,-0.01,Neutral
+2005,ASO,-0.16,Neutral
+2005,SON,-0.3,Neutral
+2005,OND,-0.49,Neutral
+2005,NDJ,-0.77,La Niña
+2006,DJF,-0.78,La Niña
+2006,JFM,-0.79,La Niña
+2006,FMA,-0.54,La Niña
+2006,MAM,-0.37,Neutral
+2006,AMJ,-0.02,Neutral
+2006,MJJ,0.07,Neutral
+2006,JJA,0.18,Neutral
+2006,JAS,0.38,Neutral
+2006,ASO,0.65,El Niño
+2006,SON,0.91,El Niño
+2006,OND,1.04,El Niño
+2006,NDJ,0.95,El Niño
+2007,DJF,0.67,El Niño
+2007,JFM,0.28,Neutral
+2007,FMA,0.01,Neutral
+2007,MAM,-0.27,Neutral
+2007,AMJ,-0.22,Neutral
+2007,MJJ,-0.31,Neutral
+2007,JJA,-0.27,Neutral
+2007,JAS,-0.6,La Niña
+2007,ASO,-1.06,La Niña
+2007,SON,-1.46,La Niña
+2007,OND,-1.77,La Niña
+2007,NDJ,-1.79,La Niña
+2008,DJF,-1.91,La Niña
+2008,JFM,-1.71,La Niña
+2008,FMA,-1.45,La Niña
+2008,MAM,-1.03,La Niña
+2008,AMJ,-0.83,La Niña
+2008,MJJ,-0.51,La Niña
+2008,JJA,-0.26,Neutral
+2008,JAS,-0.1,Neutral
+2008,ASO,-0.18,Neutral
+2008,SON,-0.34,Neutral
+2008,OND,-0.58,La Niña
+2008,NDJ,-0.82,La Niña
+2009,DJF,-0.86,La Niña
+2009,JFM,-0.79,La Niña
+2009,FMA,-0.54,La Niña
+2009,MAM,-0.26,Neutral
+2009,AMJ,0.08,Neutral
+2009,MJJ,0.37,Neutral
+2009,JJA,0.48,Neutral
+2009,JAS,0.62,El Niño
+2009,ASO,0.67,El Niño
+2009,SON,0.96,El Niño
+2009,OND,1.2,El Niño
+2009,NDJ,1.53,El Niño
+2010,DJF,1.44,El Niño
+2010,JFM,1.29,El Niño
+2010,FMA,0.95,El Niño
+2010,MAM,0.47,Neutral
+2010,AMJ,-0.16,Neutral
+2010,MJJ,-0.77,La Niña
+2010,JJA,-1.13,La Niña
+2010,JAS,-1.35,La Niña
+2010,ASO,-1.52,La Niña
+2010,SON,-1.65,La Niña
+2010,OND,-1.73,La Niña
+2010,NDJ,-1.76,La Niña
+2011,DJF,-1.58,La Niña
+2011,JFM,-1.32,La Niña
+2011,FMA,-0.95,La Niña
+2011,MAM,-0.66,La Niña
+2011,AMJ,-0.45,Neutral
+2011,MJJ,-0.32,Neutral
+2011,JJA,-0.46,Neutral
+2011,JAS,-0.61,La Niña
+2011,ASO,-0.81,La Niña
+2011,SON,-1.02,La Niña
+2011,OND,-1.1,La Niña
+2011,NDJ,-1.14,La Niña
+2012,DJF,-0.85,La Niña
+2012,JFM,-0.72,La Niña
+2012,FMA,-0.54,La Niña
+2012,MAM,-0.45,Neutral
+2012,AMJ,-0.23,Neutral
+2012,MJJ,-0.04,Neutral
+2012,JJA,0.32,Neutral
+2012,JAS,0.35,Neutral
+2012,ASO,0.42,Neutral
+2012,SON,0.2,Neutral
+2012,OND,0.03,Neutral
+2012,NDJ,-0.27,Neutral
+2013,DJF,-0.39,Neutral
+2013,JFM,-0.29,Neutral
+2013,FMA,-0.15,Neutral
+2013,MAM,-0.25,Neutral
+2013,AMJ,-0.36,Neutral
+2013,MJJ,-0.48,Neutral
+2013,JJA,-0.42,Neutral
+2013,JAS,-0.28,Neutral
+2013,ASO,-0.22,Neutral
+2013,SON,-0.12,Neutral
+2013,OND,-0.18,Neutral
+2013,NDJ,-0.2,Neutral
+2014,DJF,-0.35,Neutral
+2014,JFM,-0.35,Neutral
+2014,FMA,-0.2,Neutral
+2014,MAM,0.04,Neutral
+2014,AMJ,0.18,Neutral
+2014,MJJ,0.18,Neutral
+2014,JJA,0.12,Neutral
+2014,JAS,0.23,Neutral
+2014,ASO,0.39,Neutral
+2014,SON,0.59,El Niño
+2014,OND,0.66,El Niño
+2014,NDJ,0.67,El Niño
+2015,DJF,0.58,El Niño
+2015,JFM,0.46,Neutral
+2015,FMA,0.56,El Niño
+2015,MAM,0.73,El Niño
+2015,AMJ,0.89,El Niño
+2015,MJJ,1.1,El Niño
+2015,JJA,1.43,El Niño
+2015,JAS,1.84,El Niño
+2015,ASO,2.11,El Niño
+2015,SON,2.39,El Niño
+2015,OND,2.59,El Niño
+2015,NDJ,2.62,El Niño
+2016,DJF,2.36,El Niño
+2016,JFM,1.94,El Niño
+2016,FMA,1.49,El Niño
+2016,MAM,0.97,El Niño
+2016,AMJ,0.52,El Niño
+2016,MJJ,0.05,Neutral
+2016,JJA,-0.22,Neutral
+2016,JAS,-0.43,Neutral
+2016,ASO,-0.48,Neutral
+2016,SON,-0.52,La Niña
+2016,OND,-0.46,Neutral
+2016,NDJ,-0.36,Neutral
+2017,DJF,-0.12,Neutral
+2017,JFM,0.03,Neutral
+2017,FMA,0.16,Neutral
+2017,MAM,0.25,Neutral
+2017,AMJ,0.35,Neutral
+2017,MJJ,0.44,Neutral
+2017,JJA,0.22,Neutral
+2017,JAS,-0.03,Neutral
+2017,ASO,-0.35,Neutral
+2017,SON,-0.56,La Niña
+2017,OND,-0.75,La Niña
+2017,NDJ,-0.79,La Niña
+2018,DJF,-0.78,La Niña
+2018,JFM,-0.71,La Niña
+2018,FMA,-0.69,La Niña
+2018,MAM,-0.49,Neutral
+2018,AMJ,-0.21,Neutral
+2018,MJJ,0.07,Neutral
+2018,JJA,0.19,Neutral
+2018,JAS,0.24,Neutral
+2018,ASO,0.39,Neutral
+2018,SON,0.52,El Niño
+2018,OND,0.68,El Niño
+2018,NDJ,0.66,El Niño
+2019,DJF,0.67,El Niño
+2019,JFM,0.69,El Niño
+2019,FMA,0.71,El Niño
+2019,MAM,0.7,El Niño
+2019,AMJ,0.62,El Niño
+2019,MJJ,0.53,El Niño
+2019,JJA,0.3,Neutral
+2019,JAS,0.01,Neutral
+2019,ASO,0.04,Neutral
+2019,SON,0.22,Neutral
+2019,OND,0.47,Neutral
+2019,NDJ,0.46,Neutral
+2020,DJF,0.41,Neutral
+2020,JFM,0.39,Neutral
+2020,FMA,0.38,Neutral
+2020,MAM,0.15,Neutral
+2020,AMJ,-0.2,Neutral
+2020,MJJ,-0.42,Neutral
+2020,JJA,-0.48,Neutral
+2020,JAS,-0.54,La Niña
+2020,ASO,-0.88,La Niña
+2020,SON,-1.14,La Niña
+2020,OND,-1.22,La Niña
+2020,NDJ,-1.15,La Niña
+2021,DJF,-0.96,La Niña
+2021,JFM,-0.79,La Niña
+2021,FMA,-0.61,La Niña
+2021,MAM,-0.47,Neutral
+2021,AMJ,-0.34,Neutral
+2021,MJJ,-0.23,Neutral
+2021,JJA,-0.27,Neutral
+2021,JAS,-0.36,Neutral
+2021,ASO,-0.64,La Niña
+2021,SON,-0.83,La Niña
+2021,OND,-1.02,La Niña
+2021,NDJ,-0.95,La Niña
+2022,DJF,-0.86,La Niña
+2022,JFM,-0.9,La Niña
+2022,FMA,-0.99,La Niña
+2022,MAM,-1.12,La Niña
+2022,AMJ,-1.01,La Niña
+2022,MJJ,-0.86,La Niña
+2022,JJA,-0.83,La Niña
+2022,JAS,-0.88,La Niña
+2022,ASO,-0.97,La Niña
+2022,SON,-1.0,La Niña
+2022,OND,-1.0,La Niña
+2022,NDJ,-0.89,La Niña
+2023,DJF,-0.69,La Niña
+2023,JFM,-0.33,Neutral
+2023,FMA,-0.07,Neutral
+2023,MAM,0.3,Neutral
+2023,AMJ,0.52,El Niño
+2023,MJJ,0.83,El Niño
+2023,JJA,1.08,El Niño
+2023,JAS,1.35,El Niño
+2023,ASO,1.55,El Niño
+2023,SON,1.64,El Niño
+2023,OND,1.76,El Niño
+2023,NDJ,1.81,El Niño
+2024,DJF,1.8,El Niño
+2024,JFM,1.49,El Niño
+2024,FMA,1.11,El Niño
+2024,MAM,0.7,El Niño
+2024,AMJ,0.4,Neutral
+2024,MJJ,0.21,Neutral
+2024,JJA,0.09,Neutral
+2024,JAS,-0.1,Neutral
+2024,ASO,-0.29,Neutral
+2024,SON,-0.36,Neutral
+2024,OND,-0.48,Neutral
+2024,NDJ,-0.54,La Niña
+2025,DJF,-0.6,La Niña
+2025,JFM,-0.29,Neutral
+2025,FMA,-0.12,Neutral
+2025,MAM,0.0,Neutral
+2025,AMJ,-0.09,Neutral
+2025,MJJ,-0.13,Neutral
+2025,JJA,-0.23,Neutral
+2025,JAS,-0.34,Neutral
+2025,ASO,-0.43,Neutral
+2025,SON,-0.57,La Niña
+2025,OND,-0.66,La Niña
+2025,NDJ,-0.69,La Niña
+2026,DJF,-0.51,La Niña
+2026,JFM,-0.29,Neutral
+2026,FMA,0.04,Neutral
+2026,MAM,0.47,Neutral
+2026,AMJ,0.98,El Niño
