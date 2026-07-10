@@ -33,6 +33,8 @@ use crate::optimizer::cardinality::pushdown::{AggKind, AggSpec};
 #[derive(Clone, Default)]
 struct Acc {
     count: u128,
+    // TODO(phase7): SUM accumulates in f64, which loses precision for large int64
+    // sums (> 2^53). Accumulate integer inputs in i128 to keep SUM/COUNT bit-exact.
     sum: f64,
     min: Option<f64>,
     max: Option<f64>,
@@ -75,6 +77,10 @@ impl ZarrAggregateExec {
     }
 
     /// Fold one input batch into `accs` (parallel to `self.aggs`).
+    // TODO(phase7): folds the streamed one-column data batches, so the reader still
+    // materializes each window's data column. A bespoke chunk-fold reader (fold during
+    // decode, never building an Arrow column) would be strictly leaner — modest win
+    // for the global case, larger once GROUP BY (7.4/7.5) avoids the coordinate column.
     fn fold_batch(accs: &mut [Acc], aggs: &[AggSpec], batch: &RecordBatch) -> Result<()> {
         for (i, spec) in aggs.iter().enumerate() {
             match (spec.kind, spec.column.as_deref()) {
@@ -199,6 +205,9 @@ impl ExecutionPlan for ZarrAggregateExec {
         let fut = async move {
             let mut accs = vec![Acc::default(); aggs.len()];
             // Fold every input partition into the single group.
+            // TODO(phase7): partitions are folded sequentially, serializing the scan.
+            // Fold each partition into its own accumulators concurrently and combine,
+            // to keep the multi-partition (fan-out) scan parallelism.
             for p in 0..n_in {
                 let mut stream = input.execute(p, context.clone())?;
                 while let Some(batch) = stream.try_next().await? {
