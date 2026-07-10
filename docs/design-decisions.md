@@ -242,15 +242,33 @@ Commit hashes point at the change that introduced or settled the decision.
   inner axis keeps its `CoordFilters`-derived selection instead. Verified
   value-transparent end-to-end (a fanned-out aggregate equals the single-partition
   one) — `integration_multiaxis.rs`.
-- **Follow-ups (not yet done):**
-  - *H2 — split filtered inner axes.* Today a filtered inner axis is skipped. To
-    include it, generalize `resolve_outer_selection[_async]` to resolve any
-    coordinate's survivors, resolve the filtered inner candidates at plan time, and
-    split the *surviving* set (via `split_selection`, which already handles scattered
-    `Indices`) rather than the full extent — ranking axes by *surviving* chunk count.
-    Adds bounded plan-time coordinate reads (only when a multi-chunk inner axis is
-    filtered). Verify the reader's data path handles an `Indices` selection sitting in
-    `extra` on a non-outer axis.
+- **Applicability (important — measured against real data):** fan-out *extracts*
+  parallelism from the chunk grid; it cannot *create* it, because a chunk is the
+  atomic read/decode unit (we never split one across partitions). So multi-axis
+  fan-out only helps layouts that actually chunk their inner axes — e.g. the bundled
+  `era5_v3` fixture (`temperature` chunked `[1,1,181,720]` → latitude 4 chunks). The
+  *common* archive layout is the opposite: **one spatial chunk per timestep**.
+  ARCO-ERA5 (`gs://gcp-public-data-arco-era5/…chunk-1.zarr-v3`,
+  `sea_surface_temperature`) is `shape=[1323648,721,1440]` chunked `[1,721,1440]` →
+  `n_chunks=[1323648,1,1]`: the time axis has 1.3M chunks (outer-only partitioning
+  already saturates any `target_partitions`) while latitude/longitude are a *single*
+  chunk each — so `fan_out_inner` finds no candidate and **declines**. For such stores
+  H1 and H2 are inert. A related, distinct inefficiency they surface — a whole-globe
+  chunk means a small spatial box (e.g. a Niño-3.4 filter) still reads all 721×1440
+  cells per timestep — is a *chunk-granularity* over-read that no partition scheme can
+  fix (bound by how the data was written), and is **not** the cardinality optimizer's
+  concern.
+- **Follow-ups:**
+  - *H2 — split filtered inner axes (DEFERRED).* Would generalize
+    `resolve_outer_selection[_async]` to resolve any coordinate's survivors, resolve
+    the filtered inner candidates at plan time, and split the *surviving* set (via
+    `split_selection`, which already handles scattered `Indices`) rather than the full
+    extent — ranking axes by *surviving* chunk count, at the cost of bounded plan-time
+    coordinate reads. **Deferred:** its payoff only lands when a filtered inner axis is
+    *itself* multiply chunked, which the dominant single-spatial-chunk archives (see
+    Applicability) are not — so the value is too narrow to prioritize. Also would need
+    to verify the reader's data path handles an `Indices` selection sitting in `extra`
+    on a non-outer axis.
   - *H3 — distributed box execution (deferred).* The codec already round-trips
     `PartitionSpec.extra` (unit-tested) and a worker's `execute()` path is identical to
     local, so N-D boxes *should* run across `head`/`worker` unchanged — but this is not
