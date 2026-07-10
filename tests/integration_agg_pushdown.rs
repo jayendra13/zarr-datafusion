@@ -11,12 +11,15 @@ use common::*;
 
 use std::sync::Arc;
 
+use datafusion::execution::session_state::SessionStateBuilder;
 use datafusion::physical_plan::aggregates::AggregateExec;
 use datafusion::physical_plan::ExecutionPlan;
 use datafusion::prelude::SessionContext;
 
 use zarr_datafusion::optimizer::cardinality::pushdown::{recognize, AggKind};
 use zarr_datafusion::optimizer::cardinality::GroupKey;
+use zarr_datafusion::optimizer::CardinalityRule;
+use zarr_datafusion::physical_plan::zarr_aggregate::ZarrAggregateExec;
 use zarr_datafusion::physical_plan::zarr_exec::ZarrExec;
 
 /// Find the first `AggregateExec` whose input is a `ZarrExec`.
@@ -85,4 +88,66 @@ async fn declines_group_by_data_variable() {
     let plan = plan_for("SELECT temperature, COUNT(*) AS c FROM t GROUP BY temperature").await;
     let (agg, z) = find_agg_over_zarr(&plan).expect("AggregateExec over ZarrExec");
     assert!(recognize(agg, z).is_none());
+}
+
+// ---- Phase 7.3: global aggregate pushdown (rewrite + equivalence) ----
+
+/// A context with the cardinality rule registered — global aggregates get pushed.
+fn ctx_pushdown() -> SessionContext {
+    let state = SessionStateBuilder::new()
+        .with_default_features()
+        .with_physical_optimizer_rule(Arc::new(CardinalityRule::new()))
+        .build();
+    SessionContext::new_with_state(state)
+}
+
+fn contains_node<T: ExecutionPlan + 'static>(plan: &Arc<dyn ExecutionPlan>) -> bool {
+    if plan.downcast_ref::<T>().is_some() {
+        return true;
+    }
+    plan.children().iter().any(|c| contains_node::<T>(c))
+}
+
+async fn run(ctx: &SessionContext, sql: &str) -> String {
+    register_zarr_table(ctx, "t", SYNTHETIC_V3);
+    let batch = execute_query_single(ctx, sql).await;
+    format!("{batch:?}")
+}
+
+#[tokio::test]
+async fn global_aggregate_rewritten_to_zarr_aggregate() {
+    let ctx = ctx_pushdown();
+    register_zarr_table(&ctx, "t", SYNTHETIC_V3);
+    let plan = get_physical_plan(&ctx, "SELECT SUM(temperature) AS s FROM t").await;
+    assert!(
+        contains_node::<ZarrAggregateExec>(&plan),
+        "pushdown should introduce ZarrAggregateExec"
+    );
+    // The scan is now wrapped by ZarrAggregateExec — no bare AggregateExec remains.
+    assert!(
+        !contains_node::<AggregateExec>(&plan),
+        "the AggregateExec should have been replaced"
+    );
+}
+
+#[tokio::test]
+async fn global_aggregates_are_value_equivalent() {
+    let queries = [
+        "SELECT SUM(temperature) AS v FROM t",
+        "SELECT COUNT(*) AS v FROM t",
+        "SELECT COUNT(temperature) AS v FROM t",
+        "SELECT AVG(temperature) AS v FROM t",
+        "SELECT MIN(temperature) AS v FROM t",
+        "SELECT MAX(temperature) AS v FROM t",
+        "SELECT SUM(temperature) AS a, COUNT(*) AS b, AVG(temperature) AS c FROM t",
+        // With a coordinate filter (narrows the read).
+        "SELECT SUM(temperature) AS v FROM t WHERE lat = -10.0",
+        // Empty selection — aggregates of nothing.
+        "SELECT SUM(temperature) AS s, COUNT(*) AS c, MIN(temperature) AS m FROM t WHERE time = 99999",
+    ];
+    for sql in queries {
+        let baseline = run(&SessionContext::new(), sql).await;
+        let pushed = run(&ctx_pushdown(), sql).await;
+        assert_eq!(baseline, pushed, "value mismatch for `{sql}`");
+    }
 }

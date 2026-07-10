@@ -15,12 +15,32 @@ use std::sync::Arc;
 use datafusion::common::Result;
 use datafusion::config::ConfigOptions;
 use datafusion::physical_optimizer::PhysicalOptimizerRule;
-use datafusion::physical_plan::aggregates::AggregateExec;
+use datafusion::physical_plan::aggregates::{AggregateExec, AggregateMode};
 use datafusion::physical_plan::ExecutionPlan;
 
 use super::budget::{max_groups, MemoryBudget};
 use super::pushdown::{max_group_count, recognize};
+use crate::physical_plan::zarr_aggregate::ZarrAggregateExec;
 use crate::physical_plan::zarr_exec::ZarrExec;
+
+/// Walk down from an `AggregateExec` through single-child wrapper nodes (a partial
+/// `AggregateExec`, `CoalescePartitionsExec`, `RepartitionExec`, …) to the `ZarrExec`
+/// scan, returning the innermost `AggregateExec` (the one directly feeding the scan)
+/// paired with the scan. `None` if the descent forks or never reaches a `ZarrExec`.
+fn descend_to_zarr<'a>(
+    node: &'a Arc<dyn ExecutionPlan>,
+    last_agg: Option<&'a AggregateExec>,
+) -> Option<(&'a AggregateExec, &'a ZarrExec)> {
+    if let Some(zarr) = node.downcast_ref::<ZarrExec>() {
+        return last_agg.map(|agg| (agg, zarr));
+    }
+    let last = node.downcast_ref::<AggregateExec>().or(last_agg);
+    let children = node.children();
+    if children.len() != 1 {
+        return None;
+    }
+    descend_to_zarr(children[0], last)
+}
 
 /// Physical rule that stamps each `ZarrExec` with the streaming memory budget.
 #[derive(Debug)]
@@ -74,9 +94,41 @@ impl CardinalityRule {
         );
     }
 
+    /// Phase 7.3: rewrite a *global* aggregate (`SUM`/`COUNT`/`AVG`/`MIN`/`MAX` with
+    /// no `GROUP BY`) over a `ZarrExec` into a `ZarrAggregateExec`, replacing the whole
+    /// `AggregateExec ← ZarrExec` subtree. Declines (returns `None`) for anything not
+    /// of pushable shape, any `GROUP BY` (7.4/7.5), or a group count over budget.
+    fn try_pushdown_aggregate(
+        &self,
+        plan: &Arc<dyn ExecutionPlan>,
+    ) -> Option<Arc<dyn ExecutionPlan>> {
+        let top = plan.downcast_ref::<AggregateExec>()?;
+        // Only the result-producing aggregate (Single, or Final over a Partial).
+        if !matches!(
+            top.mode(),
+            AggregateMode::Single | AggregateMode::Final | AggregateMode::FinalPartitioned
+        ) {
+            return None;
+        }
+        let (inner_agg, zarr) = descend_to_zarr(plan, None)?;
+        let cand = recognize(inner_agg, zarr)?;
+        if !cand.group_keys.is_empty() {
+            return None; // GROUP BY is Phase 7.4/7.5.
+        }
+        let meta = zarr.store_meta()?;
+        if max_group_count(&cand, meta) > max_groups() {
+            return None;
+        }
+        let input: Arc<dyn ExecutionPlan> = Arc::new(zarr.clone());
+        Some(Arc::new(ZarrAggregateExec::new(input, cand.aggs, top.schema())))
+    }
+
     /// Recursively stamp every `ZarrExec` with the budget; leave all else untouched.
     fn annotate(&self, plan: Arc<dyn ExecutionPlan>) -> Result<Arc<dyn ExecutionPlan>> {
         self.observe_pushdown(&plan);
+        if let Some(pushed) = self.try_pushdown_aggregate(&plan) {
+            return Ok(pushed);
+        }
         if let Some(zarr) = plan.downcast_ref::<ZarrExec>() {
             // No budget configured => leave the node as-is (reader uses batch_size).
             let Some(budget) = self.budget else {
