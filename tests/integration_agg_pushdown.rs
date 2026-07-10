@@ -109,7 +109,11 @@ fn contains_node<T: ExecutionPlan + 'static>(plan: &Arc<dyn ExecutionPlan>) -> b
 }
 
 async fn run(ctx: &SessionContext, sql: &str) -> String {
-    register_zarr_table(ctx, "t", SYNTHETIC_V3);
+    run_on(ctx, SYNTHETIC_V3, sql).await
+}
+
+async fn run_on(ctx: &SessionContext, path: &str, sql: &str) -> String {
+    register_zarr_table(ctx, "t", path);
     let batches = execute_query(ctx, sql).await;
     // Compare on the rendered table: `pretty_format_batches` decodes dictionary
     // columns to their values (so different dict encodings compare equal) and is
@@ -194,4 +198,70 @@ async fn group_by_coordinate_is_value_equivalent() {
         let pushed = run(&ctx_pushdown(), sql).await;
         assert_eq!(baseline, pushed, "value mismatch for `{sql}`");
     }
+}
+
+// ---- Phase 7.5: periodic GROUP BY (date_part) — pushdown as an enabler ----
+
+const MONTHLY: &str = "data/monthly_v3.zarr"; // 6 monthly timestamps, temp = 0,10..50
+
+#[tokio::test]
+async fn periodic_group_by_rewritten_to_zarr_aggregate() {
+    let ctx = ctx_pushdown();
+    register_zarr_table(&ctx, "t", MONTHLY);
+    let plan = get_physical_plan(
+        &ctx,
+        "SELECT EXTRACT(month FROM time) AS m, SUM(temperature) AS s FROM t GROUP BY EXTRACT(month FROM time)",
+    )
+    .await;
+    assert!(contains_node::<ZarrAggregateExec>(&plan));
+    assert!(!contains_node::<AggregateExec>(&plan));
+}
+
+#[tokio::test]
+async fn periodic_group_by_enables_a_query_datafusion_cannot_run() {
+    // (1) Enabler: baseline DataFusion cannot GROUP BY date_part over a dictionary
+    //     coordinate — it asserts on the dictionary return type.
+    let base = SessionContext::new();
+    register_zarr_table(&base, "t", MONTHLY);
+    let baseline = base
+        .sql("SELECT EXTRACT(month FROM time) m, SUM(temperature) s FROM t GROUP BY EXTRACT(month FROM time)")
+        .await
+        .unwrap()
+        .collect()
+        .await;
+    assert!(
+        baseline.is_err(),
+        "baseline is expected to fail on date_part over a dict coordinate"
+    );
+
+    // (2) Anchor: GROUP BY the raw time coordinate IS baseline-valid, and pushdown
+    //     matches it — so time-grouped aggregates are a trusted reference.
+    let aggs_by_time = "SELECT SUM(temperature) AS s, COUNT(*) AS c, AVG(temperature) AS a, \
+                        MIN(temperature) AS mn, MAX(temperature) AS mx \
+                        FROM t GROUP BY time ORDER BY time";
+    let by_time_base = run_on(&SessionContext::new(), MONTHLY, aggs_by_time).await;
+    let by_time_push = run_on(&ctx_pushdown(), MONTHLY, aggs_by_time).await;
+    assert_eq!(by_time_base, by_time_push, "GROUP BY time must be equivalent");
+
+    // (3) Correctness: each month has exactly one timestamp in this fixture, so the
+    //     month-grouped aggregates must equal the time-grouped ones (same order).
+    let aggs_by_month = "SELECT SUM(temperature) AS s, COUNT(*) AS c, AVG(temperature) AS a, \
+                         MIN(temperature) AS mn, MAX(temperature) AS mx \
+                         FROM t GROUP BY EXTRACT(month FROM time) ORDER BY EXTRACT(month FROM time)";
+    let by_month_push = run_on(&ctx_pushdown(), MONTHLY, aggs_by_month).await;
+    assert_eq!(
+        by_month_push, by_time_push,
+        "periodic-grouped aggregates must match the time-grouped reference"
+    );
+}
+
+#[tokio::test]
+async fn periodic_group_single_month_matches_global() {
+    // era5_v3 is entirely January, so GROUP BY month yields one group whose aggregates
+    // equal the (baseline-valid) global aggregate — a cross-check on real data.
+    let global = "SELECT SUM(temperature) AS s, COUNT(*) AS c FROM t";
+    let by_month = "SELECT SUM(temperature) AS s, COUNT(*) AS c FROM t GROUP BY EXTRACT(month FROM time)";
+    let global_base = run_on(&SessionContext::new(), ERA5_V3, global).await;
+    let month_push = run_on(&ctx_pushdown(), ERA5_V3, by_month).await;
+    assert_eq!(global_base, month_push);
 }

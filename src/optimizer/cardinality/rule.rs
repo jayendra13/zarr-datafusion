@@ -118,10 +118,18 @@ impl CardinalityRule {
         if max_group_count(&cand, meta) > max_groups() {
             return None; // group table wouldn't fit — leave it to DataFusion.
         }
+        // The inner (partial/single) aggregate's group expressions are defined over
+        // the scan schema, so they can be evaluated directly on the scan's batches.
+        let group_exprs = inner_agg
+            .group_expr()
+            .expr()
+            .iter()
+            .map(|(e, _)| e.clone())
+            .collect();
         let input: Arc<dyn ExecutionPlan> = Arc::new(zarr.clone());
         Some(Arc::new(ZarrAggregateExec::new(
             input,
-            cand.group_names,
+            group_exprs,
             cand.aggs,
             top.schema(),
         )))

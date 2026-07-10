@@ -1,16 +1,22 @@
-//! `ZarrAggregateExec` — aggregate pushdown (Phases 7.3 global, 7.4 GROUP BY coord).
+//! `ZarrAggregateExec` — aggregate pushdown (Phases 7.3 global, 7.4 coordinate
+//! `GROUP BY`, 7.5 periodic `GROUP BY`).
 //!
 //! A recognized `SUM`/`COUNT`/`AVG`/`MIN`/`MAX` over a `ZarrExec` — with no `GROUP BY`
-//! (7.3) or grouped on coordinate columns (7.4) — is rewritten (by
+//! (7.3), grouped on coordinate columns (7.4), or on a periodic function of one such
+//! as `date_part('month', time)` (7.5) — is rewritten (by
 //! [`crate::optimizer::CardinalityRule`]) into this operator, which **replaces the
 //! whole `AggregateExec ← ZarrExec` subtree**. It drives the (projected, streaming)
-//! `ZarrExec` child and folds its batches into per-group accumulators instead of
-//! letting DataFusion hash-aggregate flattened rows. The group count is computed
-//! exactly (`group_cardinality`) and admitted against a budget, so the group table is
-//! known to fit. Emits one row per group in the aggregate's output schema
+//! `ZarrExec` child and folds its batches into per-group accumulators — keying each
+//! row on the evaluated `GROUP BY` expressions — instead of letting DataFusion
+//! hash-aggregate flattened rows. The group count is computed exactly
+//! (`group_cardinality`) and admitted against a budget, so the group table is known
+//! to fit. Emits one row per group in the aggregate's output schema
 //! (`[group cols…, agg cols…]`).
 //!
-//! Periodic grouping (month-of-time, …) is Phase 7.5.
+//! Note (7.5): grouping by `date_part` over a dictionary-encoded coordinate *fails*
+//! in stock DataFusion (a dictionary return-type assertion), so pushdown here is an
+//! *enabler* — it decodes the coordinate before evaluating the key, running a query
+//! the engine otherwise cannot.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -20,7 +26,7 @@ use arrow::datatypes::{DataType, SchemaRef};
 use arrow::record_batch::RecordBatch;
 use datafusion::error::{DataFusionError, Result};
 use datafusion::execution::TaskContext;
-use datafusion::physical_expr::EquivalenceProperties;
+use datafusion::physical_expr::{EquivalenceProperties, PhysicalExpr};
 use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType};
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::physical_plan::{
@@ -73,8 +79,13 @@ type Group = Vec<Acc>;
 pub struct ZarrAggregateExec {
     /// The scan to read (already projected to the group + aggregate columns).
     input: Arc<dyn ExecutionPlan>,
-    /// `GROUP BY` coordinate column names, in output-schema order. Empty => global.
-    group_cols: Vec<String>,
+    /// `GROUP BY` key expressions over the *scan* schema, in output-schema order.
+    /// Empty => global. Evaluating them per batch handles a bare coordinate column
+    /// (7.4) and a periodic function like `date_part('month', time)` (7.5) uniformly
+    /// — and, because we read the result value directly (not through DataFusion's
+    /// aggregate), a periodic group works even though DataFusion's own path asserts
+    /// on `date_part` over a dictionary-encoded coordinate.
+    group_exprs: Vec<Arc<dyn PhysicalExpr>>,
     /// Aggregates to compute, in output-schema order (after the group columns).
     aggs: Vec<AggSpec>,
     /// The aggregate's output schema: `[group cols…, agg cols…]`.
@@ -85,7 +96,7 @@ pub struct ZarrAggregateExec {
 impl ZarrAggregateExec {
     pub fn new(
         input: Arc<dyn ExecutionPlan>,
-        group_cols: Vec<String>,
+        group_exprs: Vec<Arc<dyn PhysicalExpr>>,
         aggs: Vec<AggSpec>,
         schema: SchemaRef,
     ) -> Self {
@@ -97,7 +108,7 @@ impl ZarrAggregateExec {
         ));
         Self {
             input,
-            group_cols,
+            group_exprs,
             aggs,
             schema,
             properties,
@@ -158,7 +169,7 @@ impl ZarrAggregateExec {
             .collect::<Result<_>>()?;
 
         // Global (no GROUP BY): one accumulator set, no per-row keying.
-        if self.group_cols.is_empty() {
+        if self.group_exprs.is_empty() {
             let group = groups.get_mut(&Vec::new()).expect("global group pre-inserted");
             for (i, spec) in self.aggs.iter().enumerate() {
                 for row in 0..batch.num_rows() {
@@ -168,15 +179,19 @@ impl ZarrAggregateExec {
             return Ok(());
         }
 
-        // Grouped: key each row by its group-column values.
-        let group_arrays: Vec<&ArrayRef> = self
-            .group_cols
+        // Grouped: evaluate each group-key expression on the batch, then key each row
+        // by the resulting values. Evaluating the expression (rather than reading a
+        // named column) handles coordinates and periodic functions uniformly.
+        //
+        // First decode dictionary-encoded coordinate columns to their value type:
+        // `date_part` over a dictionary returns a dictionary, tripping
+        // `ScalarFunctionExpr::evaluate`'s return-type assertion (the very reason the
+        // un-pushed query fails). Decoded input makes it return the plain Int32.
+        let decoded = decode_dictionaries(batch)?;
+        let group_arrays: Vec<ArrayRef> = self
+            .group_exprs
             .iter()
-            .map(|name| {
-                batch.column_by_name(name).ok_or_else(|| {
-                    DataFusionError::Internal(format!("group column {name} not in scan"))
-                })
-            })
+            .map(|e| e.evaluate(&decoded)?.into_array(decoded.num_rows()))
             .collect::<Result<_>>()?;
 
         for row in 0..batch.num_rows() {
@@ -194,7 +209,7 @@ impl ZarrAggregateExec {
 
     /// Build the output batch: one row per group, `[group cols…, agg cols…]`.
     fn finalize(&self, groups: &HashMap<Vec<ScalarValue>, Group>) -> Result<RecordBatch> {
-        let n_group = self.group_cols.len();
+        let n_group = self.group_exprs.len();
         // Fix a stable group order (map iteration order, materialized once).
         let keys: Vec<&Vec<ScalarValue>> = groups.keys().collect();
 
@@ -252,12 +267,48 @@ fn cast_to(arr: &ArrayRef, ty: &DataType) -> Result<ArrayRef> {
     }
 }
 
+/// Decode any dictionary-encoded columns of `batch` to their value type, leaving
+/// other columns untouched. Coordinate columns are dictionary-encoded; decoding
+/// them lets scalar functions (notably `date_part`) evaluate without the
+/// dictionary-return-type assertion. A no-op batch is returned as a cheap clone.
+fn decode_dictionaries(batch: &RecordBatch) -> Result<RecordBatch> {
+    use arrow::datatypes::{Field, Schema};
+    if !batch
+        .schema()
+        .fields()
+        .iter()
+        .any(|f| matches!(f.data_type(), DataType::Dictionary(_, _)))
+    {
+        return Ok(batch.clone());
+    }
+    let columns: Vec<ArrayRef> = batch
+        .columns()
+        .iter()
+        .map(|c| match c.data_type() {
+            DataType::Dictionary(_, v) => Ok(arrow::compute::cast(c, v)?),
+            _ => Ok(c.clone()),
+        })
+        .collect::<Result<_>>()?;
+    let fields: Vec<Field> = batch
+        .schema()
+        .fields()
+        .iter()
+        .map(|f| match f.data_type() {
+            DataType::Dictionary(_, v) => Field::new(f.name(), v.as_ref().clone(), f.is_nullable()),
+            _ => f.as_ref().clone(),
+        })
+        .collect();
+    RecordBatch::try_new(Arc::new(Schema::new(fields)), columns)
+        .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))
+}
+
 impl std::fmt::Debug for ZarrAggregateExec {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "ZarrAggregateExec(group={:?}, aggs={:?})",
-            self.group_cols, self.aggs
+            "ZarrAggregateExec(n_group={}, aggs={:?})",
+            self.group_exprs.len(),
+            self.aggs
         )
     }
 }
@@ -269,14 +320,15 @@ impl DisplayAs for ZarrAggregateExec {
             .iter()
             .map(|a| format!("{:?}({})", a.kind, a.column.as_deref().unwrap_or("*")))
             .collect();
-        if self.group_cols.is_empty() {
+        if self.group_exprs.is_empty() {
             write!(f, "ZarrAggregateExec: {}", names.join(", "))
         } else {
+            let keys: Vec<String> = self.group_exprs.iter().map(|e| e.to_string()).collect();
             write!(
                 f,
                 "ZarrAggregateExec: {} GROUP BY [{}]",
                 names.join(", "),
-                self.group_cols.join(", ")
+                keys.join(", ")
             )
         }
     }
@@ -301,7 +353,7 @@ impl ExecutionPlan for ZarrAggregateExec {
     ) -> Result<Arc<dyn ExecutionPlan>> {
         Ok(Arc::new(ZarrAggregateExec::new(
             children[0].clone(),
-            self.group_cols.clone(),
+            self.group_exprs.clone(),
             self.aggs.clone(),
             self.schema.clone(),
         )))
@@ -320,7 +372,7 @@ impl ExecutionPlan for ZarrAggregateExec {
         // Clone the small config into the fold future.
         let this = ZarrAggregateExec::new(
             self.input.clone(),
-            self.group_cols.clone(),
+            self.group_exprs.clone(),
             self.aggs.clone(),
             self.schema.clone(),
         );
@@ -330,7 +382,7 @@ impl ExecutionPlan for ZarrAggregateExec {
         let fut = async move {
             let mut groups: HashMap<Vec<ScalarValue>, Group> = HashMap::new();
             // A global aggregate always emits exactly one row, even over no data.
-            if this.group_cols.is_empty() {
+            if this.group_exprs.is_empty() {
                 groups.insert(Vec::new(), this.new_group());
             }
             // TODO(phase7): partitions are folded sequentially, serializing the scan.

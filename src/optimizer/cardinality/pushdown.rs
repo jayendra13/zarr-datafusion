@@ -17,9 +17,10 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
-use datafusion::physical_expr::PhysicalExpr;
+use datafusion::physical_expr::{PhysicalExpr, ScalarFunctionExpr};
 use datafusion::physical_plan::aggregates::AggregateExec;
-use datafusion::physical_plan::expressions::Column;
+use datafusion::physical_plan::expressions::{Column, Literal};
+use datafusion::scalar::ScalarValue;
 
 use super::{group_cardinality, AxisSet, GroupKey, ProductSet};
 use crate::physical_plan::zarr_exec::ZarrExec;
@@ -100,13 +101,18 @@ pub fn recognize(agg: &AggregateExec, zarr: &ZarrExec) -> Option<PushdownCandida
     }
 
     // --- grouping ---
+    // Each group key must be a bare coordinate column (→ Axis) or a periodic function
+    // of one, e.g. `date_part('month', time)` (→ Periodic). Anything else declines.
     let mut group_keys = Vec::new();
     let mut group_names = Vec::new();
-    for (_, name) in agg.group_expr().expr() {
-        // A coordinate `GROUP BY` names the coordinate in its output alias. Anything
-        // else (periodic function, data variable, expression) isn't handled here.
-        let axis = *coord_axis.get(name.as_str())?;
-        group_keys.push(GroupKey::Axis(axis));
+    for (expr, name) in agg.group_expr().expr() {
+        let key = column_axis(expr, &coord_axis)
+            .map(GroupKey::Axis)
+            .or_else(|| {
+                date_part_periodic(expr, &coord_axis)
+                    .map(|(axis, period)| GroupKey::Periodic { axis, period })
+            })?;
+        group_keys.push(key);
         group_names.push(name.clone());
     }
 
@@ -114,6 +120,60 @@ pub fn recognize(agg: &AggregateExec, zarr: &ZarrExec) -> Option<PushdownCandida
         aggs,
         group_keys,
         group_names,
+    })
+}
+
+/// The cube axis of a group key that is a bare coordinate column.
+fn column_axis(expr: &Arc<dyn PhysicalExpr>, coord_axis: &HashMap<&str, usize>) -> Option<usize> {
+    let col = expr.downcast_ref::<Column>()?;
+    coord_axis.get(col.name()).copied()
+}
+
+/// A group key of the form `date_part('<field>', <coord>)` → `(axis, period)`, where
+/// `period` bounds the distinct values (month→12, hour→24, …). `year` and unknown
+/// fields are *not* periodic and decline.
+fn date_part_periodic(
+    expr: &Arc<dyn PhysicalExpr>,
+    coord_axis: &HashMap<&str, usize>,
+) -> Option<(usize, u64)> {
+    let sf = expr.downcast_ref::<ScalarFunctionExpr>()?;
+    if sf.fun().name() != "date_part" {
+        return None;
+    }
+    let args = sf.args();
+    if args.len() != 2 {
+        return None;
+    }
+    let period = period_of(&literal_str(&args[0])?)?;
+    let col = args[1].downcast_ref::<Column>()?;
+    let axis = coord_axis.get(col.name()).copied()?;
+    Some((axis, period))
+}
+
+/// The string value of a UTF-8 literal expression, if it is one.
+fn literal_str(expr: &Arc<dyn PhysicalExpr>) -> Option<String> {
+    match expr.downcast_ref::<Literal>()?.value() {
+        ScalarValue::Utf8(Some(s))
+        | ScalarValue::LargeUtf8(Some(s))
+        | ScalarValue::Utf8View(Some(s)) => Some(s.clone()),
+        _ => None,
+    }
+}
+
+/// The period (max distinct values) of a `date_part` field, or `None` if the field
+/// is unbounded (`year`) or unrecognized.
+fn period_of(field: &str) -> Option<u64> {
+    Some(match field.to_ascii_lowercase().as_str() {
+        "month" => 12,
+        "day" => 31,
+        "hour" => 24,
+        "minute" => 60,
+        "second" => 60,
+        "quarter" => 4,
+        "doy" | "dayofyear" => 366,
+        "dow" | "dayofweek" => 7,
+        "week" => 53,
+        _ => return None,
     })
 }
 
