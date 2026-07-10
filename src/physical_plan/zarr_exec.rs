@@ -47,6 +47,12 @@ pub struct ZarrExec {
     /// — i.e. unchanged from Phase 4. The reader converts bytes -> row target via
     /// its own projected `row_width`.
     stream_budget_bytes: Option<u64>,
+    /// Store metadata (coordinates in cube-axis order + data variables), attached
+    /// so plan-level rules can reason about the cube: classify columns as
+    /// coordinate vs. data variable, map a coordinate to its axis, and read axis
+    /// extents. Used by the aggregate-pushdown recognizer (Phase 7). `None` for
+    /// callers that don't supply it (codec/tests) — recognition then declines.
+    store_meta: Option<ZarrStoreMeta>,
 }
 
 impl std::fmt::Debug for ZarrExec {
@@ -123,6 +129,7 @@ impl ZarrExec {
             cached_virtualizarr,
             partitions: Vec::new(),
             stream_budget_bytes: None,
+            store_meta: None,
         }
     }
 
@@ -214,6 +221,17 @@ impl ZarrExec {
         self.stream_budget_bytes
     }
 
+    /// Attach store metadata (coords in cube-axis order + data vars). Builder idiom.
+    pub fn with_store_meta(mut self, meta: Option<ZarrStoreMeta>) -> Self {
+        self.store_meta = meta;
+        self
+    }
+
+    /// Store metadata, if attached — coordinates (cube-axis order) and data variables.
+    pub fn store_meta(&self) -> Option<&ZarrStoreMeta> {
+        self.store_meta.as_ref()
+    }
+
     /// Get this scan's partition slices (empty == single unpartitioned read).
     /// Used by the distributed codec (to ship them) and the `TaskEstimator`
     /// (to split them across worker tasks).
@@ -237,6 +255,7 @@ impl ZarrExec {
         // borrowed (`&self`) and we can't move the Vec out of it.
         .with_partitions(self.partitions.clone())
         .with_stream_budget_bytes(self.stream_budget_bytes)
+        .with_store_meta(self.store_meta.clone())
     }
 }
 impl ExecutionPlan for ZarrExec {

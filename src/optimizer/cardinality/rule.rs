@@ -15,9 +15,11 @@ use std::sync::Arc;
 use datafusion::common::Result;
 use datafusion::config::ConfigOptions;
 use datafusion::physical_optimizer::PhysicalOptimizerRule;
+use datafusion::physical_plan::aggregates::AggregateExec;
 use datafusion::physical_plan::ExecutionPlan;
 
-use super::budget::MemoryBudget;
+use super::budget::{max_groups, MemoryBudget};
+use super::pushdown::{max_group_count, recognize};
 use crate::physical_plan::zarr_exec::ZarrExec;
 
 /// Physical rule that stamps each `ZarrExec` with the streaming memory budget.
@@ -40,8 +42,41 @@ impl CardinalityRule {
         Self { budget }
     }
 
+    /// Observe-only (Phase 7.2): if this node is an `AggregateExec` directly over a
+    /// `ZarrExec` with a pushable shape, log the recognized candidate and whether its
+    /// (upper-bound) group count fits the group budget. Drives no rewrite yet — this
+    /// is the seam Phase 7.3 will act on. Costs nothing when debug logging is off.
+    fn observe_pushdown(&self, plan: &Arc<dyn ExecutionPlan>) {
+        if !tracing::enabled!(tracing::Level::DEBUG) {
+            return;
+        }
+        let Some(agg) = plan.downcast_ref::<AggregateExec>() else {
+            return;
+        };
+        let Some(zarr) = agg.input().downcast_ref::<ZarrExec>() else {
+            return;
+        };
+        let Some(cand) = recognize(agg, zarr) else {
+            return;
+        };
+        let Some(meta) = zarr.store_meta() else {
+            return;
+        };
+        let groups = max_group_count(&cand, meta);
+        let cap = max_groups();
+        tracing::debug!(
+            aggs = ?cand.aggs,
+            group_by = ?cand.group_names,
+            max_groups = %groups,
+            cap = %cap,
+            pushable = groups <= cap,
+            "aggregate pushdown candidate (observe-only, Phase 7.2)"
+        );
+    }
+
     /// Recursively stamp every `ZarrExec` with the budget; leave all else untouched.
     fn annotate(&self, plan: Arc<dyn ExecutionPlan>) -> Result<Arc<dyn ExecutionPlan>> {
+        self.observe_pushdown(&plan);
         if let Some(zarr) = plan.downcast_ref::<ZarrExec>() {
             // No budget configured => leave the node as-is (reader uses batch_size).
             let Some(budget) = self.budget else {

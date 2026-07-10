@@ -502,7 +502,9 @@ impl TableProvider for ZarrTable {
         );
 
         // FILL 6d: attach the planned slices (builder consumes & returns exec).
-        let exec = exec.with_partitions(partitions);
+        let exec = exec
+            .with_partitions(partitions)
+            .with_store_meta(self.store_meta.clone());
 
         Ok(Arc::new(exec))
     }

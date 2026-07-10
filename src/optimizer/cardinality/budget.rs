@@ -43,6 +43,18 @@ impl MemoryBudget {
     }
 }
 
+/// The maximum number of output groups an aggregate may produce and still be a
+/// pushdown candidate (Phase 7): pushing an aggregate keeps one accumulator per
+/// group resident, so this caps that group table. Overridable via
+/// `ZARR_MAX_GROUPS`; defaults to 1,048,576 — comfortably covers coordinate and
+/// periodic group-bys while ruling out a group-per-cell blow-up.
+pub fn max_groups() -> u128 {
+    std::env::var("ZARR_MAX_GROUPS")
+        .ok()
+        .and_then(|s| s.trim().parse::<u128>().ok())
+        .unwrap_or(1 << 20)
+}
+
 /// Verdict for a scan whose predicted peak footprint exceeds the budget. Carries
 /// the exact numbers so the warning/error is actionable.
 #[derive(Debug, Clone, PartialEq, Eq)]

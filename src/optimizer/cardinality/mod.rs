@@ -19,10 +19,13 @@ pub mod axis;
 pub mod backend;
 pub mod budget;
 pub mod cost;
+pub mod group;
 pub mod index_set;
 pub mod predicate;
+pub mod pushdown;
 pub mod rule;
 
 pub use axis::{Axis, CubeShape};
 pub use backend::product::{AxisSet, ProductSet};
+pub use group::{group_cardinality, GroupKey};
 pub use index_set::{AffineMap, IndexSet};
