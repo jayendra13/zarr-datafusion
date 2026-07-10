@@ -486,7 +486,7 @@ src/
 - [x] Date-part coordinate filters (`WHERE extract(month FROM time) IN (...)`)
 - [x] Partition pruning (skip chunks outside the coordinate selection)
 - [ ] Data variable filter pushdown (`WHERE temperature > 20`)
-- [ ] Aggregate pushdown (push `SUM/AVG/COUNT` to chunk level)
+- [x] Aggregate pushdown (`SUM/COUNT/AVG/MIN/MAX`, incl. `GROUP BY` coordinate / month) — admitted by exact group cardinality
 - [ ] Top-K optimization (`ORDER BY x LIMIT k` without full sort)
 
 ### REPL Experience

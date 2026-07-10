@@ -265,3 +265,46 @@ async fn periodic_group_single_month_matches_global() {
     let month_push = run_on(&ctx_pushdown(), ERA5_V3, by_month).await;
     assert_eq!(global_base, month_push);
 }
+
+// ---- Phase 7.6: viability fallback ----
+
+/// Pushdown context with an explicit group budget.
+fn ctx_with_group_budget(n: u128) -> SessionContext {
+    let state = SessionStateBuilder::new()
+        .with_default_features()
+        .with_physical_optimizer_rule(Arc::new(CardinalityRule::new().with_group_budget(n)))
+        .build();
+    SessionContext::new_with_state(state)
+}
+
+#[tokio::test]
+async fn over_budget_group_by_falls_back_to_datafusion() {
+    // GROUP BY lat, lon => 100 groups over the synthetic universe. With a budget of
+    // 50 the aggregate is not pushed; DataFusion handles it, still correctly.
+    let ctx = ctx_with_group_budget(50);
+    register_zarr_table(&ctx, "t", SYNTHETIC_V3);
+    let plan = get_physical_plan(&ctx, "SELECT lat, lon, COUNT(*) AS c FROM t GROUP BY lat, lon").await;
+    assert!(
+        !contains_node::<ZarrAggregateExec>(&plan),
+        "an over-budget group-by must not be pushed"
+    );
+    assert!(
+        contains_node::<AggregateExec>(&plan),
+        "it falls back to DataFusion's aggregate"
+    );
+
+    let sql = "SELECT lat, lon, COUNT(*) AS c FROM t GROUP BY lat, lon ORDER BY lat, lon";
+    let baseline = run(&SessionContext::new(), sql).await;
+    let fallback = run(&ctx_with_group_budget(50), sql).await;
+    assert_eq!(baseline, fallback, "fallback result must be correct");
+}
+
+#[tokio::test]
+async fn within_budget_group_by_is_pushed() {
+    // The same shape, but a budget of 200 admits the 100 groups -> pushed.
+    let ctx = ctx_with_group_budget(200);
+    register_zarr_table(&ctx, "t", SYNTHETIC_V3);
+    let plan = get_physical_plan(&ctx, "SELECT lat, lon, COUNT(*) AS c FROM t GROUP BY lat, lon").await;
+    assert!(contains_node::<ZarrAggregateExec>(&plan));
+    assert!(!contains_node::<AggregateExec>(&plan));
+}

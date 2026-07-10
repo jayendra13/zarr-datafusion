@@ -105,6 +105,27 @@ Commit hashes point at the change that introduced or settled the decision.
   materializing huge coordinate arrays and rejects impossible filters
   (`lat = 100` when bounds are `[0, 90]`) before any read.
 
+### 10b. Aggregate pushdown driven by exact group cardinality (Phase 7)
+- **Decision:** A `SUM`/`COUNT`/`AVG`/`MIN`/`MAX` over a `ZarrExec` — global, grouped
+  on coordinate columns, or on a periodic function of one (`date_part('month', time)`)
+  — is rewritten by `CardinalityRule` into a self-contained `ZarrAggregateExec`
+  (`physical_plan/zarr_aggregate.rs`) that **replaces the whole `AggregateExec ←
+  ZarrExec` subtree**. It drives the streaming scan and folds each batch into per-group
+  accumulators, keying rows on the evaluated `GROUP BY` expressions. The decision is
+  *deterministic*: the exact output-group count is computed by lattice counting
+  (`group_cardinality`, exact for coordinate keys, period-bounded for periodic) and
+  admitted against a group budget (`ZARR_MAX_GROUPS`); over budget, the rule declines
+  and DataFusion handles it unchanged.
+- **Rationale:** Because gridded data has a known regular shape, the group count is
+  *computed*, not estimated — so pushdown is chosen only when the group table is
+  provably bounded, never heuristically. Two payoffs beyond skipping DataFusion's
+  hash-aggregate: it is the seam the exact-cardinality cost model plugs into, and — for
+  periodic grouping over a dictionary-encoded coordinate, which **fails outright in
+  stock DataFusion** (a `date_part` dictionary return-type assertion) — the operator
+  decodes the coordinate before evaluating the key and so *enables a query the engine
+  otherwise cannot run*. See `docs/exact-cardinality-optimizer.md`; verified in
+  `tests/integration_agg_pushdown.rs`.
+
 ---
 
 ## Domain correctness (climate / CF semantics)

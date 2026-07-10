@@ -42,24 +42,39 @@ fn descend_to_zarr<'a>(
     descend_to_zarr(children[0], last)
 }
 
-/// Physical rule that stamps each `ZarrExec` with the streaming memory budget.
+/// Physical rule that stamps each `ZarrExec` with the streaming memory budget and
+/// pushes admissible aggregates into a `ZarrAggregateExec`.
 #[derive(Debug)]
 pub struct CardinalityRule {
     budget: Option<MemoryBudget>,
+    /// Max output groups an aggregate may produce and still be pushed (Phase 7.6).
+    group_budget: u128,
 }
 
 impl CardinalityRule {
     /// Budget from `ZARR_MEM_BUDGET_BYTES` — matches the reader's env fallback, so
-    /// registering the rule is behaviour-neutral until a budget is configured.
+    /// registering the rule is behaviour-neutral until a budget is configured. The
+    /// group budget defaults from `ZARR_MAX_GROUPS`.
     pub fn new() -> Self {
         Self {
             budget: MemoryBudget::from_env(),
+            group_budget: max_groups(),
         }
     }
 
-    /// Construct with an explicit budget (for tests / programmatic sessions).
+    /// Construct with an explicit memory budget (for tests / programmatic sessions).
     pub fn with_budget(budget: Option<MemoryBudget>) -> Self {
-        Self { budget }
+        Self {
+            budget,
+            group_budget: max_groups(),
+        }
+    }
+
+    /// Set the aggregate-pushdown group budget (for tests): a group-by whose exact
+    /// group count exceeds this is left for DataFusion.
+    pub fn with_group_budget(mut self, group_budget: u128) -> Self {
+        self.group_budget = group_budget;
+        self
     }
 
     /// Observe-only (Phase 7.2): if this node is an `AggregateExec` directly over a
@@ -83,7 +98,7 @@ impl CardinalityRule {
             return;
         };
         let groups = max_group_count(&cand, meta);
-        let cap = max_groups();
+        let cap = self.group_budget;
         tracing::debug!(
             aggs = ?cand.aggs,
             group_by = ?cand.group_names,
@@ -115,7 +130,7 @@ impl CardinalityRule {
         // Global (7.3) and coordinate GROUP BY (7.4) are handled; the recognizer only
         // yields coordinate-axis group keys (periodic is 7.5).
         let meta = zarr.store_meta()?;
-        if max_group_count(&cand, meta) > max_groups() {
+        if max_group_count(&cand, meta) > self.group_budget {
             return None; // group table wouldn't fit — leave it to DataFusion.
         }
         // The inner (partial/single) aggregate's group expressions are defined over
