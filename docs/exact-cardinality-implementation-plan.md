@@ -322,6 +322,47 @@ cost to the default build.
 - **Feature-off safety:** default build compiles and runs with the conservative
   fallback; coupled queries still execute (just without the exact-count decision).
 
+**Motivating queries.** Five recurring, *affine*-coupled climate queries justify the
+backend (full write-up, per-query shape and expected q-error in
+[`exact-cardinality-tier-b-use-cases.md`](exact-cardinality-tier-b-use-cases.md)):
+1. **Forecast verification** — `valid = init + lead`, windowed → diagonal band in the
+   (init, lead) plane (the freeze / forecast-vs-ERA5 cookbook).
+2. **ONI 3-month running seasons** — `|member − center| ≤ 1` → band with month wrap
+   (the el-niño ONI cookbook).
+3. **Heatwave / spell detection** — `a.time ≤ b.time ≤ a.time + N` → band self-join.
+4. **Coarsening / regrid** — `coarse = ⌊fine / k⌋` → floor-division map.
+5. **Cumulative accumulation** (GDD, cumulative precip) — `b.time ≤ a.time` → triangle
+   (windowed variant → band).
+The band and floor-map cases (1, 3, 4, 5-windowed) have **large** q-error vs the naïve
+product-of-extents and are the ones worth building for; the triangle (5-full) and the
+3-wide band (2) are only ~2–4× and likely change no decision.
+
+**Measuring the improvement.** Three levels, measured in order:
+- **Level 1 — q-error** (`max(est/truth, truth/est)`) against a brute-force oracle:
+  the plan-independent headline, and the framing the thesis wants (computed → q-error
+  ≈ 1). Needs no DataFusion plumbing.
+- **Level 2 — plan sensitivity:** `EXPLAIN VERBOSE` tree-diff (join order, join
+  algorithm, partition count, `ZarrAggregateExec` presence) — the estimate only matters
+  where it *crosses a decision threshold*.
+- **Level 3 — runtime:** `EXPLAIN ANALYZE` (time, peak memory, bytes, spills), only for
+  queries whose plan flipped.
+- **Plumbing caveat:** pushdown-admission and partition fan-out already consume *our*
+  cardinality (a Tier-B estimate flips them immediately, visible in `EXPLAIN`); but
+  **join order/algorithm** need the exact count *published into DataFusion's
+  `Statistics`* first — until that small bridge exists, the join plan is byte-identical
+  and only Level 1 differs.
+
+**Effort deconstruction.** W1 — `barvinok → isl → GMP` build/FFI (M–L, **high** risk,
+static-musl CLI especially; `iscc` prototype first). W2 — `backend/isl.rs` (M;
+`touched_tiles` under floor-division is the fiddly method). W3 — *the consumer gap*
+(M–L): nothing produces coupled predicates today (filters are `coord op value`) and the
+reader can't read non-box selections, so a value-delivering Phase 8 also needs a
+coupled-predicate surface + reader fallback, or the "publish into `Statistics`" bridge
+for joins. W4 — fallback/gating/docs (S–M; mostly *already there* via `apply → None`).
+W5 — testing (M; needs the C libs in CI). **Current value ≈ 0** (no live query needs
+it); this is the research tail — build a bounded `iscc` spike (licensing test + one
+coupled golden) before committing to the FFI/consumer work.
+
 ---
 
 ## Where to stop
