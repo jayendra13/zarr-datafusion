@@ -116,23 +116,45 @@ WHERE NOT isnan(b08 - b04);
 
 ## Plots
 
-[`plots.py`](plots.py) displays the recipe output — fully offline, reading the
-frozen `ndvi.csv.gz` (the `ndvi.sql` result; regenerate with the `COPY … STORED
-AS CSV` shown at the top of the script, then `gzip -9`):
+[`plots.py`](plots.py) displays the recipe output — reading the frozen
+`ndvi.csv.gz` (the `ndvi.sql` result; regenerate with the `COPY … STORED AS CSV`
+shown at the top of the script, then `gzip -9`). The two maps carry a **locator
+inset with country borders + coastline** (cartopy) so the ~10 km window is placed
+geographically — it sits in **Piedmont, NW Italy, near the French/Alpine border**.
+No border crosses a 10 km tile, so that context lives in the inset, not on the
+raster. cartopy/pyproj are optional: without them the maps still render, minus the
+inset.
 
 ```bash
-uv run --with pandas --with numpy --with matplotlib cookbook/ndvi/plots.py
+uv run --with pandas --with numpy --with matplotlib --with cartopy --with pyproj \
+    cookbook/ndvi/plots.py
 ```
 
-| output | what it shows |
-|---|---|
-| `ndvi_map.png` | the NDVI raster — the flat `(x, y, ndvi)` table **pivoted back into the 2D scene**. The whole point: a Zarr scene *is* a table, and the table *is* the scene. |
-| `ndvi_hist.png` | NDVI distribution over the valid pixels, with the mean and the standard land-cover thresholds. |
-| `ndvi_landcover.png` | NDVI binned into land-cover classes (water/snow, bare soil, sparse/moderate/dense vegetation) — the per-pixel expression turned into a classified map. |
+### NDVI raster — the table *is* the scene
 
-The window sits in the Alpine foothills near Turin: green agricultural valleys
-and field parcels, bare/rocky slopes, and snow on the high peaks (which reads
-NDVI < 0, same as water).
+![NDVI raster over the Sentinel-2 window, with a locator inset showing its position in NW Italy](ndvi_map.png)
+
+The flat `(x, y, ndvi)` table pivoted back into the 2D scene on a red→green
+vegetation ramp — the whole point of the recipe: a Zarr scene *is* a table, and
+the table *is* the scene. Green agricultural valleys and field parcels, bare/rocky
+slopes to the west, and snow on the high peaks (which reads NDVI < 0, same as
+water). The inset marks the footprint SW of Turin.
+
+### NDVI distribution
+
+![Histogram of NDVI over the valid pixels with the mean and land-cover thresholds marked](ndvi_hist.png)
+
+NDVI over the 1,048,496 valid pixels: a bare-soil/snow peak near 0 and a long
+vegetation tail out to ~0.8, with the mean (0.2354) and the standard land-cover
+thresholds marked.
+
+### NDVI land cover — the per-pixel expression, classified
+
+![Classified land-cover map from NDVI breaks, with the same locator inset](ndvi_landcover.png)
+
+The same raster binned into land-cover classes (water/snow, bare soil,
+sparse/moderate/dense vegetation) at the standard remote-sensing NDVI breaks — the
+per-pixel expression turned into a thematic map.
 
 ## Writing results to Parquet
 

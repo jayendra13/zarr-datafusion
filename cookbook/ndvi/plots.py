@@ -15,22 +15,43 @@ offline and reproducible — no remote scan. The CSV is the frozen result of
                            table IS the scene.
   2. ndvi_hist.png       — distribution of NDVI over the valid pixels, with the
                            mean and the usual land-cover thresholds marked.
-  3. ndvi_landcover.png  — NDVI binned into land-cover classes (water/built,
+  3. ndvi_landcover.png  — NDVI binned into land-cover classes (water/snow,
                            bare soil, sparse, moderate, dense vegetation): the
                            per-pixel expression turned into a classified map.
 
+Both maps carry a LOCATOR INSET with country borders + coastline (cartopy) so the
+~10 km window is placed geographically — it sits in Piedmont, NW Italy, near the
+French/Alpine border. (No border crosses a 10 km tile, so the context belongs in
+the inset, not on the raster.) cartopy/pyproj are optional: without them the maps
+still render, just without the inset.
+
 Usage:
-    uv run --with pandas --with numpy --with matplotlib \
+    uv run --with pandas --with numpy --with matplotlib --with cartopy --with pyproj \
         cookbook/ndvi/plots.py
 """
 
 import argparse
+import warnings
 from pathlib import Path
 
+import matplotlib.patches as mpatches
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 from matplotlib.colors import BoundaryNorm, ListedColormap
+
+# Geographic locator is optional — degrade gracefully if cartopy/pyproj absent.
+try:
+    import cartopy.crs as ccrs
+    import cartopy.feature as cfeature
+    from pyproj import Transformer
+
+    _HAVE_GEO = True
+except ImportError:  # pragma: no cover
+    _HAVE_GEO = False
+
+UTM_EPSG = 32632          # scene CRS: WGS 84 / UTM zone 32N (from the store attrs)
+TURIN = (7.686, 45.070)   # city marker for orientation in the locator
 
 # Land-cover NDVI break points (standard remote-sensing convention) and the
 # labels/colors for the classified map. Edges feed both the histogram guides and
@@ -56,6 +77,43 @@ def to_grid(df):
     return g.to_numpy(), extent
 
 
+def scene_lonlat_bounds(df):
+    """Convert the window's UTM (x, y) extent to lon/lat corners for the locator.
+    Returns (lon_w, lon_e, lat_s, lat_n), or None if pyproj/cartopy are absent."""
+    if not _HAVE_GEO:
+        return None
+    t = Transformer.from_crs(UTM_EPSG, 4326, always_xy=True)
+    xs, ys = df["x"], df["y"]
+    lon0, lat0 = t.transform(xs.min(), ys.min())
+    lon1, lat1 = t.transform(xs.max(), ys.max())
+    return min(lon0, lon1), max(lon0, lon1), min(lat0, lat1), max(lat0, lat1)
+
+
+def add_locator(fig, bounds, rect=(0.135, 0.135, 0.24, 0.24)):
+    """Draw a small regional map (country borders + coastline) with the scene
+    footprint marked, so the ~10 km window is placed geographically. No-op when
+    cartopy/pyproj are unavailable."""
+    if not _HAVE_GEO or bounds is None:
+        return
+    lon_w, lon_e, lat_s, lat_n = bounds
+    ax = fig.add_axes(rect, projection=ccrs.PlateCarree())
+    ax.set_extent([5.0, 10.6, 43.3, 47.1], crs=ccrs.PlateCarree())
+    ax.add_feature(cfeature.LAND, facecolor="#efece4")
+    ax.add_feature(cfeature.OCEAN, facecolor="#cfe2f3")
+    ax.add_feature(cfeature.BORDERS, lw=0.7, edgecolor="0.3")
+    ax.coastlines("50m", lw=0.5, color="0.3")
+    # The footprint is tiny at this scale — draw the box AND a centroid marker.
+    ax.add_patch(mpatches.Rectangle((lon_w, lat_s), lon_e - lon_w, lat_n - lat_s,
+                                    fill=False, edgecolor="#c0392b", lw=1.4, zorder=5))
+    ax.plot((lon_w + lon_e) / 2, (lat_s + lat_n) / 2, "s", ms=5,
+            color="#c0392b", mec="white", mew=0.5, zorder=6)
+    ax.plot(*TURIN, "o", ms=3, color="0.15", zorder=6)
+    ax.text(TURIN[0] + 0.15, TURIN[1], "Turin", fontsize=6, va="center", zorder=6)
+    ax.set_title("scene location", fontsize=7, pad=2)
+    for s in ax.spines.values():
+        s.set_edgecolor("0.4")
+
+
 def plot_map(df, out):
     Z, extent = to_grid(df)
     fig, ax = plt.subplots(figsize=(8.5, 7.5))
@@ -67,8 +125,8 @@ def plot_map(df, out):
     ax.set_ylabel("northing (km)")
     cb = fig.colorbar(im, ax=ax, pad=0.02, shrink=0.85)
     cb.set_label("NDVI = (NIR − Red) / (NIR + Red)")
-    fig.tight_layout()
-    fig.savefig(out, dpi=150)
+    add_locator(fig, scene_lonlat_bounds(df))
+    fig.savefig(out, dpi=150, bbox_inches="tight")
     print(f"wrote {out}")
 
 
@@ -112,8 +170,8 @@ def plot_landcover(df, out):
                       ticks=[(a + b) / 2 for a, b in
                              zip(CLASS_EDGES[:-1], CLASS_EDGES[1:])])
     cb.ax.set_yticklabels(CLASS_NAMES)
-    fig.tight_layout()
-    fig.savefig(out, dpi=150)
+    add_locator(fig, scene_lonlat_bounds(df))
+    fig.savefig(out, dpi=150, bbox_inches="tight")
     print(f"wrote {out}")
 
 

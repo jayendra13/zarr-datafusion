@@ -1,7 +1,14 @@
-# NASA Openscapes Cookbook — Adoption Assessment
+# Cookbook Adaptation Assessment
 
-Assessment of the [NASA Earthdata Cloud Cookbook](https://nasa-openscapes.github.io/earthdata-cloud-cookbook/tutorials/)
-tutorials for expanding the zarr-datafusion `cookbook/`. Captured 2026-07-10.
+Assessment of external cookbooks/tutorials for expanding the zarr-datafusion
+`cookbook/`. The bulk of this doc evaluates the [NASA Earthdata Cloud Cookbook](https://nasa-openscapes.github.io/earthdata-cloud-cookbook/tutorials/)
+(candidates, not yet shipped; captured 2026-07-10); the
+[Shipped adaptations](#shipped-adaptations) section at the end tracks recipes
+already adapted from other sources.
+
+# NASA Openscapes Cookbook
+
+Assessment of the NASA Earthdata Cloud Cookbook tutorials.
 
 ## Key structural fact
 
@@ -64,8 +71,42 @@ tokens) and assume in-region `us-west-2` S3 access. Our remote reader currently
 opens stores anonymously — EDL-credential support (or pre-staged public
 mirrors) is needed before these run end-to-end.
 
+# Shipped adaptations
+
+Recipes already adapted from cookbooks *other* than NASA Openscapes.
+
+## NDVI — xarray-sql geospatial benchmark
+
+[`cookbook/ndvi/`](../cookbook/ndvi/) adapts
+[xarray-sql's `benchmarks/geospatial/01_ndvi.py`](https://github.com/xqlsystems/xarray-sql/blob/main/benchmarks/geospatial/01_ndvi.py)
+(sibling to the `02_climatology.py` we already mirror in `cookbook/climatology/`).
+It computes NDVI `(b08 - b04) / (b08 + b04)` as one **per-pixel** SQL expression
+over a 1024×1024 Sentinel-2 L2A window — the *projection* counterpart to the
+aggregation recipes, matching xarray to 4 decimals.
+
+**Relevance to the NASA caveat above.** The remote-read spike for this recipe
+concretely reproduced the [Caveat](#recommendation)'s "our remote reader isn't
+ready for these stores" warning — two distinct blockers any NASA Tier-1
+(virtual-Zarr) or Tier-3 (native-Zarr endpoint) recipe will hit:
+
+1. **HTTP object_store can't list a Ceph/S3 endpoint.** Pointing at a group with
+   no group-level consolidated metadata forces a directory listing; the EODC
+   endpoint answered `PROPFIND` with `405 Method Not Allowed`.
+2. **Root-level consolidated `.zmetadata` spans the whole hierarchical product.**
+   The EOPF product's only consolidated metadata sits at the root and mixes
+   10/20/60 m arrays (different shapes, multiple `x`/`y`); the reader folds them
+   into one Cartesian coord cube and overflows the shape product.
+
+Resolution shipped: a local sample store written by
+`scripts/gen_ndvi_scene.py`, which resolves the scene via the same STAC path as
+the benchmark. Making these remote stores work directly (prefix-filtering a
+consolidated `.zmetadata` down to one subgroup; an S3 backend with custom
+endpoint + tenant + anonymous auth) is the reader work that also unblocks the
+NASA Tier-1 recipes.
+
 ## Sources
 
+- [xarray-sql geospatial benchmarks](https://github.com/xqlsystems/xarray-sql/tree/main/benchmarks/geospatial) — source of the shipped NDVI (`01_ndvi.py`) and climatology (`02_climatology.py`) recipes
 - [Earthdata Cloud Clinic](https://nasa-openscapes.github.io/earthdata-cloud-cookbook/tutorials/Earthdata-cloud-clinic.html)
 - [GES DISC MERRA-2 Kerchunk](https://nasa-openscapes.github.io/earthdata-cloud-cookbook/examples/GESDISC/GESDISC_MERRA2_tavg1_2d_flx_Nx__Kerchunk.html)
 - [PO.DAAC ECCO SSH Kerchunk](https://nasa-openscapes.github.io/earthdata-cloud-cookbook/examples/PODAAC/PODAAC_ECCO_SSH__Kerchunk.html)
