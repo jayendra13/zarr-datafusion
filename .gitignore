@@ -10,6 +10,9 @@ sql/out.txt
 sql/*.oout
 *.swp
 
+# Business/pitch docs — kept local only, never committed
+docs/business/
+
 # Python
 __pycache__/
 
