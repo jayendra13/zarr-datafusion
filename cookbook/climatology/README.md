@@ -1,15 +1,29 @@
 # Climatology cookbook — gridded normals via SQL
 
-Builds **monthly temperature normals** from ARCO-ERA5 with a single SQL query.
-Two variants:
+Builds temperature **climatologies** from ARCO-ERA5 with a single SQL query.
+Three variants:
 
 | file | scope | output rows | cost |
 |------|-------|------------|------|
+| [`diurnal_climatology.sql`](diurnal_climatology.sql) | CONUS box, hour-of-day cycle, 3-day window | 101 × 221 × 24 = **535 K** | ~300 MB (72 timesteps) |
 | [`city_climatology.sql`](city_climatology.sql) | 10 largest cities, nearest grid cell | 10 × 12 = **120** | ~1–2 GB (mid-month sample) |
 | [`monthly_climatology.sql`](monthly_climatology.sql) | whole 0.25° grid, **all** timesteps | 12 × 721 × 1440 = **12.4 M** | hundreds of GB–~1 TB (stress test) |
 
-Both use the same base period (default **1991–2020**, the WMO standard normal),
-the same `era5` GCS table, and the same dict-encoding `arrow_cast` gotchas.
+All use the same `era5` GCS table and the same dict-encoding `arrow_cast`
+gotchas. The two *monthly* variants use the WMO 1991–2020 base period; the
+diurnal variant instead groups by hour-of-day over a short bounded window.
+
+## Diurnal variant (cheapest — start here)
+
+`diurnal_climatology.sql` is the canonical **"a climatology is a `GROUP BY`, not
+a rechunk"** workload: `GROUP BY latitude, longitude, hour` with `AVG` — exactly
+`da.groupby("time.hour").mean()`, but the `WHERE` prunes a multi-decade archive
+down to a 72-timestep window so you pay only for the slice you ask for. It mirrors
+[xarray-sql's `02_climatology.py`](https://github.com/xqlsystems/xarray-sql/blob/main/benchmarks/geospatial/02_climatology.py)
+benchmark. `hour` is derived in the `GROUP BY` (after the read), not a filter, so
+all three coordinate predicates stay contiguous ranges — no scattered-`Indices`
+conflict. Widen the date range for a seasonal diurnal normal; the row count is
+fixed by grid × 24.
 
 ## City variant (start here)
 
@@ -60,9 +74,53 @@ year range and/or uncommenting the spatial sub-grid `BETWEEN`.
 ## Run
 
 ```bash
+zarr-cli cookbook/climatology/diurnal_climatology.sql   # 535K rows — redirect to a file
 zarr-cli cookbook/climatology/city_climatology.sql      # 120 rows
 zarr-cli cookbook/climatology/monthly_climatology.sql   # 12.4M rows — redirect to a file
 ```
+
+## Plots (diurnal variant)
+
+`plots.py` turns the 535 K-row diurnal result into three figures. It reads the
+**frozen** recipe output `diurnal_climatology.csv.gz` (the committed result of
+`diurnal_climatology.sql`), so it is fully offline — **no remote scan**. To
+refresh the CSV, wrap the query in a CSV `COPY` (see *Writing results* below) and
+gzip it.
+
+```bash
+uv run --with pandas --with numpy --with matplotlib \
+    cookbook/climatology/plots.py
+```
+
+### 1. The average day — `diurnal_cycles.png`
+
+![diurnal cycles](diurnal_cycles.png)
+
+Mean 2 m temperature vs **local solar hour** at four contrasting cells. Aligning
+on solar time makes every cycle peak near local afternoon, so only the
+**amplitude** differs — and that difference is the physics: the arid Great Basin
+swings ~15 °C between night and afternoon, while the marine Pacific-NW coast
+barely moves (~5 °C). This is what `GROUP BY lat, lon, hour` *is*.
+
+### 2. Diurnal temperature range — `diurnal_range_map.png`
+
+![diurnal range map](diurnal_range_map.png)
+
+Per-cell `max − min` over the 24 hours, i.e. the nD cube flattened straight back
+to a map. The North American **coastline draws itself** — dark, low-range ocean
+vs bright, high-range land — with the Great Lakes and Gulf of Mexico clearly
+resolved. Nothing here knows about geography; the land/sea contrast falls out of
+the diurnal range alone. Cyan rings mark the four cells from plot 1.
+
+### 3. Hour of peak warmth — `peak_hour_map.png`
+
+![peak hour map](peak_hour_map.png)
+
+The **UTC** hour of each cell's daily maximum. It sweeps later from east to west
+(east coast peaks ~20 UTC, west coast ~23 UTC) — a timezone gradient emerging
+purely from the data, proof the longitude axis is real. Ocean cells (where the
+flat cycle makes "hour of max" meaningless noise) are masked by a diurnal-range
+floor.
 
 ## Writing results to Parquet
 
@@ -73,6 +131,15 @@ final `SELECT` (drop `ORDER BY` for the write):
 COPY ( <the WITH ... SELECT ... GROUP BY ...> )
 TO 'cookbook/climatology/city_climatology_1991_2020.parquet'
 STORED AS PARQUET;
+```
+
+Same shape for CSV — this is how `diurnal_climatology.csv.gz` (the input to
+`plots.py`) is produced; drop `ORDER BY`, write CSV, then `gzip`:
+
+```sql
+COPY ( <the diurnal WITH ... SELECT ... GROUP BY ...> )
+TO 'cookbook/climatology/diurnal_climatology.csv'
+STORED AS CSV;
 ```
 
 ## Validating the normals
