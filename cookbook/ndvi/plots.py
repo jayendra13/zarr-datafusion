@@ -19,11 +19,13 @@ offline and reproducible — no remote scan. The CSV is the frozen result of
                            bare soil, sparse, moderate, dense vegetation): the
                            per-pixel expression turned into a classified map.
 
-Both maps carry a LOCATOR INSET with country borders + coastline (cartopy) so the
-~10 km window is placed geographically — it sits in Piedmont, NW Italy, near the
-French/Alpine border. (No border crosses a 10 km tile, so the context belongs in
-the inset, not on the raster.) cartopy/pyproj are optional: without them the maps
-still render, just without the inset.
+Both maps are GEOREFERENCED: the raster is drawn on a cartopy GeoAxes in the
+scene's CRS (UTM zone 32N) with coastline + country-border features and a lon/lat
+graticule, plus a small locator inset. At this ~10 km frame no border/coast
+actually intersects (the nearest is the Alpine crest ~20 km west), so the visible
+country line lives in the inset; the main map carries true lon/lat axes and the
+features are enabled for a proper geographic canvas. cartopy/pyproj are optional:
+without them the maps fall back to plain km axes (no features, no inset).
 
 Usage:
     uv run --with pandas --with numpy --with matplotlib --with cartopy --with pyproj \
@@ -31,7 +33,6 @@ Usage:
 """
 
 import argparse
-import warnings
 from pathlib import Path
 
 import matplotlib.patches as mpatches
@@ -66,15 +67,47 @@ CLASS_COLORS = ["#2c7fb8", "#d9b382", "#c2e699", "#78c679", "#238443"]
 
 def to_grid(df):
     """Pivot the flat (x, y, ndvi) table back into a 2D raster for imshow.
-    Returns (Z, extent) with north (max y) at the top."""
+    Returns (Z, ext_utm, ext_km) with north (max y) at the top: ext_utm is the
+    true UTM-metre extent (for the georeferenced cartopy map), ext_km is metres
+    → km relative to the SW corner (fallback when cartopy is unavailable)."""
     g = df.pivot_table(index="y", columns="x", values="ndvi")
     g = g.sort_index(ascending=False)          # northing descending → north on top
     xs, ys = g.columns.to_numpy(), g.index.to_numpy()
-    # UTM metres → kilometres, relative to the window's SW corner, for readable ticks.
-    x_km = (xs - xs.min()) / 1000.0
-    y_km = (ys - ys.min()) / 1000.0
-    extent = [x_km.min(), x_km.max(), y_km.min(), y_km.max()]
-    return g.to_numpy(), extent
+    ext_utm = [xs.min(), xs.max(), ys.min(), ys.max()]
+    ext_km = [0.0, (xs.max() - xs.min()) / 1000.0, 0.0, (ys.max() - ys.min()) / 1000.0]
+    return g.to_numpy(), ext_utm, ext_km
+
+
+# Explicit axis geometry (figure fractions): cartopy's auto-layout clips titles
+# and tick labels when the GeoAxes has a fixed aspect, so we place everything by
+# hand. The map box is square (the window is ~10.2 km on both sides).
+MAP_RECT = (0.07, 0.04, 0.72, 0.82)      # georeferenced raster
+CAX_RECT = (0.815, 0.12, 0.022, 0.66)    # colorbar (room for long class labels)
+INSET_RECT = (0.095, 0.07, 0.20, 0.20)   # locator, lower-left of the map
+
+
+def geo_map(fig, Z, ext_utm, ext_km, **imshow_kw):
+    """Draw the raster onto a georeferenced cartopy GeoAxes (scene CRS = UTM 32N)
+    with coastline/border features and a lon/lat graticule. Falls back to a plain
+    km-axis plot when cartopy is unavailable. Returns (ax, image)."""
+    if _HAVE_GEO:
+        ax = fig.add_axes(MAP_RECT, projection=ccrs.UTM(32))
+        ax.set_extent(ext_utm, crs=ccrs.UTM(32))
+        im = ax.imshow(Z, extent=ext_utm, transform=ccrs.UTM(32),
+                       origin="upper", **imshow_kw)
+        # Features are enabled for a true geographic canvas; at this ~10 km frame
+        # none actually intersect (nearest border is the Alpine crest ~20 km west).
+        ax.add_feature(cfeature.COASTLINE.with_scale("10m"), lw=0.6, edgecolor="0.2")
+        ax.add_feature(cfeature.BORDERS.with_scale("10m"), lw=0.6, edgecolor="0.2")
+        gl = ax.gridlines(draw_labels=True, lw=0.3, color="0.6", alpha=0.7)
+        gl.top_labels = gl.right_labels = False
+        gl.xlabel_style = gl.ylabel_style = {"size": 8, "color": "0.3"}
+        return ax, im
+    ax = fig.add_axes(MAP_RECT)
+    im = ax.imshow(Z, extent=ext_km, origin="upper", aspect="equal", **imshow_kw)
+    ax.set_xlabel("easting (km from window SW corner)")
+    ax.set_ylabel("northing (km)")
+    return ax, im
 
 
 def scene_lonlat_bounds(df):
@@ -89,7 +122,7 @@ def scene_lonlat_bounds(df):
     return min(lon0, lon1), max(lon0, lon1), min(lat0, lat1), max(lat0, lat1)
 
 
-def add_locator(fig, bounds, rect=(0.135, 0.135, 0.24, 0.24)):
+def add_locator(fig, bounds, rect=INSET_RECT):
     """Draw a small regional map (country borders + coastline) with the scene
     footprint marked, so the ~10 km window is placed geographically. No-op when
     cartopy/pyproj are unavailable."""
@@ -115,18 +148,16 @@ def add_locator(fig, bounds, rect=(0.135, 0.135, 0.24, 0.24)):
 
 
 def plot_map(df, out):
-    Z, extent = to_grid(df)
-    fig, ax = plt.subplots(figsize=(8.5, 7.5))
-    im = ax.imshow(Z, extent=extent, origin="upper", aspect="equal",
-                   cmap="RdYlGn", vmin=-0.2, vmax=0.9)
-    ax.set_title("NDVI — the (x, y, ndvi) table flattened back to the scene\n"
-                 "(Sentinel-2 L2A, 10 m, near Turin, Italy, 2025-05-05)")
-    ax.set_xlabel("easting (km from window SW corner)")
-    ax.set_ylabel("northing (km)")
-    cb = fig.colorbar(im, ax=ax, pad=0.02, shrink=0.85)
+    Z, ext_utm, ext_km = to_grid(df)
+    fig = plt.figure(figsize=(9.5, 8.6))
+    ax, im = geo_map(fig, Z, ext_utm, ext_km, cmap="RdYlGn", vmin=-0.2, vmax=0.9)
+    fig.suptitle("NDVI — the (x, y, ndvi) table flattened back to the scene\n"
+                 "(Sentinel-2 L2A, 10 m, near Turin, Italy, 2025-05-05)",
+                 fontsize=12, y=0.965)
+    cb = fig.colorbar(im, cax=fig.add_axes(CAX_RECT))
     cb.set_label("NDVI = (NIR − Red) / (NIR + Red)")
     add_locator(fig, scene_lonlat_bounds(df))
-    fig.savefig(out, dpi=150, bbox_inches="tight")
+    fig.savefig(out, dpi=150)
     print(f"wrote {out}")
 
 
@@ -156,22 +187,19 @@ def plot_hist(df, out):
 
 
 def plot_landcover(df, out):
-    Z, extent = to_grid(df)
+    Z, ext_utm, ext_km = to_grid(df)
     cmap = ListedColormap(CLASS_COLORS)
     norm = BoundaryNorm(CLASS_EDGES, cmap.N)
-    fig, ax = plt.subplots(figsize=(8.5, 7.5))
-    im = ax.imshow(Z, extent=extent, origin="upper", aspect="equal",
-                   cmap=cmap, norm=norm)
-    ax.set_title("NDVI land cover — the per-pixel expression, classified\n"
-                 "(standard remote-sensing NDVI breaks)")
-    ax.set_xlabel("easting (km from window SW corner)")
-    ax.set_ylabel("northing (km)")
-    cb = fig.colorbar(im, ax=ax, pad=0.02, shrink=0.85,
+    fig = plt.figure(figsize=(9.5, 8.6))
+    ax, im = geo_map(fig, Z, ext_utm, ext_km, cmap=cmap, norm=norm)
+    fig.suptitle("NDVI land cover — the per-pixel expression, classified\n"
+                 "(standard remote-sensing NDVI breaks)", fontsize=12, y=0.965)
+    cb = fig.colorbar(im, cax=fig.add_axes(CAX_RECT),
                       ticks=[(a + b) / 2 for a, b in
                              zip(CLASS_EDGES[:-1], CLASS_EDGES[1:])])
     cb.ax.set_yticklabels(CLASS_NAMES)
     add_locator(fig, scene_lonlat_bounds(df))
-    fig.savefig(out, dpi=150, bbox_inches="tight")
+    fig.savefig(out, dpi=150)
     print(f"wrote {out}")
 
 

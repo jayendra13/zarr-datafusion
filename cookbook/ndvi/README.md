@@ -118,12 +118,14 @@ WHERE NOT isnan(b08 - b04);
 
 [`plots.py`](plots.py) displays the recipe output — reading the frozen
 `ndvi.csv.gz` (the `ndvi.sql` result; regenerate with the `COPY … STORED AS CSV`
-shown at the top of the script, then `gzip -9`). The two maps carry a **locator
-inset with country borders + coastline** (cartopy) so the ~10 km window is placed
-geographically — it sits in **Piedmont, NW Italy, near the French/Alpine border**.
-No border crosses a 10 km tile, so that context lives in the inset, not on the
-raster. cartopy/pyproj are optional: without them the maps still render, minus the
-inset.
+shown at the top of the script, then `gzip -9`). The two maps are **georeferenced**:
+the raster is drawn on a cartopy GeoAxes in the scene's CRS (UTM zone 32N) with
+coastline + country-border features and a **lon/lat graticule**, plus a small
+locator inset. The window sits in **Piedmont, NW Italy, near the French/Alpine
+border**; no border actually crosses a ~10 km frame (the nearest is the Alpine
+crest ~20 km west), so the visible country line lives in the inset while the main
+map carries true lon/lat axes. cartopy/pyproj are optional: without them the maps
+fall back to plain km axes (no features, no inset).
 
 ```bash
 uv run --with pandas --with numpy --with matplotlib --with cartopy --with pyproj \
