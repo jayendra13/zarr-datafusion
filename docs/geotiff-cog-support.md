@@ -48,7 +48,7 @@ carry over. Tiles = chunks.
 
 ### Barriers (native route), worst first
 1. **Single COG = one 2-D scene, no time.** Real value is *collections* — HLS,
-   Landsat, Sentinel-2 (see [NASA cookbook note](nasa-cookbook-adoption.md)) are
+   Landsat, Sentinel-2 (see [cookbook adaptation note](cookbook-adaptation.md)) are
    thousands of COGs. A time cube needs a **STAC/multi-file stacking layer** —
    a substantial new build.
 2. **Projected CRS ≠ lat/lon.** COGs are usually UTM / Web Mercator; `WHERE lat
