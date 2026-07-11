@@ -365,6 +365,11 @@ End-to-end, reproducible recipes live under [`cookbook/`](cookbook/):
   with a single SQL query over public ERA5 on GCS, classify each season as El Niño
   / La Niña / Neutral, and validate against NOAA's official ONI table (MAE 0.14 °C
   in the satellite era, Pearson r 0.96, class-agreement weighted κ 0.85).
+- **[NDVI — per-pixel band math](cookbook/ndvi/)** — the Normalized Difference
+  Vegetation Index for a 1024×1024 Sentinel-2 scene as one SQL expression
+  `(b08 - b04) / (b08 + b04)`. The complement to the aggregation recipes: a pure
+  per-pixel projection across two co-registered bands, matching xarray to 4
+  decimals. Adapts xarray-sql's `01_ndvi.py`.
 
 ## Distributed Execution
 
