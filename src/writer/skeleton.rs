@@ -1,0 +1,295 @@
+//! Skeleton creation: array metadata + coordinate arrays, no data chunks.
+//!
+//! The skeleton is the target store before any data variable is materialised.
+//! Coordinate arrays are written in full (they *are* the grid); data variables
+//! get metadata only. zarrs never writes a chunk that is entirely fill_value, so
+//! an unwritten data variable reads back as fill_value everywhere for free —
+//! which is exactly the "allocated but empty" semantics we want, and what the
+//! Phase 1 exit criterion checks.
+//!
+//! Dimension order is the order of `SkeletonSpec::coords`, and each data
+//! variable is the cartesian product of every coordinate in that order. That
+//! matches the read side's assumption (see the Assumptions section of
+//! CLAUDE.md), so a skeleton written here is readable by our own scan.
+//!
+//! `dimension_names` is always written. The reader can infer axes from shape
+//! alone on v3, but only when the axis lengths are distinct; writing the names
+//! makes the mapping explicit rather than inferred, and is what lets xarray open
+//! the result. This is the writer's half of the axis-swap hazard that the
+//! round-trip fixture exists to detect (docs/zarr-write-roundtrip-plan.md §2).
+
+use std::sync::Arc;
+
+use serde_json::{Map, Value};
+use zarrs::array::codec::bytes_to_bytes::blosc::{
+    BloscCompressionLevel, BloscCompressor, BloscShuffleMode,
+};
+use zarrs::array::codec::BloscCodec;
+use zarrs::array::{ArrayBuilder, DataType, FillValue};
+use zarrs::filesystem::FilesystemStore;
+use zarrs::group::GroupBuilder;
+use tracing::{debug, info};
+
+type BoxError = Box<dyn std::error::Error + Send + Sync>;
+
+/// Element type of a written array.
+///
+/// Deliberately narrow: these are the types the round-trip fixture and the
+/// first real target (NDVI) need. Widen when a consumer needs more.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WriteDataType {
+    Int64,
+    Float32,
+    Float64,
+}
+
+impl WriteDataType {
+    fn to_zarrs(self) -> DataType {
+        match self {
+            Self::Int64 => DataType::Int64,
+            Self::Float32 => DataType::Float32,
+            Self::Float64 => DataType::Float64,
+        }
+    }
+
+    /// Bytes per element — Blosc needs this as its shuffle `typesize`.
+    fn size(self) -> usize {
+        match self {
+            Self::Int64 | Self::Float64 => 8,
+            Self::Float32 => 4,
+        }
+    }
+
+    /// Default hole marker: NaN for floats, 0 for ints.
+    ///
+    /// Integers have no NaN, so an unwritten int cell is indistinguishable from
+    /// a written 0. Callers who care must pass an explicit sentinel.
+    fn default_fill_value(self) -> FillValue {
+        match self {
+            Self::Int64 => FillValue::from(0i64),
+            Self::Float32 => FillValue::from(f32::NAN),
+            Self::Float64 => FillValue::from(f64::NAN),
+        }
+    }
+}
+
+/// Values of one coordinate axis, dense and in index order.
+#[derive(Debug, Clone)]
+pub enum CoordValues {
+    Int64(Vec<i64>),
+    Float64(Vec<f64>),
+}
+
+impl CoordValues {
+    fn len(&self) -> usize {
+        match self {
+            Self::Int64(v) => v.len(),
+            Self::Float64(v) => v.len(),
+        }
+    }
+
+    fn data_type(&self) -> WriteDataType {
+        match self {
+            Self::Int64(_) => WriteDataType::Int64,
+            Self::Float64(_) => WriteDataType::Float64,
+        }
+    }
+}
+
+/// A coordinate array: a 1-D axis, stored as a single chunk.
+#[derive(Debug, Clone)]
+pub struct CoordSpec {
+    pub name: String,
+    pub values: CoordValues,
+    pub attributes: Map<String, Value>,
+}
+
+impl CoordSpec {
+    pub fn new(name: impl Into<String>, values: CoordValues) -> Self {
+        Self {
+            name: name.into(),
+            values,
+            attributes: Map::new(),
+        }
+    }
+}
+
+/// An n-D data variable: metadata now, chunks later.
+#[derive(Debug, Clone)]
+pub struct DataVarSpec {
+    pub name: String,
+    pub data_type: WriteDataType,
+    /// Hole marker. `None` takes [`WriteDataType::default_fill_value`].
+    pub fill_value: Option<FillValue>,
+    pub attributes: Map<String, Value>,
+}
+
+impl DataVarSpec {
+    pub fn new(name: impl Into<String>, data_type: WriteDataType) -> Self {
+        Self {
+            name: name.into(),
+            data_type,
+            fill_value: None,
+            attributes: Map::new(),
+        }
+    }
+}
+
+/// The full description of a target store.
+#[derive(Debug, Clone)]
+pub struct SkeletonSpec {
+    /// Dimension order. Every data variable spans these axes in this order.
+    pub coords: Vec<CoordSpec>,
+    pub data_vars: Vec<DataVarSpec>,
+    /// Chunk shape for data variables, one entry per coordinate.
+    pub chunks: Vec<u64>,
+    pub attributes: Map<String, Value>,
+}
+
+impl SkeletonSpec {
+    pub fn new(coords: Vec<CoordSpec>, data_vars: Vec<DataVarSpec>, chunks: Vec<u64>) -> Self {
+        Self {
+            coords,
+            data_vars,
+            chunks,
+            attributes: Map::new(),
+        }
+    }
+
+    /// Array shape: the length of each coordinate, in dimension order.
+    fn shape(&self) -> Vec<u64> {
+        self.coords.iter().map(|c| c.values.len() as u64).collect()
+    }
+
+    fn dimension_names(&self) -> Vec<String> {
+        self.coords.iter().map(|c| c.name.clone()).collect()
+    }
+
+    /// Reject specs that would produce a store we could not read back.
+    fn validate(&self) -> Result<(), BoxError> {
+        if self.coords.is_empty() {
+            return Err("skeleton needs at least one coordinate".into());
+        }
+        if self.chunks.len() != self.coords.len() {
+            return Err(format!(
+                "chunks has {} entries but there are {} coordinates; \
+                 a chunk shape is required per dimension",
+                self.chunks.len(),
+                self.coords.len()
+            )
+            .into());
+        }
+        if let Some(bad) = self.chunks.iter().position(|&c| c == 0) {
+            return Err(format!("chunk size must be non-zero (dimension {bad})").into());
+        }
+        for coord in &self.coords {
+            if coord.values.len() == 0 {
+                return Err(format!("coordinate '{}' is empty", coord.name).into());
+            }
+        }
+
+        // The reader classifies arrays by name and assumes coordinate names are
+        // unique; duplicates would silently collapse an axis.
+        let mut names: Vec<&str> = self.coords.iter().map(|c| c.name.as_str()).collect();
+        names.sort_unstable();
+        if let Some(dup) = names.windows(2).find(|w| w[0] == w[1]) {
+            return Err(format!("duplicate coordinate name '{}'", dup[0]).into());
+        }
+
+        // A data variable sharing a coordinate's name would be discovered as a
+        // 1-D coordinate on read, not as a data variable.
+        for var in &self.data_vars {
+            if names.binary_search(&var.name.as_str()).is_ok() {
+                return Err(format!(
+                    "data variable '{}' collides with a coordinate name",
+                    var.name
+                )
+                .into());
+            }
+        }
+
+        Ok(())
+    }
+}
+
+/// Blosc/LZ4, matching what `scripts/data_gen.py` writes.
+fn blosc(type_size: usize) -> Result<BloscCodec, BoxError> {
+    BloscCodec::new(
+        BloscCompressor::LZ4,
+        BloscCompressionLevel::try_from(5u8).map_err(|e| format!("{e:?}"))?,
+        None,
+        BloscShuffleMode::Shuffle,
+        Some(type_size),
+    )
+    .map_err(|e| format!("blosc codec: {e}").into())
+}
+
+/// Create the target store: root group, coordinate arrays (with data), and data
+/// variable metadata (without data).
+///
+/// Overwrites metadata at `store_path` if arrays of the same name already exist.
+pub fn create_skeleton(store_path: &str, spec: &SkeletonSpec) -> Result<(), BoxError> {
+    spec.validate()?;
+
+    let store = Arc::new(FilesystemStore::new(store_path)?);
+    let shape = spec.shape();
+    let dimension_names = spec.dimension_names();
+
+    GroupBuilder::new()
+        .attributes(spec.attributes.clone())
+        .build(store.clone(), "/")?
+        .store_metadata()?;
+
+    for coord in &spec.coords {
+        let len = coord.values.len() as u64;
+        let dtype = coord.values.data_type();
+        // One chunk per coordinate: axes are small and always read whole.
+        let array = ArrayBuilder::new(
+            vec![len],
+            vec![len],
+            dtype.to_zarrs(),
+            dtype.default_fill_value(),
+        )
+        .bytes_to_bytes_codecs(vec![Arc::new(blosc(dtype.size())?)])
+        .dimension_names(Some([coord.name.clone()]))
+        .attributes(coord.attributes.clone())
+        .build(store.clone(), &format!("/{}", coord.name))?;
+        array.store_metadata()?;
+
+        match &coord.values {
+            CoordValues::Int64(v) => array.store_chunk_elements(&[0], v)?,
+            CoordValues::Float64(v) => array.store_chunk_elements(&[0], v)?,
+        }
+        debug!(coord = %coord.name, len, "Coordinate array written");
+    }
+
+    for var in &spec.data_vars {
+        let fill_value = var
+            .fill_value
+            .clone()
+            .unwrap_or_else(|| var.data_type.default_fill_value());
+        let array = ArrayBuilder::new(
+            shape.clone(),
+            spec.chunks.clone(),
+            var.data_type.to_zarrs(),
+            fill_value,
+        )
+        .bytes_to_bytes_codecs(vec![Arc::new(blosc(var.data_type.size())?)])
+        .dimension_names(Some(dimension_names.clone()))
+        .attributes(var.attributes.clone())
+        .build(store.clone(), &format!("/{}", var.name))?;
+        // Metadata only — no chunks. Reads return fill_value.
+        array.store_metadata()?;
+        debug!(var = %var.name, "Data variable metadata written");
+    }
+
+    info!(
+        path = store_path,
+        coords = spec.coords.len(),
+        data_vars = spec.data_vars.len(),
+        shape = ?shape,
+        chunks = ?spec.chunks,
+        "Skeleton created"
+    );
+    Ok(())
+}

@@ -6,3 +6,4 @@ pub mod physical_plan;
 pub mod reader;
 pub mod udfs;
 pub mod udtf;
+pub mod writer;
