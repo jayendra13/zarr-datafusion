@@ -147,6 +147,139 @@ def generate_synthetic(
 
 
 # -----------------------------
+# Round-trip fixture (Zarr write path)
+# -----------------------------
+# A dedicated fixture for the `zarr -> parquet -> zarr` write round trip. It is
+# NOT the shared synthetic store, deliberately: the streaming/aggregate tests are
+# tuned to that store's 100-row lat*lon plane, and reshaping it would silently
+# move which branch they cover. See docs/zarr-write-roundtrip-plan.md.
+#
+# Two properties the shared fixture lacks, both required to validate a writer:
+#
+#  1. DISTINCT AXIS LENGTHS (time=7, lat=10, lon=12). The shared store has
+#     lat=lon=10, and schema_inference.rs:619 falls back to alphabetical ordering
+#     when coordinates share a size — so a lat/lon swap there is undetectable:
+#     every shape still matches and the round trip still passes. With distinct
+#     lengths a mislabelled axis is a shape error. This is what makes the round
+#     trip able to fail; round trips are otherwise blind to symmetric bugs
+#     (reader swaps, writer swaps back, test goes green).
+#
+#  2. A FLOAT VARIABLE WITH NaN. The shared store is all randint -> int64, so it
+#     exercises no float, NaN, or fill_value handling at all — precisely the
+#     machinery the chunk sink depends on, and what the first real target (NDVI,
+#     with NaN nodata) needs.
+#
+# Chunks are ragged on both spatial axes (10/4 -> 4,4,2 and 12/5 -> 5,5,2) so
+# partial edge chunks are covered from the start; writing a partial final chunk
+# is a classic write bug.
+RT_NLAT = 10
+RT_NLON = 12
+RT_NTIME = 7
+RT_CHUNKS = (1, 4, 5)
+
+
+def get_roundtrip_store_path(version: ZarrVersion) -> Path:
+    """Path for a round-trip fixture variation."""
+    return DATA_DIR / f"synthetic_rt_v{version}.zarr"
+
+
+def generate_roundtrip(version: ZarrVersion, seed: int = 7) -> None:
+    """Generate the Zarr write round-trip fixture.
+
+    Always Blosc/LZ4 — compression is orthogonal to what this fixture tests, and
+    the read side already covers the codec matrix via the 4-way synthetic stores.
+
+    Args:
+        version: Zarr format version (2 or 3)
+        seed: Random seed for reproducibility
+    """
+    store_path = get_roundtrip_store_path(version)
+    rng = np.random.default_rng(seed)
+
+    shape = (RT_NTIME, RT_NLAT, RT_NLON)
+    temperature_data = rng.integers(-50, 60, shape)
+
+    # float32 with a deterministic scatter of NaN holes (~49 of 840 cells), placed
+    # by index so they land in interior AND ragged edge chunks alike.
+    reflectance_data = rng.random(shape, dtype=np.float32)
+    t_idx, y_idx, x_idx = np.indices(shape)
+    reflectance_data[(t_idx + y_idx + x_idx) % 17 == 0] = np.nan
+    n_nan = int(np.isnan(reflectance_data).sum())
+
+    if version == 3:
+        from zarr.codecs import BloscCodec
+
+        compressors = BloscCodec(cname="lz4", clevel=5, shuffle="shuffle")
+
+        store = zarr.storage.LocalStore(str(store_path))
+        root = zarr.group(store=store, overwrite=True, zarr_format=3)
+
+        root.create_array(
+            "lat", data=np.arange(RT_NLAT), compressors=compressors,
+            dimension_names=("lat",),
+        )
+        root.create_array(
+            "lon", data=np.arange(RT_NLON), compressors=compressors,
+            dimension_names=("lon",),
+        )
+        root.create_array(
+            "time", data=np.arange(RT_NTIME), compressors=compressors,
+            dimension_names=("time",),
+        )
+
+        temperature = root.create_array(
+            "temperature",
+            chunks=RT_CHUNKS,
+            data=temperature_data,
+            compressors=compressors,
+            dimension_names=("time", "lat", "lon"),
+        )
+        reflectance = root.create_array(
+            "reflectance",
+            chunks=RT_CHUNKS,
+            data=reflectance_data,
+            compressors=compressors,
+            dimension_names=("time", "lat", "lon"),
+            fill_value=np.nan,
+        )
+    else:
+        # Zarr v2 — no dimension names, matching the shared v2 fixture. This is
+        # the inference path (schema_inference.rs), and with distinct axis lengths
+        # the size-based mapping is now unambiguous rather than an alphabetical
+        # coin flip. Note xarray CANNOT open this store (it requires
+        # _ARRAY_DIMENSIONS), which is why the oracle is zarr-python based.
+        root = zarr.open_group(str(store_path), mode="w", zarr_format=2)
+
+        root.create_array("lat", data=np.arange(RT_NLAT), compressor=BLOSC_LZ4)
+        root.create_array("lon", data=np.arange(RT_NLON), compressor=BLOSC_LZ4)
+        root.create_array("time", data=np.arange(RT_NTIME), compressor=BLOSC_LZ4)
+
+        temperature = root.create_array(
+            "temperature",
+            chunks=RT_CHUNKS,
+            data=temperature_data,
+            compressor=BLOSC_LZ4,
+        )
+        reflectance = root.create_array(
+            "reflectance",
+            chunks=RT_CHUNKS,
+            data=reflectance_data,
+            compressor=BLOSC_LZ4,
+            fill_value=np.nan,
+        )
+
+    root.attrs["title"] = "Write Round-Trip Fixture"
+    root.attrs["conventions"] = f"Zarr v{version}"
+    temperature.attrs.update({"units": "K", "long_name": "Air Temperature"})
+    reflectance.attrs.update({"units": "1", "long_name": "Surface Reflectance"})
+
+    print(
+        f"  Written: {store_path} (v{version}, Blosc/LZ4, "
+        f"shape={shape}, chunks={RT_CHUNKS}, {n_nan} NaN)"
+    )
+
+
+# -----------------------------
 # ERA5 Data Download
 # -----------------------------
 def generate_era5_all_variations(
@@ -247,6 +380,14 @@ def main() -> None:
     for version in [2, 3]:
         for with_codecs in [False, True]:
             generate_synthetic(version, with_codecs)
+    print()
+
+    # Round-trip fixture for the Zarr write path
+    print("=" * 60)
+    print("WRITE ROUND-TRIP FIXTURE")
+    print("=" * 60)
+    for version in [2, 3]:
+        generate_roundtrip(version)
     print()
 
     # Download ERA5 once and create all variations
