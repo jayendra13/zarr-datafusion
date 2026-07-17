@@ -450,6 +450,71 @@ inexpressible. Silent fill is correct there — nodata lands as NaN, which is wh
 xarray user expects. (`cookbook/el-nino-oni/oni_ersst.sql:35` already carries a
 `coordinates only in WHERE` convention comment.)
 
+### 5.9 Tiered execution: bypass the tabular layer when values are a passthrough
+
+§9 says a pure rechunk is the case where the tabular layer contributes nothing —
+values are byte-identical to the source, so SQL, Arrow, and coordinate
+materialisation are all overhead. The original conclusion was "then it should be a
+separate binary with no DataFusion dependency". **That is the wrong split.** The
+right one keeps the *planning* and specialises the *execution*.
+
+**The dispatch key** is a plan-level predicate: does each output data column carry
+**new** values or **source** values? A bare `Column` reference to a source data
+variable, under coordinate `WHERE` filters only, is a passthrough. Any arithmetic,
+`CASE`, UDF, or aggregate makes it computed. This is decided by the same
+`descend_to_zarr` + `recognize` walk aggregate pushdown already uses (§3.3),
+including its join rejection (`children.len() != 1`).
+
+**Three tiers, dispatched on that key:**
+
+| Tier | When | Per-chunk inner loop | zarrs primitive |
+|---|---|---|---|
+| **0 — compressed passthrough** | identity values **and** target chunk = whole source chunks (no re-tiling) **and** identical codec | copy raw bytes `store.set(key, source_bytes)` — no decode/encode | store-level `get`/`set` on the chunk key |
+| **1 — array-native rechunk** | identity values, chunk grids differ (e.g. ERA5 source bundles all levels in one chunk, target splits `level:1`) | `retrieve_array_subset_ndarray` -> scatter in n-D -> `store_array_subset_ndarray` | `array_sync_readable.rs` / `array_sync_readable_writable.rs` |
+| **2 — tabular** (the rest of this plan) | values are **new** (transform, reduce) | flatten -> SQL -> row-scatter (§5.6) | the Phase 2 sink |
+
+**What is shared across all three — this is the point.** The bypass does *not*
+duplicate plan analysis. Grid derivation (`selection_from_filters` -> `ProductSet`),
+alignment / source-target chunk incidence (`touched_tiles`), and
+repartition-so-each-target-chunk-has-one-writer (§5.4) are **identical** in every
+tier. Only the fill differs — byte-copy vs array-copy vs row-scatter. So the tabular
+flatten stops being "the pipeline" and becomes *one implementation of "fill this
+target chunk"*, chosen by a plan predicate.
+
+**Mechanism: a plan-rewrite rule, not a fork.** Exactly the move `CardinalityRule`
+already makes — `try_pushdown_aggregate` detects `AggregateExec <- ZarrExec` and
+swaps in a `ZarrAggregateExec` that never emits the normal row stream. The bypass
+detects `ZarrSink <- [coord filter / bare projection only] <- ZarrExec` and swaps in
+a `ZarrRechunkExec` that works in ndarray space and **emits only a row count** — so
+Arrow is never in the loop. It must fire at plan-rewrite time, because routing
+through *any* DataFusion `ExecutionPlan` commits to `RecordBatch`.
+
+**The scheduling insight (Tier 1).** A level-split target chunk requires
+decompressing the all-levels source chunk that holds it. The optimal schedule is
+therefore *decompress each source chunk once, then write every target chunk it
+feeds* — a `GROUP BY source-chunk` on the write side. `touched_tiles` already
+computes the source-target incidence, so we can generate that schedule; it is the
+difference between a per-hour memory blow-up and one source chunk in flight per
+worker.
+
+**Honest limits:**
+
+- **The memory floor is the source's, not ours.** Array-native streaming reaches
+  "one source chunk decompressed" and no lower. For an ERA5 model-level source chunk
+  (~137 x 721 x 1440 x 4 ≈ 570 MB/variable) that floor is high *because the source
+  bundles all levels* — no engine beats it without first re-chunking the source.
+- **Mixed projections.** `SELECT lat, lon, temperature, (b08-b04) AS ndvi` mixes a
+  passthrough and a computed column. v1: whole-query dispatch — any computed data
+  column sends the whole query to Tier 2. Per-variable tiering (passthrough vars
+  array-native, computed vars tabular, shared skeleton) is a real refinement, not a
+  first cut.
+- **Tier 0 assumes identical codecs** source-to-target, and we **write v3 only** —
+  so a v2 source or a re-compression drops to Tier 1.
+
+This re-scopes Phase 7 (§7): from "rechunk demo (slow, don't bother)" to "Tier 1
+array-native rechunk", which is both faster and the more honest thing to ship. It
+reuses Phases 3 and 5 wholesale and adds only the `ZarrRechunkExec` inner loop.
+
 ---
 
 ## 6. The SQL surface
@@ -531,7 +596,7 @@ See §8 gaps 1-2.
 | 4 | Round trip green, v3 and v2 | round trip + compare_zarr | **high** — first misaligned source | not started |
 | 5 | Repartition by target chunk (the shuffle) | round trip + xarray | **high** — correctness (§5.4) | not started |
 | 6 | Dict LUT fast path; shuffle elision via `touched_tiles` | slow path as oracle | low | not started |
-| 7 | Rechunk demo | round trip + xarray | low; see §9 | not started |
+| 7 | Tier 1 array-native rechunk (`ZarrRechunkExec`) | round trip + xarray | medium; see §5.9, §9 | not started |
 
 Changes from the original phasing: **admission is now its own phase (3)** rather
 than an afterthought; **the shuffle is promoted to a first-class phase (5)** because
@@ -595,14 +660,17 @@ and 37 writes.
 
 A pure rechunk is the case where the tabular layer contributes **nothing**: the
 values are byte-identical to the source, so SQL, Arrow, and coordinate
-materialisation are all overhead. The write that *justifies* this engine is one
-where the values are **new** — NDVI, anomalies, climatologies — because there the
-tabular layer did the work that produced them.
+materialisation are all overhead. The write that *justifies* the **tabular** engine
+is one where the values are **new** — NDVI, anomalies, climatologies — because there
+the tabular layer did the work that produced them.
 
-So Phase 7 is a demo that the writer generalises. If rechunking ever needs to be
-fast, the answer is a chunk-native path (decompress -> slice -> write) that bypasses
-the tabular layer entirely — a separate code path, arguably a separate binary with
-no DataFusion dependency at all.
+But "the tabular layer adds nothing here" is an argument for **bypassing it**, not
+for abandoning the engine. §5.9 resolves this: the chunk-native path
+(decompress -> slice -> write) lives *inside* the sink as Tier 1, gated by a plan
+predicate, reusing the same grid-derivation, alignment, and repartition machinery —
+it is a specialised `ExecutionPlan` (`ZarrRechunkExec`), not a separate binary. What
+this section rules out is doing a pure rechunk *through Arrow rows*; it does not rule
+out doing it in this crate.
 
 ---
 
