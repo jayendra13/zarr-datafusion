@@ -26,3 +26,8 @@ terraform/terraform.tfvars
 *.tfplan
 data/ersst_v5_nc/
 data/ersst_v5_psl.nc
+
+# Benchmark run artifacts (logs + results.json) — regenerated per run, and
+# shipping them to a remote host makes stale local results look like fresh ones.
+bench/out/
+bench/**/__pycache__/
