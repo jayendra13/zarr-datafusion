@@ -9,7 +9,10 @@
 //!
 //! Pushable shape (this phase):
 //! - aggregates are `SUM`/`COUNT`/`AVG`/`MIN`/`MAX`, none `DISTINCT`;
-//! - each aggregate argument is a **data variable** (or `COUNT(*)`/`COUNT(coord)`);
+//! - each aggregate argument is a **bare data-variable column**, modulo casts (or
+//!   `COUNT(*)`/`COUNT(coord)`). An argument that *computes* over an array, such as
+//!   `AVG(sst - 273.15)`, is declined: `AggSpec` can only name an array, so pushing
+//!   it would drop the arithmetic and silently return `AVG(sst)`;
 //! - `GROUP BY` is empty, or on **coordinate columns** (each mapped to a cube axis).
 //!   Grouping by a periodic function of a coordinate (e.g. month-of-time) is deferred
 //!   to Phase 7.5.
@@ -19,7 +22,7 @@ use std::sync::Arc;
 
 use datafusion::physical_expr::{PhysicalExpr, ScalarFunctionExpr};
 use datafusion::physical_plan::aggregates::AggregateExec;
-use datafusion::physical_plan::expressions::{Column, Literal};
+use datafusion::physical_plan::expressions::{CastExpr, Column, Literal, TryCastExpr};
 use datafusion::scalar::ScalarValue;
 
 use super::{group_cardinality, AxisSet, GroupKey, ProductSet};
@@ -83,7 +86,13 @@ pub fn recognize(agg: &AggregateExec, zarr: &ZarrExec) -> Option<PushdownCandida
             "max" => AggKind::Max,
             _ => return None,
         };
-        let column = column_name(&a.expressions());
+        // An argument that is a computation over an array (e.g. `sst - 273.15`) has no
+        // representation in `AggSpec`; decline so DataFusion evaluates it correctly.
+        let column = match aggregate_arg(&a.expressions()) {
+            AggArg::Star => None,
+            AggArg::Column(name) => Some(name),
+            AggArg::Unsupported => return None,
+        };
         let ok = match (&kind, &column) {
             // COUNT(*) / COUNT(coord) / COUNT(data_var) all just count rows.
             (AggKind::Count, _) => true,
@@ -195,19 +204,56 @@ pub fn max_group_count(cand: &PushdownCandidate, meta: &ZarrStoreMeta) -> u128 {
     group_cardinality(&universe(meta), &cand.group_keys)
 }
 
-/// The column an aggregate reads, searching *through* wrapper expressions such as
-/// the `CAST` that `AVG` inserts (`AVG(temperature)` lowers to
-/// `avg(CAST(temperature AS Float64))`). Returns the first `Column` found in tree
-/// order — sufficient for the single-data-column aggregates we push.
-fn column_name(exprs: &[Arc<dyn PhysicalExpr>]) -> Option<String> {
-    exprs.iter().find_map(find_column)
+/// What an aggregate reads, as far as `AggSpec` is able to represent it.
+///
+/// `AggSpec` can only say "apply this function to this array", so an argument that
+/// is a *computation* over an array has no representation here and must decline the
+/// pushdown — see [`aggregate_arg`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum AggArg {
+    /// No value argument: `COUNT(*)`, which lowers to `count(Int64(1))`.
+    Star,
+    /// A bare column, possibly wrapped in casts.
+    Column(String),
+    /// An expression we cannot fold chunk-wise (e.g. `sst - 273.15`).
+    Unsupported,
 }
 
-fn find_column(e: &Arc<dyn PhysicalExpr>) -> Option<String> {
+/// The column an aggregate reads, searching *through* the casts that DataFusion
+/// inserts (`AVG(temperature)` lowers to `avg(CAST(temperature AS Float64))`).
+///
+/// Casts are the *only* wrapper we see through. Descending through arbitrary
+/// expressions would let `AVG(sst - 273.15)` be recognized as `Avg(sst)` and
+/// silently drop the arithmetic, since the rewritten node inherits the original
+/// aggregate's schema and the projection above it merely relabels column 0.
+fn aggregate_arg(exprs: &[Arc<dyn PhysicalExpr>]) -> AggArg {
+    match exprs {
+        // No argument at all — a genuine `COUNT(*)`.
+        [] => AggArg::Star,
+        [e] => match bare_column(e) {
+            Some(name) => AggArg::Column(name),
+            // `COUNT(*)` lowers to a literal argument; any other expression is
+            // a computation we cannot represent.
+            None if e.downcast_ref::<Literal>().is_some() => AggArg::Star,
+            None => AggArg::Unsupported,
+        },
+        // Multi-argument aggregates are not pushable.
+        _ => AggArg::Unsupported,
+    }
+}
+
+/// The name of a bare column, seeing through cast wrappers only.
+fn bare_column(e: &Arc<dyn PhysicalExpr>) -> Option<String> {
     if let Some(c) = e.downcast_ref::<Column>() {
         return Some(c.name().to_string());
     }
-    e.children().into_iter().find_map(find_column)
+    if let Some(c) = e.downcast_ref::<CastExpr>() {
+        return bare_column(c.expr());
+    }
+    if let Some(c) = e.downcast_ref::<TryCastExpr>() {
+        return bare_column(c.expr());
+    }
+    None
 }
 
 #[cfg(test)]

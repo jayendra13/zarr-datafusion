@@ -166,6 +166,102 @@ async fn global_aggregates_are_value_equivalent() {
     }
 }
 
+// ---- Regression: aggregate arguments that COMPUTE over an array ----
+//
+// `AggSpec` can only name an array, so an argument like `temperature - 273.15` has no
+// representation in a pushed aggregate. The recognizer used to search *through* any
+// wrapper expression for the first `Column`, so it accepted these as `Avg(temperature)`
+// and silently dropped the arithmetic — the rewritten node inherits the original
+// aggregate's schema, and the projection above it only relabels column 0, so the wrong
+// value flowed out under the right name with no error. Unit conversions (K->degC,
+// m->mm) are the common form, which made this a routine query returning a plausible
+// number in the wrong unit.
+
+/// Queries whose aggregate argument is a computation, not a bare column.
+const EXPRESSION_ARG_QUERIES: [&str; 5] = [
+    "SELECT AVG(temperature - 273.15) AS v FROM t",
+    "SELECT SUM(temperature * 2.0) AS v FROM t",
+    "SELECT MIN(temperature + 1.0) AS v FROM t",
+    "SELECT MAX(temperature / 2.0) AS v FROM t",
+    "SELECT COUNT(temperature - 273.15) AS v FROM t",
+];
+
+#[tokio::test]
+async fn declines_aggregate_over_expression_argument() {
+    for sql in EXPRESSION_ARG_QUERIES {
+        let plan = plan_for(sql).await;
+        let (agg, z) = find_agg_over_zarr(&plan).expect("AggregateExec over ZarrExec");
+        assert!(
+            recognize(agg, z).is_none(),
+            "must decline a computed argument: `{sql}`"
+        );
+    }
+}
+
+#[tokio::test]
+async fn expression_argument_is_not_pushed() {
+    for sql in EXPRESSION_ARG_QUERIES {
+        let ctx = ctx_pushdown();
+        register_zarr_table(&ctx, "t", SYNTHETIC_V3);
+        let plan = get_physical_plan(&ctx, sql).await;
+        assert!(
+            !contains_node::<ZarrAggregateExec>(&plan),
+            "a computed argument must not be pushed: `{sql}`"
+        );
+        assert!(
+            contains_node::<AggregateExec>(&plan),
+            "it must fall back to DataFusion's aggregate: `{sql}`"
+        );
+    }
+}
+
+#[tokio::test]
+async fn expression_argument_aggregates_are_value_equivalent() {
+    for sql in EXPRESSION_ARG_QUERIES {
+        let baseline = run(&SessionContext::new(), sql).await;
+        let pushed = run(&ctx_pushdown(), sql).await;
+        assert_eq!(baseline, pushed, "value mismatch for `{sql}`");
+    }
+}
+
+#[tokio::test]
+async fn unit_conversion_is_not_silently_dropped() {
+    // The exact shape that failed against ARCO-ERA5: `AVG(sst - 273.15)` returned the
+    // Kelvin mean. Guard the *semantics*, not just baseline agreement — if the offset
+    // were dropped again, these two would coincide.
+    let converted = run(
+        &ctx_pushdown(),
+        "SELECT AVG(temperature - 273.15) AS v FROM t",
+    )
+    .await;
+    let raw = run(&ctx_pushdown(), "SELECT AVG(temperature) AS v FROM t").await;
+    assert_ne!(
+        converted, raw,
+        "`- 273.15` was dropped: the aggregate ignored its argument expression"
+    );
+}
+
+#[tokio::test]
+async fn bare_and_cast_wrapped_columns_still_push() {
+    // Tightening the recognizer must not cost the optimization it exists for:
+    // `AVG(temperature)` lowers to `avg(CAST(temperature AS Float64))`, and seeing
+    // through that cast is exactly why `bare_column` recurses at all.
+    for sql in [
+        "SELECT AVG(temperature) AS v FROM t",
+        "SELECT SUM(temperature) AS v FROM t",
+        "SELECT COUNT(*) AS v FROM t",
+        "SELECT COUNT(temperature) AS v FROM t",
+    ] {
+        let ctx = ctx_pushdown();
+        register_zarr_table(&ctx, "t", SYNTHETIC_V3);
+        let plan = get_physical_plan(&ctx, sql).await;
+        assert!(
+            contains_node::<ZarrAggregateExec>(&plan),
+            "a bare/cast column must still push: `{sql}`"
+        );
+    }
+}
+
 // ---- Phase 7.4: GROUP BY coordinate axis ----
 
 #[tokio::test]
