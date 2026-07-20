@@ -31,3 +31,6 @@ data/ersst_v5_psl.nc
 # shipping them to a remote host makes stale local results look like fresh ones.
 bench/out/
 bench/**/__pycache__/
+
+# Invention disclosure — kept out of the public repo.
+docs/exact-cardinality-invention-disclosure.md
