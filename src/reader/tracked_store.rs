@@ -25,7 +25,11 @@ pub struct TrackedStore<S> {
 
 impl<S> TrackedStore<S> {
     /// Create a new tracked store wrapping the given storage.
+    ///
+    /// Marks the read as *measured*, so a resulting `0` means "read nothing" rather
+    /// than "nobody was counting".
     pub fn new(inner: Arc<S>, stats: SharedIoStats) -> Self {
+        stats.mark_disk_tracked();
         Self { inner, stats }
     }
 }

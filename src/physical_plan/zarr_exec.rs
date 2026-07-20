@@ -284,8 +284,21 @@ impl ExecutionPlan for ZarrExec {
         context: std::sync::Arc<datafusion::execution::TaskContext>,
     ) -> datafusion::error::Result<datafusion::execution::SendableRecordBatchStream> {
         // DataFusion decides the target rows per emitted RecordBatch via session
-        // config; we honor it as the streaming batch target (Block 0).
+        // config; we honor it as the *output* batch target. It is deliberately not
+        // the read window — see `stream_budget_bytes` below.
         let batch_size = context.session_config().batch_size();
+
+        // Resolve this partition's share of the scan memory ceiling. Every partition
+        // streams its own window concurrently, so the scan-wide ceiling has to be
+        // divided by the partition count or an N-core box holds N times the intended
+        // memory. Done here rather than in the reader because the partition count is
+        // a session/planner fact, not something the reader can see.
+        let n_partitions = self.partitions.len().max(1);
+        let stream_budget_bytes =
+            Some(crate::optimizer::cardinality::budget::resolve_scan_ceiling(
+                self.stream_budget_bytes,
+                n_partitions,
+            ));
 
         // Look up this partition's outer-axis selection. Empty `partitions` =>
         // legacy whole-store read (`None`). The selection is intersected with the
@@ -326,7 +339,7 @@ impl ExecutionPlan for ZarrExec {
                 self.io_stats.clone(),
                 self.coord_filters.clone(),
                 batch_size,
-                self.stream_budget_bytes,
+                stream_budget_bytes,
             );
         }
 
@@ -340,7 +353,7 @@ impl ExecutionPlan for ZarrExec {
                 self.io_stats.clone(),
                 self.coord_filters.clone(),
                 batch_size,
-                self.stream_budget_bytes,
+                stream_budget_bytes,
             )
         } else if is_remote_url(&self.path) || self.cached_remote.is_some() {
             // A cached async store on a non-remote path is an icechunk store
@@ -357,7 +370,7 @@ impl ExecutionPlan for ZarrExec {
                 partition_selection,
                 partition_extra,
                 batch_size,
-                self.stream_budget_bytes,
+                stream_budget_bytes,
             )
         } else {
             info!("Using local (sync) execution path");
@@ -371,7 +384,7 @@ impl ExecutionPlan for ZarrExec {
                 partition_selection,
                 partition_extra,
                 batch_size,
-                self.stream_budget_bytes,
+                stream_budget_bytes,
             )
         }
     }
@@ -495,9 +508,16 @@ fn execute_remote(
     batch_size: usize,
     stream_budget_bytes: Option<u64>,
 ) -> datafusion::error::Result<datafusion::execution::SendableRecordBatchStream> {
+    use crate::reader::async_tracked_store::AsyncTrackedStore;
     use crate::reader::storage::create_async_store;
 
     debug!(path = %path, has_cached_remote = cached_remote.is_some(), "Setting up remote execution stream");
+
+    // Byte counting is attached here, per execution, rather than where the store is
+    // built. The remote store is created once at CREATE EXTERNAL TABLE time and cached
+    // for the life of the table, but `stats` is per-query — baking a handle into the
+    // cached store would make every query report the running total of the session.
+    let io_stats = stats.clone();
 
     let params = AsyncReadParams {
         schema,
@@ -514,17 +534,24 @@ fn execute_remote(
     execute_async_read(
         params,
         move || async move {
-            if let Some((store, prefix, meta)) = cached_remote {
+            let (store, prefix, meta) = if let Some((store, prefix, meta)) = cached_remote {
                 info!("Using cached async store and metadata");
-                Ok((store, prefix, Some(meta)))
+                (store, prefix, Some(meta))
             } else {
                 debug!("Creating async store (no cache)");
                 let (store, prefix) = create_async_store(&path)
                     .await
                     .map_err(|e| DataFusionError::External(Box::new(e)))?;
                 debug!(prefix = %prefix, "Async store created");
-                Ok((store, prefix, None))
-            }
+                (store, prefix, None)
+            };
+
+            // Wrap whichever store we ended up with, so cached and freshly-created
+            // stores are both counted. Partitions each build their own wrapper but
+            // share one `Arc<ZarrIoStats>`, so the atomic counters aggregate.
+            let tracked: AsyncReadableListableStorage =
+                Arc::new(AsyncTrackedStore::new(store, Some(io_stats)));
+            Ok((tracked, prefix, meta))
         },
         "Remote",
     )

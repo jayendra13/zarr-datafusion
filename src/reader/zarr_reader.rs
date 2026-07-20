@@ -277,6 +277,127 @@ fn create_empty_result_stream(
 /// mixed-dimensionality optimization.
 ///
 /// This consolidates the identical schema building logic used in both sync and async paths.
+/// Per-axis chunk extent that every projected data variable agrees on, in effective
+/// axis order — the alignment the streaming window should snap its tiles to.
+///
+/// Only data variables constrain alignment; coordinate columns are 1-D and cheap.
+/// Callers reach here under `all_full_cube`, which guarantees each projected var has
+/// the same rank as the effective coordinate set, so `chunks[j]` corresponds to
+/// effective axis `j`. The rank check below is belt-and-braces: a mismatch means the
+/// positional mapping is not valid, and aligning on it would tile the wrong axis.
+///
+/// Returns all-ones (no constraint) when nothing usable is found, which reproduces
+/// the previous unaligned behaviour rather than guessing.
+fn projected_chunk_alignment(
+    schema: &SchemaRef,
+    projected_indices: &[usize],
+    coord_names: &[String],
+    data_vars: &[super::schema_inference::ZarrArrayMeta],
+    sizes: &[u64],
+) -> Vec<u64> {
+    let per_var: Vec<&[u64]> = projected_indices
+        .iter()
+        .filter_map(|&i| {
+            let name = schema.field(i).name();
+            if coord_names.iter().any(|c| c == name) {
+                return None;
+            }
+            data_vars
+                .iter()
+                .find(|v| &v.name == name)?
+                .chunks
+                .as_deref()
+                .filter(|ch| ch.len() == sizes.len())
+        })
+        .collect();
+
+    if per_var.is_empty() {
+        return vec![1; sizes.len()];
+    }
+    crate::optimizer::cardinality::budget::chunk_alignment(&per_var, sizes)
+}
+
+/// Per-axis tile sizes for the streaming window, snapped to whole chunk rows.
+///
+/// Shared by the sync and async scans, which plan windows identically. Rounds the
+/// tiled axis *down* to a whole number of chunk rows so the memory budget still caps
+/// the batch: a tile thinner than its chunk makes every window re-fetch and
+/// re-decompress the same chunks, but exceeding the budget risks an OOM, and a
+/// re-read is the cheaper failure. When the target cannot hold even one chunk row,
+/// the plan stays unaligned and the predicted cost is logged rather than paid
+/// silently.
+#[allow(clippy::too_many_arguments)]
+fn plan_window_tiles(
+    sizes: &[u64],
+    ceiling_bytes: u64,
+    row_width: usize,
+    batch_size: usize,
+    schema: &SchemaRef,
+    projected_indices: &[usize],
+    coord_names: &[String],
+    data_vars: &[super::schema_inference::ZarrArrayMeta],
+) -> Vec<usize> {
+    use crate::optimizer::cardinality::budget;
+
+    let align = projected_chunk_alignment(schema, projected_indices, coord_names, data_vars, sizes);
+
+    // Plan-time inference: what this query's geometry actually needs, versus what it
+    // is allowed. The window is the smaller — never sized from the machine, because
+    // past one chunk row a bigger window reads exactly the same bytes.
+    let need_bytes = budget::chunk_row_bytes(sizes, &align, row_width);
+    let target = (ceiling_bytes / (row_width as u64).max(1)).max(batch_size as u64);
+
+    let plan = budget::plan_streaming_chunked(sizes, target, &align);
+    let amplification = plan.chunk_amplification(sizes, &align);
+
+    if amplification > 1.0 {
+        // Actionable rather than mysterious: say what it needs and what it has, so a
+        // 37x re-read cliff reads as a setting to change instead of unexplained
+        // slowness. This is the failure mode that stayed invisible for so long.
+        warn!(
+            amplification = format!("{amplification:.1}x"),
+            needed = %crate::optimizer::cardinality::budget::human_bytes(need_bytes),
+            ceiling = %crate::optimizer::cardinality::budget::human_bytes(ceiling_bytes as u128),
+            tiles = ?plan.tiles,
+            chunk_alignment = ?align,
+            "read window is narrower than one chunk row, so chunks will be re-read; \
+             raise the scan memory ceiling (ZARR_MEM_BUDGET_BYTES) to remove this"
+        );
+    } else {
+        debug!(
+            needed = %crate::optimizer::cardinality::budget::human_bytes(need_bytes),
+            ceiling = %crate::optimizer::cardinality::budget::human_bytes(ceiling_bytes as u128),
+            tiles = ?plan.tiles,
+            "read window covers whole chunk rows; each chunk read once"
+        );
+    }
+
+    plan.tiles.iter().map(|&t| t as usize).collect()
+}
+
+/// Split a batch into `batch_size`-row slices for emission.
+///
+/// The read window is sized from chunk geometry so each chunk is fetched once,
+/// which makes it far wider than DataFusion's `batch_size`. Emitting it whole would
+/// hand downstream operators a single enormous `RecordBatch` and break the batching
+/// contract they pipeline against. `RecordBatch::slice` is zero-copy — the slices
+/// share the window's buffers — so reading wide and emitting narrow costs nothing.
+fn slice_to_batch_size(batch: RecordBatch, batch_size: usize) -> Vec<RecordBatch> {
+    let rows = batch.num_rows();
+    let step = batch_size.max(1);
+    if rows <= step {
+        return vec![batch];
+    }
+    let mut out = Vec::with_capacity(rows.div_ceil(step));
+    let mut offset = 0;
+    while offset < rows {
+        let len = step.min(rows - offset);
+        out.push(batch.slice(offset, len));
+        offset += len;
+    }
+    out
+}
+
 fn build_projected_schema(
     schema: &SchemaRef,
     projected_indices: &[usize],
@@ -1263,12 +1384,46 @@ struct WindowedScan {
     limit: Option<usize>,
     /// Rows emitted so far (drives the LIMIT stop).
     emitted: usize,
+    /// DataFusion's output batch target. The read window is chosen from chunk
+    /// geometry and is usually much larger, so a window is sliced into batches of
+    /// this size before being emitted — reading wide and emitting narrow.
+    batch_size: usize,
+    /// Slices of the current window still to be emitted.
+    pending: std::collections::VecDeque<RecordBatch>,
 }
 
 impl WindowedScan {
+    /// Emit the next output batch, honouring DataFusion's `batch_size`.
+    ///
+    /// The read window is sized from chunk geometry so each chunk is fetched once,
+    /// which makes it far wider than `batch_size`. Emitting it whole would hand
+    /// downstream operators a single enormous `RecordBatch`; instead each window is
+    /// sliced here. `RecordBatch::slice` is zero-copy — the slices share the
+    /// window's buffers, so this costs no extra memory.
+    fn next_batch(&mut self) -> Option<Result<RecordBatch>> {
+        loop {
+            if let Some(batch) = self.pending.pop_front() {
+                return Some(Ok(batch));
+            }
+            match self.next_window()? {
+                Ok(window) => self.push_slices(window),
+                Err(e) => return Some(Err(e)),
+            }
+        }
+    }
+
+    /// Split one window into `batch_size`-row slices, queued for emission.
+    fn push_slices(&mut self, window: RecordBatch) {
+        if window.num_rows() == 0 {
+            return;
+        }
+        self.pending
+            .extend(slice_to_batch_size(window, self.batch_size));
+    }
+
     /// Build the next tile's batch, or `None` when the grid is exhausted or the
     /// LIMIT has been reached (later tiles are never read — laziness).
-    fn next_batch(&mut self) -> Option<Result<RecordBatch>> {
+    fn next_window(&mut self) -> Option<Result<RecordBatch>> {
         if let Some(limit) = self.limit {
             if self.emitted >= limit {
                 return None;
@@ -1617,22 +1772,28 @@ pub fn read_zarr(
             // outer-only `max_steps = batch_size / inner_rows`.
             let row_width =
                 crate::optimizer::cardinality::cost::row_width(&projected_schema).max(1);
-            // Budget precedence: rule-set bytes (Phase 5) -> env bytes. The single
-            // bytes -> rows division (by the authoritative projected row_width)
-            // happens here; absent any budget the target is batch_size.
-            let budget_bytes = stream_budget_bytes.or_else(|| {
-                crate::optimizer::cardinality::budget::MemoryBudget::from_env().map(|b| b.bytes)
-            });
-            let target = budget_bytes
-                .map(|bytes| (bytes / row_width as u64).max(1))
-                .unwrap_or(batch_size as u64);
+            // Ceiling precedence: rule-set bytes (Phase 5, already divided by the
+            // partition count) -> env bytes -> the 256 MiB default. The window itself
+            // is then inferred from chunk geometry inside `plan_window_tiles`, capped
+            // by this ceiling: `batch_size` is an output-batching preference and is
+            // no longer allowed to masquerade as a memory budget.
+            let ceiling_bytes = crate::optimizer::cardinality::budget::resolve_scan_ceiling(
+                stream_budget_bytes.or_else(|| {
+                    crate::optimizer::cardinality::budget::MemoryBudget::from_env().map(|b| b.bytes)
+                }),
+                1,
+            );
             let sizes: Vec<u64> = query_coord_sizes.iter().map(|&s| s as u64).collect();
-            let tiles: Vec<usize> =
-                crate::optimizer::cardinality::budget::plan_streaming(&sizes, target)
-                    .tiles
-                    .iter()
-                    .map(|&t| t as usize)
-                    .collect();
+            let tiles = plan_window_tiles(
+                &sizes,
+                ceiling_bytes,
+                row_width,
+                batch_size,
+                &schema,
+                &projected_indices,
+                &coord_names,
+                &store_meta.data_vars,
+            );
             let effective_sels: Vec<CoordSelection> = (0..effective_coord_indices.len())
                 .map(|j| match &coord_ranges {
                     Some(sels) => sels[effective_coord_indices[j]].clone(),
@@ -1676,7 +1837,7 @@ pub fn read_zarr(
             limit,
             query_rows,
         )?;
-        let stream = stream::iter(vec![Ok(batch)]);
+        let stream = stream::iter(slice_to_batch_size(batch, batch_size).into_iter().map(Ok));
         return Ok(Box::pin(RecordBatchStreamAdapter::new(
             projected_schema,
             stream,
@@ -1691,6 +1852,8 @@ pub fn read_zarr(
         batch_size, "Streaming scan: tiling selection"
     );
     let scan = WindowedScan {
+        batch_size,
+        pending: std::collections::VecDeque::new(),
         store,
         store_meta,
         schema,
@@ -1865,10 +2028,37 @@ struct AsyncWindowedScan {
     total_rows: usize,
     /// Rows emitted so far (drives the LIMIT stop).
     emitted: usize,
+    /// DataFusion's output batch target; see `WindowedScan::batch_size`.
+    batch_size: usize,
+    /// Slices of the current window still to be emitted.
+    pending: std::collections::VecDeque<RecordBatch>,
 }
 
 impl AsyncWindowedScan {
+    /// Emit the next output batch, honouring `batch_size`; see
+    /// [`WindowedScan::next_batch`] for why reads and emissions are decoupled.
     async fn next_batch(&mut self) -> Option<Result<RecordBatch>> {
+        loop {
+            if let Some(batch) = self.pending.pop_front() {
+                return Some(Ok(batch));
+            }
+            match self.next_window().await? {
+                Ok(window) => self.push_slices(window),
+                Err(e) => return Some(Err(e)),
+            }
+        }
+    }
+
+    /// Split one window into `batch_size`-row slices, queued for emission.
+    fn push_slices(&mut self, window: RecordBatch) {
+        if window.num_rows() == 0 {
+            return;
+        }
+        self.pending
+            .extend(slice_to_batch_size(window, self.batch_size));
+    }
+
+    async fn next_window(&mut self) -> Option<Result<RecordBatch>> {
         if let Some(limit) = self.limit {
             if self.emitted >= limit {
                 return None;
@@ -2247,22 +2437,28 @@ pub async fn read_zarr_async(
         if all_full_cube && !effective_coord_indices.is_empty() && !query_coord_sizes.is_empty() {
             let row_width =
                 crate::optimizer::cardinality::cost::row_width(&projected_schema).max(1);
-            // Budget precedence: rule-set bytes (Phase 5) -> env bytes. The single
-            // bytes -> rows division (by the authoritative projected row_width)
-            // happens here; absent any budget the target is batch_size.
-            let budget_bytes = stream_budget_bytes.or_else(|| {
-                crate::optimizer::cardinality::budget::MemoryBudget::from_env().map(|b| b.bytes)
-            });
-            let target = budget_bytes
-                .map(|bytes| (bytes / row_width as u64).max(1))
-                .unwrap_or(batch_size as u64);
+            // Ceiling precedence: rule-set bytes (Phase 5, already divided by the
+            // partition count) -> env bytes -> the 256 MiB default. The window itself
+            // is then inferred from chunk geometry inside `plan_window_tiles`, capped
+            // by this ceiling: `batch_size` is an output-batching preference and is
+            // no longer allowed to masquerade as a memory budget.
+            let ceiling_bytes = crate::optimizer::cardinality::budget::resolve_scan_ceiling(
+                stream_budget_bytes.or_else(|| {
+                    crate::optimizer::cardinality::budget::MemoryBudget::from_env().map(|b| b.bytes)
+                }),
+                1,
+            );
             let sizes: Vec<u64> = query_coord_sizes.iter().map(|&s| s as u64).collect();
-            let tiles: Vec<usize> =
-                crate::optimizer::cardinality::budget::plan_streaming(&sizes, target)
-                    .tiles
-                    .iter()
-                    .map(|&t| t as usize)
-                    .collect();
+            let tiles = plan_window_tiles(
+                &sizes,
+                ceiling_bytes,
+                row_width,
+                batch_size,
+                &schema,
+                &projected_indices,
+                &coord_names,
+                &store_meta.data_vars,
+            );
             let effective_sels: Vec<CoordSelection> = (0..effective_coord_indices.len())
                 .map(|j| match &coord_ranges {
                     Some(sels) => sels[effective_coord_indices[j]].clone(),
@@ -2307,7 +2503,7 @@ pub async fn read_zarr_async(
             total_rows,
         )
         .await?;
-        let stream = stream::iter(vec![Ok(batch)]);
+        let stream = stream::iter(slice_to_batch_size(batch, batch_size).into_iter().map(Ok));
         return Ok(Box::pin(RecordBatchStreamAdapter::new(
             projected_schema,
             stream,
@@ -2322,6 +2518,8 @@ pub async fn read_zarr_async(
         batch_size, "Streaming async scan: tiling selection"
     );
     let scan = AsyncWindowedScan {
+        batch_size,
+        pending: std::collections::VecDeque::new(),
         store,
         prefix: prefix.clone(),
         store_meta,

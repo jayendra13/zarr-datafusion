@@ -504,7 +504,6 @@ fn print_stats_line(row_count: usize, elapsed_secs: f64, io_stats: Option<&Share
     if let Some(stats) = io_stats {
         let total_arrays =
             stats.coord_arrays.load(Ordering::Relaxed) + stats.data_arrays.load(Ordering::Relaxed);
-        let disk_bytes = stats.total_disk_bytes();
         let mem_bytes = stats.total_bytes();
 
         parts.push(format!(
@@ -512,7 +511,12 @@ fn print_stats_line(row_count: usize, elapsed_secs: f64, io_stats: Option<&Share
             total_arrays,
             if total_arrays == 1 { "" } else { "s" }
         ));
-        parts.push(format!("{} disk", format_bytes(disk_bytes)));
+        // "n/a" where nothing counted (icechunk and VirtualiZarr do their own object
+        // I/O) — reporting those as `0 B` would read as "this query fetched nothing".
+        parts.push(match stats.disk_bytes_tracked() {
+            Some(bytes) => format!("{} disk", format_bytes(bytes)),
+            None => "n/a disk".to_string(),
+        });
         parts.push(format!("{} mem", format_bytes(mem_bytes)));
     }
 
@@ -527,14 +531,17 @@ fn spawn_live_stats(stats: SharedIoStats, stop: Arc<AtomicBool>) -> tokio::task:
         while !stop.load(Ordering::Relaxed) {
             let arrays = stats.coord_arrays.load(Ordering::Relaxed)
                 + stats.data_arrays.load(Ordering::Relaxed);
-            let disk_bytes = stats.total_disk_bytes();
+            let disk = match stats.disk_bytes_tracked() {
+                Some(bytes) => format_bytes(bytes),
+                None => "n/a".to_string(),
+            };
 
             // Use \r to overwrite line, \x1b[K to clear to end of line
             print!(
                 "\r{} array{} · {} disk...\x1b[K",
                 arrays,
                 if arrays == 1 { "" } else { "s" },
-                format_bytes(disk_bytes)
+                disk
             );
             let _ = io::stdout().flush();
 

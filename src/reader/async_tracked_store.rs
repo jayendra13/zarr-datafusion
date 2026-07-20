@@ -27,7 +27,13 @@ pub struct AsyncTrackedStore<S: ?Sized> {
 
 impl<S: ?Sized> AsyncTrackedStore<S> {
     /// Create a new async tracked store wrapping the given storage.
+    ///
+    /// Passing `Some(stats)` both enables counting and marks the read as *measured*,
+    /// so a resulting `0` means "fetched nothing" rather than "nobody was counting".
     pub fn new(inner: Arc<S>, stats: Option<SharedIoStats>) -> Self {
+        if let Some(ref s) = stats {
+            s.mark_disk_tracked();
+        }
         Self { inner, stats }
     }
 }

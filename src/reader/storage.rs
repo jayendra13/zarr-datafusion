@@ -17,8 +17,6 @@ use zarrs_object_store::object_store::path::Path as ObjectPath;
 use zarrs_object_store::object_store::Error as ObjectStoreError;
 use zarrs_object_store::AsyncObjectStore;
 
-use super::async_tracked_store::AsyncTrackedStore;
-
 /// Error type for storage operations
 #[derive(Debug)]
 pub enum StorageError {
@@ -156,9 +154,9 @@ async fn create_s3_store(
         .with_bucket_name(bucket)
         .build()?;
 
-    let object_store = Arc::new(AsyncObjectStore::new(store));
-    let tracked_store = AsyncTrackedStore::new(object_store, None);
-    let async_store: AsyncReadableListableStorage = Arc::new(tracked_store);
+    // Returned untracked: byte counting is attached per-execution in `execute_remote`,
+    // because this store is cached across queries while stats are per-query.
+    let async_store: AsyncReadableListableStorage = Arc::new(AsyncObjectStore::new(store));
     let object_path = ObjectPath::from(path);
 
     Ok((async_store, object_path))
@@ -190,9 +188,9 @@ async fn create_gcs_store(
                 .build()
         })?;
 
-    let object_store = Arc::new(AsyncObjectStore::new(store));
-    let tracked_store = AsyncTrackedStore::new(object_store, None);
-    let async_store: AsyncReadableListableStorage = Arc::new(tracked_store);
+    // Returned untracked: byte counting is attached per-execution in `execute_remote`,
+    // because this store is cached across queries while stats are per-query.
+    let async_store: AsyncReadableListableStorage = Arc::new(AsyncObjectStore::new(store));
     let object_path = ObjectPath::from(path);
     info!(
         bucket = bucket,
@@ -229,9 +227,9 @@ async fn create_http_store(
         .build()
         .map_err(StorageError::ObjectStore)?;
 
-    let object_store = Arc::new(AsyncObjectStore::new(store));
-    let tracked_store = AsyncTrackedStore::new(object_store, None);
-    let async_store: AsyncReadableListableStorage = Arc::new(tracked_store);
+    // Returned untracked: byte counting is attached per-execution in `execute_remote`,
+    // because this store is cached across queries while stats are per-query.
+    let async_store: AsyncReadableListableStorage = Arc::new(AsyncObjectStore::new(store));
     let object_path = ObjectPath::from(path);
 
     info!(
