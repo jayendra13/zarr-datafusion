@@ -303,3 +303,45 @@ async fn end_to_end_copy_roundtrips_v2() {
     // upgrades it to a v3 target with dimension_names.
     copy_roundtrips("data/synthetic_rt_v2.zarr", "mat_copy_v2.zarr").await;
 }
+
+// ---------------------------------------------------------------------------
+// DataSink driver: writing a Zarr store as a DataFusion ExecutionPlan
+// ---------------------------------------------------------------------------
+
+use zarr_datafusion::writer::zarr_write_exec;
+
+#[tokio::test]
+async fn data_sink_writes_a_store_as_an_execution_plan() {
+    let ctx = create_baseline_context();
+    register_zarr_table(&ctx, "src", SRC);
+    let plan = plan_of(&ctx, "SELECT time, lat, lon, temperature, reflectance FROM src").await;
+
+    // Derive the spec at plan time (not from the stream), then wrap the input in a
+    // sink node. Executing the node creates the skeleton and writes the store.
+    let spec = derive_skeleton_spec(&plan, vec![1, 4, 5]).expect("materialise");
+    let target = scratch("datasink_copy.zarr");
+    let exec = zarr_write_exec(plan, target.clone(), spec, 3); // 3 write partitions
+
+    let out = collect(exec, ctx.task_ctx()).await.expect("execute sink");
+    // The sink yields a single `count` row (UInt64) of rows written.
+    let count = out[0]
+        .column(0)
+        .as_any()
+        .downcast_ref::<arrow::array::UInt64Array>()
+        .expect("count column")
+        .value(0);
+    assert_eq!(count, 7 * 10 * 12);
+
+    // The written store must match the source.
+    let tgt = create_baseline_context();
+    register_zarr_table(&tgt, "t", &target);
+    assert_eq!(
+        scalar_i64(&ctx, "SELECT SUM(temperature) FROM src").await,
+        scalar_i64(&tgt, "SELECT SUM(temperature) FROM t").await,
+    );
+    let nan = "SELECT SUM(CASE WHEN isnan(reflectance) THEN 1 ELSE 0 END)";
+    assert_eq!(
+        scalar_i64(&ctx, &format!("{nan} FROM src")).await,
+        scalar_i64(&tgt, &format!("{nan} FROM t")).await,
+    );
+}

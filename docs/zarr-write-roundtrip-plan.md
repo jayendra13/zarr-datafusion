@@ -522,6 +522,21 @@ reuses Phases 3 and 5 wholesale and adds only the `ZarrRechunkExec` inner loop.
 **Decision: build the sink first as a plain `DataSink`; defer the verb.** The sink
 is identical either way.
 
+**`DataSink` — done** (`src/writer/data_sink.rs`, `ZarrDataSink` + `zarr_write_exec`).
+The write path is now a native DataFusion `ExecutionPlan`: `zarr_write_exec(input,
+path, spec, partitions)` returns a `DataSinkExec` whose execution creates the
+skeleton and writes the store, yielding a `count` row. Load-bearing point (§3.1/Q1)
+respected — the sink is *constructed with the already-derived spec*; `write_all`
+consumes the stream and writes, it never re-derives the grid. `DataSinkExec` reads
+only partition 0, so `zarr_write_exec` coalesces multi-partition input first; the
+write-side parallelism stays our own chunk-aligned `write_batches_partitioned`
+(Phase 5), run off the collected stream. Validated by
+`data_sink_writes_a_store_as_an_execution_plan` (execute the node, count == rows,
+store matches source). **Still deferred: the verb itself** (`COPY TO` /
+`insert_into`) that routes a SQL statement to this node, and the streaming input
+shuffle (the sink currently collects the whole coalesced stream, so accumulation
+memory is still unbounded — plan gap 3).
+
 **Lean: `COPY TO`** — three independent arguments, all found by writing the SQL out
 rather than by reasoning about traits:
 
