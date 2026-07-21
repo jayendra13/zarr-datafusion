@@ -592,7 +592,7 @@ See §8 gaps 1-2.
 | 0 | Fixture + external oracle | — | low | **done** |
 | 1 | Skeleton (metadata, coord arrays, no data) | xarray opens it; all-fill read | low | **core done** |
 | 2 | Chunk-aligned sink, single partition, v3, plain columns | round trip + xarray | **high** — core design | **done** |
-| 3 | Admission rule wired to `optimizer::cardinality` | unit tests vs brute force | medium | not started |
+| 3 | Admission rule wired to `optimizer::cardinality` | plans over the fixture | medium | **structural decision done**; value materialisation deferred |
 | 4 | Round trip green, v3 and v2 | round trip + compare_zarr | **high** — first misaligned source | not started |
 | 5 | Repartition by target chunk (the shuffle) | round trip + xarray | **high** — correctness (§5.4) | not started |
 | 6 | Dict LUT fast path; shuffle elision via `touched_tiles` | slow path as oracle | low | not started |
@@ -644,6 +644,44 @@ conventions. `examples/write_filled.rs` emits the store the script checks.
 > exact cardinality and **ignores an attached `FILTER` clause**. zarr-python
 > confirmed the store itself is byte-correct. Worked around in the test with
 > `SUM(CASE ...)`; the optimiser bug is logged separately as out of Phase 2 scope.
+
+### Phase 3 — admission & grid derivation
+
+**Structural decision done** (`src/writer/plan.rs`, `derive_write_shape`).
+
+Admission and derivation are one fallible constructor, not a boolean gate: a query
+is admissible *because* we can derive its target grid, so `derive_write_shape(plan)
+-> Result<WriteShape, RejectReason>` returns the derived shape or a reason. This
+settles the plan-discussion Q1 — nothing else builds the spec, because building it
+and admitting it are the same analysis; a separate builder would re-derive and the
+two would drift (the recurring failure mode — falsified assumptions, #24).
+
+The rule that closes the §5.4 corruption hole is structural: **every source axis
+must be projected (kept as an output coordinate) or reduced (a `GROUP BY` key).**
+A pure projection that drops an axis is rejected (`DroppedAxis`) — otherwise many
+rows collapse onto one cell, last-write-wins. A reduce's target grid *is* the group
+keys; admissibility of the aggregate is `recognize()`'s existing decision, **reused
+not reinvented** (§5.8) — so `AVG(temperature - 5)` and `GROUP BY <data var>` reject
+for free, via the same code that guards aggregate pushdown.
+
+Two scope calls:
+
+- **No store I/O, no cardinality visibility change.** The decision needs only axis
+  *names* + the plan's output schema + `recognize()` (already `pub`); the plan-walk
+  is local to `writer/`. So `optimizer::cardinality` was not touched — cleaner than
+  the "promote `descend_to_zarr`/`project_onto` to pub" the design anticipated.
+- **Value materialisation deferred.** `WriteShape` is the grid *structure* (axes in
+  dim order, data vars + widened dtypes, `is_reduce`). Turning it into a concrete
+  `SkeletonSpec` — loading the source coord arrays and gathering them by any subset
+  filter via `selection_from_filters` — needs store I/O that is not cleanly exposed
+  yet. It *consumes* a `WriteShape` (does not re-derive it), so Q1's single-source
+  rule holds. This is the seam into Phase 4.
+
+Validated by `tests/integration_write_admission.rs` over real physical plans
+(baseline context, so a `GROUP BY` stays `AggregateExec <- ZarrExec` rather than
+being pushed to `ZarrAggregateExec` first): full projection, transform, coordinate
+reduce; and rejections for dropped axis, scalar aggregate, group-by-data-variable,
+computed aggregate argument, coordinates-only.
 
 ### Phase 4 — round trip
 

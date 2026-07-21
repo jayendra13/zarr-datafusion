@@ -7,9 +7,11 @@
 //!
 //! Writing is v3-only by design; reading v2 stays supported.
 
+pub mod plan;
 pub mod skeleton;
 pub mod sink;
 
+pub use plan::{derive_write_shape, RejectReason, WriteShape, WriteVar};
 pub use skeleton::{
     create_skeleton, CoordSpec, CoordValues, DataVarSpec, SkeletonSpec, WriteDataType,
 };
