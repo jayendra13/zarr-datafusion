@@ -130,7 +130,7 @@ impl std::error::Error for RejectReason {}
 /// number of children other than one — which is what rejects joins and other
 /// multi-input plans. Mirrors `cardinality::rule::descend_to_zarr`, but the
 /// aggregate is optional so a pure projection is reachable too.
-fn find_scan(
+pub(crate) fn find_scan(
     plan: &Arc<dyn ExecutionPlan>,
 ) -> Option<(Option<&AggregateExec>, &ZarrExec)> {
     fn go<'a>(

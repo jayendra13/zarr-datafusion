@@ -176,3 +176,113 @@ async fn rejects_coordinates_only() {
         .unwrap_err();
     assert_eq!(err, RejectReason::NoDataVariables);
 }
+
+// ---------------------------------------------------------------------------
+// Materialisation seam: WriteShape + source store -> SkeletonSpec, end to end
+// ---------------------------------------------------------------------------
+
+use datafusion::physical_plan::collect;
+use zarr_datafusion::writer::{derive_skeleton_spec, write_batches};
+
+async fn plan_of(ctx: &SessionContext, sql: &str) -> Arc<dyn ExecutionPlan> {
+    ctx.sql(sql)
+        .await
+        .expect("plan sql")
+        .create_physical_plan()
+        .await
+        .expect("physical plan")
+}
+
+async fn scalar_i64(ctx: &SessionContext, sql: &str) -> i64 {
+    let b = ctx.sql(sql).await.unwrap().collect().await.unwrap();
+    b[0].column(0)
+        .as_any()
+        .downcast_ref::<arrow::array::Int64Array>()
+        .unwrap()
+        .value(0)
+}
+
+/// The committed round-trip fixture (int64 coords, int64 + float32-with-NaN vars).
+const SRC: &str = "data/synthetic_rt_v3.zarr";
+
+#[tokio::test]
+async fn materialise_full_copy_spec() {
+    let ctx = create_baseline_context();
+    register_zarr_table(&ctx, "src", SRC);
+    let plan = plan_of(&ctx, "SELECT time, lat, lon, temperature, reflectance FROM src").await;
+
+    let spec = derive_skeleton_spec(&plan, vec![1, 4, 5]).expect("materialise");
+
+    // Grid axes carry the source coordinate values, in dimension order.
+    let grid: Vec<(String, usize)> = spec
+        .coords
+        .iter()
+        .map(|c| (c.name.clone(), c.values.len()))
+        .collect();
+    assert_eq!(
+        grid,
+        vec![
+            ("time".to_string(), 7),
+            ("lat".to_string(), 10),
+            ("lon".to_string(), 12)
+        ]
+    );
+    let vars: Vec<(String, WriteDataType)> = spec
+        .data_vars
+        .iter()
+        .map(|v| (v.name.clone(), v.data_type))
+        .collect();
+    assert_eq!(
+        vars,
+        vec![
+            ("temperature".to_string(), WriteDataType::Int64),
+            ("reflectance".to_string(), WriteDataType::Float32),
+        ]
+    );
+}
+
+#[tokio::test]
+async fn materialise_subset_gathers_coordinates() {
+    let ctx = create_baseline_context();
+    register_zarr_table(&ctx, "src", SRC);
+    // lat is arange(10); `lat < 5` narrows the grid to five points, other axes full.
+    let plan = plan_of(&ctx, "SELECT time, lat, lon, temperature FROM src WHERE lat < 5").await;
+
+    let spec = derive_skeleton_spec(&plan, vec![1, 4, 5]).expect("materialise");
+    let axis = |n: &str| spec.coords.iter().find(|c| c.name == n).unwrap().values.len();
+    assert_eq!(axis("lat"), 5, "lat narrowed to the subset");
+    assert_eq!(axis("time"), 7, "time unfiltered");
+    assert_eq!(axis("lon"), 12, "lon unfiltered");
+}
+
+#[tokio::test]
+async fn end_to_end_copy_roundtrips() {
+    // Query a real store, derive its spec, create the target, execute the plan, and
+    // write it — a full zarr -> (Arrow) -> zarr copy driven only by a SELECT.
+    let ctx = create_baseline_context();
+    register_zarr_table(&ctx, "src", SRC);
+    let sql = "SELECT time, lat, lon, temperature, reflectance FROM src";
+    let plan = plan_of(&ctx, sql).await;
+
+    let spec = derive_skeleton_spec(&plan, vec![1, 4, 5]).expect("materialise");
+    let target = scratch("mat_copy.zarr");
+    create_skeleton(&target, &spec).expect("create target");
+
+    let batches = collect(plan, ctx.task_ctx()).await.expect("execute");
+    let n = write_batches(&target, &spec, batches).expect("write");
+    assert_eq!(n, 7 * 10 * 12);
+
+    // The target must read back identical to the source: same value sum, and the
+    // same NaN structure in the float variable (the fixture has real NaN holes).
+    let tgt = create_baseline_context();
+    register_zarr_table(&tgt, "t", &target);
+
+    assert_eq!(
+        scalar_i64(&ctx, "SELECT SUM(temperature) FROM src").await,
+        scalar_i64(&tgt, "SELECT SUM(temperature) FROM t").await,
+    );
+    let nan = "SELECT SUM(CASE WHEN isnan(reflectance) THEN 1 ELSE 0 END)";
+    let src_nan = scalar_i64(&ctx, &format!("{nan} FROM src")).await;
+    assert!(src_nan > 0, "fixture should have NaN holes to preserve");
+    assert_eq!(src_nan, scalar_i64(&tgt, &format!("{nan} FROM t")).await);
+}

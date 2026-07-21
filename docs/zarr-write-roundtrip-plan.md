@@ -670,12 +670,26 @@ Two scope calls:
   *names* + the plan's output schema + `recognize()` (already `pub`); the plan-walk
   is local to `writer/`. So `optimizer::cardinality` was not touched — cleaner than
   the "promote `descend_to_zarr`/`project_onto` to pub" the design anticipated.
-- **Value materialisation deferred.** `WriteShape` is the grid *structure* (axes in
-  dim order, data vars + widened dtypes, `is_reduce`). Turning it into a concrete
-  `SkeletonSpec` — loading the source coord arrays and gathering them by any subset
-  filter via `selection_from_filters` — needs store I/O that is not cleanly exposed
-  yet. It *consumes* a `WriteShape` (does not re-derive it), so Q1's single-source
-  rule holds. This is the seam into Phase 4.
+- **Value materialisation — now done** (`src/writer/materialize.rs`).
+  `materialize_spec(plan, shape, chunks)` loads the source coord arrays (raw, no CF
+  conversion, so they round-trip), gathers them by any coordinate filter via
+  `calculate_coord_ranges`, and assembles a `SkeletonSpec`. It *consumes* a
+  `WriteShape` (never re-derives the admission decision), so Q1's single-source
+  rule holds. `derive_skeleton_spec(plan, chunks)` is the one-call convenience.
+
+  This closes the loop — a query alone produces a store.
+  `end_to_end_copy_roundtrips` drives a full `zarr -> Arrow -> zarr` copy of the
+  committed fixture from a single `SELECT` (derive spec -> create skeleton ->
+  execute -> `write_batches`); the target reads back identical (same value sum,
+  same NaN structure), and the sink handled the scan's dict-encoded coordinate
+  columns via its cast path. `materialise_subset_gathers_coordinates` covers a
+  `WHERE lat < 5` coordinate subset (grid narrows to five points).
+
+  Scope of this cut: local (`FilesystemStore`) sources; coordinate values widen to
+  Int64/Float64 (lossless in value, but a `float32` source coord becomes `float64`
+  in the target — data variables keep exact width via the sink); periodic group
+  keys not materialised. External `compare_zarr.py` verification of a copy belongs
+  to Phase 4 proper.
 
 Validated by `tests/integration_write_admission.rs` over real physical plans
 (baseline context, so a `GROUP BY` stays `AggregateExec <- ZarrExec` rather than

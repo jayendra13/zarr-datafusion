@@ -7,10 +7,12 @@
 //!
 //! Writing is v3-only by design; reading v2 stays supported.
 
+pub mod materialize;
 pub mod plan;
 pub mod skeleton;
 pub mod sink;
 
+pub use materialize::{derive_skeleton_spec, materialize_spec};
 pub use plan::{derive_write_shape, RejectReason, WriteShape, WriteVar};
 pub use skeleton::{
     create_skeleton, CoordSpec, CoordValues, DataVarSpec, SkeletonSpec, WriteDataType,
