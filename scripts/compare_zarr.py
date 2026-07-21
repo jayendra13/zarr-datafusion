@@ -87,8 +87,18 @@ def fill_value_equal(a, b) -> bool:
     return bool(fa == fb) if fa is not None or fb is not None else True
 
 
-def compare(a_path: str, b_path: str, check_chunks: bool = False) -> list[str]:
-    """Compare two Zarr stores. Returns a list of human-readable differences."""
+def compare(
+    a_path: str,
+    b_path: str,
+    check_chunks: bool = False,
+    allow_added_dim_names: bool = False,
+) -> list[str]:
+    """Compare two Zarr stores. Returns a list of human-readable differences.
+
+    `allow_added_dim_names` permits B to carry dimension names where A had none —
+    the legitimate case of a v2 -> v3 copy, which always adds `dimension_names`.
+    Names that are present on *both* sides must still match exactly.
+    """
     errors: list[str] = []
     a_root = zarr.open_group(a_path, mode="r")
     b_root = zarr.open_group(b_path, mode="r")
@@ -112,7 +122,10 @@ def compare(a_path: str, b_path: str, check_chunks: bool = False) -> list[str]:
             continue
 
         a_dims, b_dims = dim_names(a), dim_names(b)
-        if a_dims != b_dims:
+        # A v2 -> v3 copy adds dimension names A never had; allow that enrichment,
+        # but still require names to match when both stores carry them.
+        added_names = allow_added_dim_names and a_dims is None and b_dims is not None
+        if a_dims != b_dims and not added_names:
             errors.append(f"{name}: dimension names {a_dims} != {b_dims}")
 
         if check_chunks and a.chunks != b.chunks:
@@ -207,6 +220,9 @@ def main() -> int:
     p.add_argument("--check-chunks", action="store_true",
                    help="also require an exact chunk-grid match (a true round trip; "
                         "omit when comparing across a deliberate rechunk)")
+    p.add_argument("--allow-added-dim-names", action="store_true",
+                   help="permit B to add dimension names A lacked (a v2 -> v3 copy); "
+                        "names present on both sides must still match")
     p.add_argument("--self-test", action="store_true",
                    help="verify the oracle rejects a lat/lon-swapped store")
     args = p.parse_args()
@@ -217,7 +233,12 @@ def main() -> int:
     if not args.a or not args.b:
         p.error("two store paths are required (or --self-test)")
 
-    errors = compare(args.a, args.b, check_chunks=args.check_chunks)
+    errors = compare(
+        args.a,
+        args.b,
+        check_chunks=args.check_chunks,
+        allow_added_dim_names=args.allow_added_dim_names,
+    )
     if errors:
         print(f"DIFFER: {args.a} vs {args.b}")
         for e in errors:

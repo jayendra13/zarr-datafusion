@@ -593,7 +593,7 @@ See §8 gaps 1-2.
 | 1 | Skeleton (metadata, coord arrays, no data) | xarray opens it; all-fill read | low | **core done** |
 | 2 | Chunk-aligned sink, single partition, v3, plain columns | round trip + xarray | **high** — core design | **done** |
 | 3 | Admission rule wired to `optimizer::cardinality` | plans over the fixture | medium | **structural decision done**; value materialisation deferred |
-| 4 | Round trip green, v3 and v2 | round trip + compare_zarr | **high** — first misaligned source | not started |
+| 4 | Round trip green, v3 and v2 | round trip + compare_zarr | **high** — first misaligned source | **zarr->zarr done (v2+v3, external oracle); parquet/non-Zarr hop -> 4b** |
 | 5 | Repartition by target chunk (the shuffle) | round trip + xarray | **high** — correctness (§5.4) | not started |
 | 6 | Dict LUT fast path; shuffle elision via `touched_tiles` | slow path as oracle | low | not started |
 | 7 | Tier 1 array-native rechunk (`ZarrRechunkExec`) | round trip + xarray | medium; see §5.9, §9 | not started |
@@ -699,14 +699,33 @@ computed aggregate argument, coordinates-only.
 
 ### Phase 4 — round trip
 
-`zarr -> parquet -> zarr`, both formats. Parquet is a deliberate intermediate:
-`COPY TO ... STORED AS PARQUET` already works, and it gives an inspectable
-checkpoint (the debugging trick in CLAUDE.md). Assert with **both** oracles:
-byte-equality of the round trip, *and* `compare_zarr.py` against the original — the
-second is the one that can fail interestingly.
+**4a — `zarr -> (Arrow) -> zarr`, both formats, externally verified. Done.**
+`examples/write_copy.rs` copies a store from a single `SELECT * FROM src`
+(`derive_skeleton_spec` -> `create_skeleton` -> execute -> `write_batches`). Verified
+two ways:
 
-Its parquet source is the first input whose partitioning bears no relation to the
-target grid, so Phase 5's shuffle is a prerequisite for parallelising it.
+- `tests/integration_write_admission.rs::end_to_end_copy_roundtrips_v{2,3}` — our
+  reader, both formats. The v2 path exercises shape-inference (no `dimension_names`),
+  where the round trip could silently transpose.
+- **External `compare_zarr.py`** (the oracle that shares none of our conventions):
+  v3 -> v3 reports `IDENTICAL` (strict). v2 -> v3 is `IDENTICAL` with
+  `--allow-added-dim-names`, and in strict mode differs on *exactly* the dimension
+  names and nothing else — confirming the copy is byte-faithful and the only change
+  is the legitimate v2->v3 `dimension_names` enrichment (new flag added to the
+  oracle for this case).
+
+**4b — the parquet intermediate / non-Zarr source. Deferred.** The plan's original
+`zarr -> parquet -> zarr` has a hidden dependency: the `parquet -> zarr` hop reads
+from a Parquet scan, not a `ZarrExec`, so `derive_write_shape` rejects it
+(`NotSingleZarrScan`) — there is no source store to read coordinate *values* from.
+That is §8 gaps 1-2 (non-Zarr grid provenance), which need the reference-store
+escape hatch, not just a round-trip harness. The direct `zarr -> Arrow -> zarr` path
+(4a) already gives the faithful round trip and the inspectable artifact, so the
+parquet hop is decoupled here and moves to 4b, to be built together with the
+non-Zarr grid source.
+
+The parquet source is also the first input whose partitioning bears no relation to
+the target grid, so Phase 5's shuffle is a prerequisite for parallelising it.
 
 ---
 

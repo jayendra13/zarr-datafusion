@@ -255,34 +255,51 @@ async fn materialise_subset_gathers_coordinates() {
     assert_eq!(axis("lon"), 12, "lon unfiltered");
 }
 
-#[tokio::test]
-async fn end_to_end_copy_roundtrips() {
-    // Query a real store, derive its spec, create the target, execute the plan, and
-    // write it — a full zarr -> (Arrow) -> zarr copy driven only by a SELECT.
+/// A full `zarr -> (Arrow) -> zarr` copy driven only by a SELECT, asserting the
+/// target reads back identical to `src`. Runs for both v2 and v3 sources — the v2
+/// path exercises the reader's shape-inference (no `dimension_names`), which is
+/// where the round trip could go wrong. (The external `compare_zarr.py` oracle
+/// checks the same copy against the original; see examples/write_copy.rs.)
+async fn copy_roundtrips(src: &str, tag: &str) {
     let ctx = create_baseline_context();
-    register_zarr_table(&ctx, "src", SRC);
-    let sql = "SELECT time, lat, lon, temperature, reflectance FROM src";
-    let plan = plan_of(&ctx, sql).await;
+    register_zarr_table(&ctx, "src", src);
+    let plan = plan_of(&ctx, "SELECT time, lat, lon, temperature, reflectance FROM src").await;
 
     let spec = derive_skeleton_spec(&plan, vec![1, 4, 5]).expect("materialise");
-    let target = scratch("mat_copy.zarr");
+    let target = scratch(tag);
     create_skeleton(&target, &spec).expect("create target");
 
     let batches = collect(plan, ctx.task_ctx()).await.expect("execute");
     let n = write_batches(&target, &spec, batches).expect("write");
     assert_eq!(n, 7 * 10 * 12);
 
-    // The target must read back identical to the source: same value sum, and the
-    // same NaN structure in the float variable (the fixture has real NaN holes).
+    // Target must read back identical: same value sum and same NaN structure in the
+    // float variable (the fixture has real NaN holes).
     let tgt = create_baseline_context();
     register_zarr_table(&tgt, "t", &target);
-
     assert_eq!(
         scalar_i64(&ctx, "SELECT SUM(temperature) FROM src").await,
         scalar_i64(&tgt, "SELECT SUM(temperature) FROM t").await,
+        "temperature sum differs for {src}",
     );
     let nan = "SELECT SUM(CASE WHEN isnan(reflectance) THEN 1 ELSE 0 END)";
     let src_nan = scalar_i64(&ctx, &format!("{nan} FROM src")).await;
     assert!(src_nan > 0, "fixture should have NaN holes to preserve");
-    assert_eq!(src_nan, scalar_i64(&tgt, &format!("{nan} FROM t")).await);
+    assert_eq!(
+        src_nan,
+        scalar_i64(&tgt, &format!("{nan} FROM t")).await,
+        "NaN structure differs for {src}",
+    );
+}
+
+#[tokio::test]
+async fn end_to_end_copy_roundtrips_v3() {
+    copy_roundtrips("data/synthetic_rt_v3.zarr", "mat_copy_v3.zarr").await;
+}
+
+#[tokio::test]
+async fn end_to_end_copy_roundtrips_v2() {
+    // v2 has no dimension_names — the reader infers axes from shape, and the copy
+    // upgrades it to a v3 target with dimension_names.
+    copy_roundtrips("data/synthetic_rt_v2.zarr", "mat_copy_v2.zarr").await;
 }
