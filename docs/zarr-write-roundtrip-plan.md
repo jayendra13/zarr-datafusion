@@ -591,7 +591,7 @@ See §8 gaps 1-2.
 |---|---|---|---|---|
 | 0 | Fixture + external oracle | — | low | **done** |
 | 1 | Skeleton (metadata, coord arrays, no data) | xarray opens it; all-fill read | low | **core done** |
-| 2 | Chunk-aligned sink, single partition, v3, plain columns | round trip + xarray | **high** — core design | not started |
+| 2 | Chunk-aligned sink, single partition, v3, plain columns | round trip + xarray | **high** — core design | **done** |
 | 3 | Admission rule wired to `optimizer::cardinality` | unit tests vs brute force | medium | not started |
 | 4 | Round trip green, v3 and v2 | round trip + compare_zarr | **high** — first misaligned source | not started |
 | 5 | Repartition by target chunk (the shuffle) | round trip + xarray | **high** — correctness (§5.4) | not started |
@@ -620,6 +620,31 @@ Single-partition and v3-only. **Do not chase parallelism here** — but note tha
 single-partition *hides* §5.4 entirely: with one writer no chunk can have two
 owners, so Phase 2 green proves nothing about alignment.
 
+**Done** (`src/writer/sink.rs`, `write_batches`). Two simplifications taken for this
+cut, both because it is single-partition:
+
+- **The whole array is materialised per variable** and handed to zarrs in one
+  `store_array_subset_elements` call, which owns all chunk decomposition — ragged
+  edge chunks included, so none of that math is ours to get wrong. Bounded
+  per-chunk-per-partition memory (plan gap 3) arrives with partitioning in Phase 5.
+- **Default fills only.** A custom `fill_value` is refused, because a full-array
+  write must write the holes too and the sink only knows the defaults (0 / NaN).
+
+Row -> index is a binary search of each coordinate value into its axis (plain
+columns, not the dict fast path — Phase 6); an off-axis value is a loud error
+(§5.6). Validated by `tests/integration_writer.rs` through our own reader **and** by
+`scripts/check_sink.py`, which re-derives a position-encoding formula
+(`temp[t,y,x] = 1000t+100y+x`) with zarr-python — so an axis transpose or stride
+bug that our reader would echo back is caught by a party that shares none of our
+conventions. `examples/write_filled.rs` emits the store the script checks.
+
+> **Aside — a real optimiser bug this surfaced (not a sink bug).** A first cut of
+> the fill-hole test used `COUNT(x) FILTER (WHERE isnan(x))`; it returned the grid
+> cardinality regardless of the predicate. The count optimiser folds `COUNT` to the
+> exact cardinality and **ignores an attached `FILTER` clause**. zarr-python
+> confirmed the store itself is byte-correct. Worked around in the test with
+> `SUM(CASE ...)`; the optimiser bug is logged separately as out of Phase 2 scope.
+
 ### Phase 4 — round trip
 
 `zarr -> parquet -> zarr`, both formats. Parquet is a deliberate intermediate:
@@ -641,7 +666,7 @@ target grid, so Phase 5's shuffle is a prerequisite for parallelising it.
 | 2 | **Coord/var classification, non-Zarr** | Phase 4 | Parquet carries no marker saying `lat` is an axis. **Distinct from gap 1** — axis *values* and *which columns are axes* are different problems. |
 | 3 | **Shuffle memory bound** | Phase 5 | Phase 2 bounds memory at one buffer per partition, true only when a partition owns one chunk. After a repartition each partition owns *many* → N × buffers, not a bound. Needs sort-by-chunk-index within partition (stream one at a time) or a bounded pool. `budget.rs` may supply the accounting (§3.3). |
 | 4 | **Coord identity through projection** | Phase 3 | `SELECT time AS t` — under `COPY TO` the output schema *is* the target schema, so "which columns are axes" needs tracing coords through aliases and expressions. Expression analysis, not name matching. |
-| 5 | **`fill_value` / dtype declaration** | Phase 2 | `create_skeleton` defaults NaN/0 and supports only Int64/Float32/Float64. No override syntax; no rule for Arrow -> `WriteDataType` or narrowing casts. What type is `(b08-b04)/(b08+b04)`? |
+| 5 | ~~`fill_value` / dtype declaration~~ **(settled)** | — | `WriteDataType::from_arrow` maps a query's Arrow output type by **widen-or-reject, never narrow** (ints -> Int64, Float16/32 -> Float32, Float64 stays; UInt64 and non-numerics refused). `DataVarSpec::from_arrow_field` derives the var. `(b08-b04)/(b08+b04)` over Float32 bands stays Float32. Fill defaults NaN/0, overridable via `DataVarSpec::fill_value`. A *declared* target dtype disagreeing with the query output remains a `COPY TO ... OPTIONS` concern (deferred with the verb, §6). |
 | 6 | **Atomicity** | later | A failed write leaves a half-written store. No transaction, no cleanup. icechunk would give this free; plain Zarr will not. |
 
 Gaps 1 and 2 both land on **Phase 4**. Give its first cut a reference-store escape
