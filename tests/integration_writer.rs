@@ -19,8 +19,8 @@ use arrow::datatypes::{DataType, Field, Schema};
 
 use common::{create_test_context, execute_query, register_zarr_table};
 use zarr_datafusion::writer::{
-    create_skeleton, write_batches, CoordSpec, CoordValues, DataVarSpec, SkeletonSpec,
-    WriteDataType,
+    create_skeleton, write_batches, write_batches_partitioned, CoordSpec, CoordValues,
+    DataVarSpec, SkeletonSpec, WriteDataType,
 };
 
 /// Mirrors the round-trip fixture's grid: time(7) x lat(10) x lon(12), ragged
@@ -412,4 +412,119 @@ fn sink_refuses_custom_fill_value() {
         .unwrap_err()
         .to_string();
     assert!(err.contains("custom fill_value"), "{err}");
+}
+
+// ---------------------------------------------------------------------------
+// Phase 5 — chunk-aligned partitioned (concurrent) writes
+// ---------------------------------------------------------------------------
+
+/// Read every cell of a data variable back, in row-major order, as f64 (NaN-aware
+/// equality handles the reflectance holes).
+async fn read_all_f64(path: &str, var: &str) -> Vec<f64> {
+    let ctx = create_test_context();
+    register_zarr_table(&ctx, "t", path);
+    // ORDER BY the coordinates to get a deterministic, comparable ordering.
+    let sql = format!("SELECT {var} FROM t ORDER BY time, lat, lon");
+    let batches = execute_query(&ctx, &sql).await;
+    let mut out = Vec::new();
+    for b in &batches {
+        let col = b.column(0);
+        if let Some(a) = col.as_any().downcast_ref::<arrow::array::Int64Array>() {
+            out.extend((0..a.len()).map(|i| a.value(i) as f64));
+        } else if let Some(a) = col.as_any().downcast_ref::<Float32Array>() {
+            out.extend((0..a.len()).map(|i| a.value(i) as f64));
+        } else if let Some(a) = col.as_any().downcast_ref::<arrow::array::Float64Array>() {
+            out.extend((0..a.len()).map(|i| a.value(i)));
+        }
+    }
+    out
+}
+
+fn nan_aware_eq(a: &[f64], b: &[f64]) -> bool {
+    a.len() == b.len()
+        && a.iter()
+            .zip(b)
+            .all(|(x, y)| x == y || (x.is_nan() && y.is_nan()))
+}
+
+#[tokio::test]
+async fn partitioned_write_matches_monolithic_across_partition_counts() {
+    // The chunk-aligned outer partitioning must produce byte-identical results to
+    // the single-writer path, for any partition count — including counts that
+    // exceed the number of outer chunks (7 time chunks here, chunk=1).
+    let batch = grid_batch(|_, _, _| true);
+
+    // Reference: single-writer path.
+    let mono = scratch("part_mono.zarr");
+    create_skeleton(&mono, &rt_spec()).unwrap();
+    write_batches(&mono, &rt_spec(), [batch.clone()]).unwrap();
+    let mono_temp = read_all_f64(&mono, "temperature").await;
+    let mono_refl = read_all_f64(&mono, "reflectance").await;
+
+    for parts in [1usize, 2, 3, 7, 16] {
+        let path = scratch(&format!("part_{parts}.zarr"));
+        create_skeleton(&path, &rt_spec()).unwrap();
+        let n = write_batches_partitioned(&path, &rt_spec(), [batch.clone()], parts).unwrap();
+        assert_eq!(n, (NT * NLAT * NLON) as u64, "row count with {parts} partitions");
+
+        assert!(
+            nan_aware_eq(&read_all_f64(&path, "temperature").await, &mono_temp),
+            "temperature differs with {parts} partitions",
+        );
+        assert!(
+            nan_aware_eq(&read_all_f64(&path, "reflectance").await, &mono_refl),
+            "reflectance differs with {parts} partitions",
+        );
+    }
+}
+
+#[tokio::test]
+async fn partitioned_write_is_faithful_to_the_formula() {
+    // An independent check that the concurrent slabs land values at the right
+    // cells: spot-check the doubly-ragged corner and an interior cell through the
+    // reader after a many-partition write.
+    let path = scratch("part_formula.zarr");
+    create_skeleton(&path, &rt_spec()).unwrap();
+    write_batches_partitioned(&path, &rt_spec(), [grid_batch(|_, _, _| true)], 7).unwrap();
+
+    let ctx = create_test_context();
+    register_zarr_table(&ctx, "t", &path);
+    assert_eq!(
+        scalar_i64(&ctx, "SELECT temperature FROM t WHERE time=6 AND lat=9 AND lon=11").await,
+        cell(6, 9, 11),
+    );
+    assert_eq!(
+        scalar_i64(&ctx, "SELECT temperature FROM t WHERE time=2 AND lat=3 AND lon=7").await,
+        cell(2, 3, 7),
+    );
+}
+
+#[tokio::test]
+async fn partitioned_write_leaves_fill_holes() {
+    // A filtered (partial) write under partitioning must still leave the unwritten
+    // cells as fill — the slabs that receive no rows write all-fill chunks.
+    let path = scratch("part_holes.zarr");
+    create_skeleton(&path, &rt_spec()).unwrap();
+    // Only the time=3 slice; with chunk=1 on time, only one outer chunk is touched.
+    write_batches_partitioned(&path, &rt_spec(), [grid_batch(|t, _, _| t == 3)], 4).unwrap();
+
+    let ctx = create_test_context();
+    register_zarr_table(&ctx, "t", &path);
+    assert_eq!(
+        scalar_i64(&ctx, "SELECT temperature FROM t WHERE time=3 AND lat=4 AND lon=6").await,
+        cell(3, 4, 6),
+    );
+    assert_eq!(
+        scalar_i64(&ctx, "SELECT temperature FROM t WHERE time=0 AND lat=4 AND lon=6").await,
+        0,
+        "untouched outer chunk must read as fill",
+    );
+    assert_eq!(
+        scalar_i64(
+            &ctx,
+            "SELECT SUM(CASE WHEN isnan(reflectance) THEN 1 ELSE 0 END) FROM t"
+        )
+        .await,
+        (NT - 1) * NLAT * NLON,
+    );
 }

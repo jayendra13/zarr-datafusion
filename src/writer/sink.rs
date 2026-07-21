@@ -12,21 +12,26 @@
 //! axis is a **loud error**, never a silent drop, because it means the source and
 //! target grids disagree.
 //!
-//! **Phase 2 is deliberately the simplest correct cut, and these limits are known:**
+//! Two entry points:
+//! - [`write_batches`] — a single writer holding the whole array in memory.
+//! - [`write_batches_partitioned`] — `N` concurrent writers, each owning a
+//!   chunk-aligned outer slab. Because [`plan_partitions`] boundaries are
+//!   chunk-aligned, no two writers ever touch the same chunk, so the §5.4
+//!   last-write-wins hazard cannot arise (Phase 5). Both share the [`write_range`]
+//!   core and give identical results.
 //!
-//! - **Single "partition": the whole array is materialised in memory, per
-//!   variable.** One dense `Vec` of `product(shape)` elements is built and handed to
-//!   zarrs in one `store_array_subset` call, which owns all chunk decomposition
-//!   (including ragged edge chunks). Bounded, per-chunk-per-partition memory is the
-//!   Phase 5 refinement (plan gap 3), not this.
-//! - **No alignment concern.** With one writer, no chunk can have two owners, so the
-//!   §5.4 corruption hazard cannot arise here — and Phase 2 passing proves nothing
-//!   about it. That is Phase 5's job.
+//! **Known limits of this cut:**
+//!
+//! - **Whole array (or slab) materialised in memory.** Each writer builds a dense
+//!   `Vec` for its region and hands it to zarrs in one `store_array_subset` call,
+//!   which owns all chunk decomposition (ragged edge chunks included).
+//!   Partitioning bounds a *writer's* buffer to its slab; bounding *accumulation*
+//!   too (a streaming input shuffle, plan gap 3) waits on the `DataSink` driver.
 //! - **Plain columns only.** Coordinate columns are read as plain typed arrays, not
 //!   the `DictionaryArray` fast path (§5.6, Phase 6). Build and test where nothing
 //!   clever can hide a bug first.
 //! - **Default fills only.** A variable with a custom `fill_value` is refused: this
-//!   sink writes the *whole* array including the holes, so the hole value it writes
+//!   sink writes the *whole* region including the holes, so the hole value it writes
 //!   must equal the array's declared fill, and it only knows the defaults (0 / NaN).
 
 use std::sync::Arc;
@@ -40,6 +45,7 @@ use zarrs::array::Array;
 use zarrs::array_subset::ArraySubset;
 use zarrs::filesystem::FilesystemStore;
 
+use crate::physical_plan::partition::plan_partitions;
 use super::skeleton::{CoordValues, SkeletonSpec, WriteDataType};
 
 type BoxError = Box<dyn std::error::Error + Send + Sync>;
@@ -153,38 +159,45 @@ fn row_major_strides(shape: &[usize]) -> Vec<usize> {
     strides
 }
 
-/// Write data-variable chunks into an existing skeleton at `store_path` by
-/// scattering the rows of `batches` into the target grid.
-///
-/// `spec` must be the same spec the skeleton was created from — it supplies the
-/// coordinate axis values used to map each row to its grid index. Returns the
-/// number of rows written. See the module docs for the Phase 2 limits.
-pub fn write_batches(
-    store_path: &str,
-    spec: &SkeletonSpec,
-    batches: impl IntoIterator<Item = RecordBatch>,
-) -> Result<u64, BoxError> {
-    // A custom fill would disagree with the holes this sink writes (see module docs).
+/// A custom fill would disagree with the holes this sink writes (see module docs).
+fn reject_custom_fills(spec: &SkeletonSpec) -> Result<(), BoxError> {
     if let Some(v) = spec.data_vars.iter().find(|v| v.fill_value.is_some()) {
         return Err(format!(
-            "data variable '{}' has a custom fill_value; the Phase 2 sink writes \
-             the whole array and only knows the default fills (0 / NaN)",
+            "data variable '{}' has a custom fill_value; the sink writes the whole \
+             target region and only knows the default fills (0 / NaN)",
             v.name
         )
         .into());
     }
+    Ok(())
+}
 
-    let shape: Vec<usize> = spec.coords.iter().map(|c| c.values.len()).collect();
-    let strides = row_major_strides(&shape);
-    let total: usize = shape.iter().product();
+/// Write the rows whose outer-axis (axis 0) index falls in `[outer_start,
+/// outer_end)` into that chunk-aligned slab of the target.
+///
+/// The slab is full on every inner axis and clipped only on the outer axis, so it
+/// touches a *disjoint, whole* set of chunks: two calls with non-overlapping outer
+/// ranges never write the same chunk, which is what makes them safe to run
+/// concurrently (§5.4). Rows outside the range are ignored, so every partition can
+/// see the same input and take only its share.
+fn write_range(
+    store_path: &str,
+    spec: &SkeletonSpec,
+    shape: &[usize],
+    strides: &[usize],
+    batches: &[RecordBatch],
+    outer_start: usize,
+    outer_end: usize,
+) -> Result<u64, BoxError> {
+    let outer_stride = strides[0]; // = product of inner-axis sizes
+    let slab_rows = (outer_end - outer_start) * outer_stride;
+    let base = outer_start * outer_stride;
 
     let store = Arc::new(FilesystemStore::new(store_path)?);
-
-    // One dense buffer per data variable, plus the opened array to flush it into.
     let mut buffers: Vec<Buffer> = spec
         .data_vars
         .iter()
-        .map(|v| Buffer::filled(v.data_type, total))
+        .map(|v| Buffer::filled(v.data_type, slab_rows))
         .collect();
     let arrays: Vec<Array<FilesystemStore>> = spec
         .data_vars
@@ -197,13 +210,12 @@ pub fn write_batches(
     for batch in batches {
         let n = batch.num_rows();
 
-        // Coordinate columns, cast to their axis element type.
         let axis_cols: Vec<AxisCol> = spec
             .coords
             .iter()
             .map(|c| match &c.values {
                 CoordValues::Int64(axis) => {
-                    let arr = cast_to(&batch, &c.name, &ArrowType::Int64)?;
+                    let arr = cast_to(batch, &c.name, &ArrowType::Int64)?;
                     let col = arr
                         .as_any()
                         .downcast_ref::<Int64Array>()
@@ -212,7 +224,7 @@ pub fn write_batches(
                     Ok(AxisCol::I64 { col, axis })
                 }
                 CoordValues::Float64(axis) => {
-                    let arr = cast_to(&batch, &c.name, &ArrowType::Float64)?;
+                    let arr = cast_to(batch, &c.name, &ArrowType::Float64)?;
                     let col = arr
                         .as_any()
                         .downcast_ref::<Float64Array>()
@@ -223,13 +235,12 @@ pub fn write_batches(
             })
             .collect::<Result<_, BoxError>>()?;
 
-        // Data-variable columns, cast to the variable's element type.
         let var_cols: Vec<VarCol> = spec
             .data_vars
             .iter()
             .map(|v| match v.data_type {
                 WriteDataType::Int64 => {
-                    let arr = cast_to(&batch, &v.name, &ArrowType::Int64)?;
+                    let arr = cast_to(batch, &v.name, &ArrowType::Int64)?;
                     Ok(VarCol::I64(
                         arr.as_any()
                             .downcast_ref::<Int64Array>()
@@ -238,7 +249,7 @@ pub fn write_batches(
                     ))
                 }
                 WriteDataType::Float32 => {
-                    let arr = cast_to(&batch, &v.name, &ArrowType::Float32)?;
+                    let arr = cast_to(batch, &v.name, &ArrowType::Float32)?;
                     Ok(VarCol::F32(
                         arr.as_any()
                             .downcast_ref::<Float32Array>()
@@ -247,7 +258,7 @@ pub fn write_batches(
                     ))
                 }
                 WriteDataType::Float64 => {
-                    let arr = cast_to(&batch, &v.name, &ArrowType::Float64)?;
+                    let arr = cast_to(batch, &v.name, &ArrowType::Float64)?;
                     Ok(VarCol::F64(
                         arr.as_any()
                             .downcast_ref::<Float64Array>()
@@ -259,37 +270,116 @@ pub fn write_batches(
             .collect::<Result<_, BoxError>>()?;
 
         for r in 0..n {
-            let mut pos = 0usize;
-            for (axis_idx, ac) in axis_cols.iter().enumerate() {
-                let i = ac.index_at(&spec.coords[axis_idx].name, r)?;
-                pos += i * strides[axis_idx];
+            // Resolve the outer index first, so rows outside this slab are cheaply
+            // skipped (and off-grid values still error, in every partition).
+            let outer_idx = axis_cols[0].index_at(&spec.coords[0].name, r)?;
+            if outer_idx < outer_start || outer_idx >= outer_end {
+                continue;
             }
+            let mut pos = outer_idx * strides[0];
+            for (axis_idx, ac) in axis_cols.iter().enumerate().skip(1) {
+                pos += ac.index_at(&spec.coords[axis_idx].name, r)? * strides[axis_idx];
+            }
+            let pos_slab = pos - base;
             for (v, vc) in var_cols.iter().enumerate() {
-                vc.scatter(r, &mut buffers[v], pos);
+                vc.scatter(r, &mut buffers[v], pos_slab);
             }
+            rows_written += 1;
         }
-
-        rows_written += n as u64;
     }
 
-    // Flush each buffer as one full-array subset write; zarrs decomposes it into
-    // chunks (edge chunks included).
-    let full = ArraySubset::new_with_shape(shape.iter().map(|&s| s as u64).collect());
+    // One subset write over the slab: outer axis clipped to the range, inner axes
+    // full. zarrs decomposes it into chunks (inner edge chunks included).
+    let mut ranges: Vec<std::ops::Range<u64>> = Vec::with_capacity(shape.len());
+    ranges.push(outer_start as u64..outer_end as u64);
+    for &s in &shape[1..] {
+        ranges.push(0..s as u64);
+    }
+    let subset = ArraySubset::new_with_ranges(&ranges);
     for (v, (array, buf)) in arrays.iter().zip(buffers).enumerate() {
         match buf {
-            Buffer::I64(b) => array.store_array_subset_elements(&full, &b),
-            Buffer::F32(b) => array.store_array_subset_elements(&full, &b),
-            Buffer::F64(b) => array.store_array_subset_elements(&full, &b),
+            Buffer::I64(b) => array.store_array_subset_elements(&subset, &b),
+            Buffer::F32(b) => array.store_array_subset_elements(&subset, &b),
+            Buffer::F64(b) => array.store_array_subset_elements(&subset, &b),
         }
         .map_err(|e| format!("store '{}': {e}", spec.data_vars[v].name))?;
-        debug!(var = %spec.data_vars[v].name, "data variable chunks written");
     }
-
-    info!(
-        path = store_path,
-        rows = rows_written,
-        data_vars = spec.data_vars.len(),
-        "Sink wrote data variables"
-    );
+    debug!(store_path, outer_start, outer_end, rows_written, "slab written");
     Ok(rows_written)
+}
+
+/// Write data-variable chunks into an existing skeleton by scattering the rows of
+/// `batches` into the target grid. Single writer, whole array in memory.
+///
+/// `spec` must be the same spec the skeleton was created from — it supplies the
+/// coordinate axis values used to map each row to its grid index. Returns the
+/// number of rows written.
+pub fn write_batches(
+    store_path: &str,
+    spec: &SkeletonSpec,
+    batches: impl IntoIterator<Item = RecordBatch>,
+) -> Result<u64, BoxError> {
+    reject_custom_fills(spec)?;
+    let shape: Vec<usize> = spec.coords.iter().map(|c| c.values.len()).collect();
+    let strides = row_major_strides(&shape);
+    let batches: Vec<RecordBatch> = batches.into_iter().collect();
+    let n = write_range(store_path, spec, &shape, &strides, &batches, 0, shape[0])?;
+    info!(store_path, rows = n, "sink wrote data variables");
+    Ok(n)
+}
+
+/// Write in parallel across `target_partitions` writers, each owning a
+/// chunk-aligned slab of the outer axis.
+///
+/// The partitioning comes from [`plan_partitions`], whose boundaries are
+/// **chunk-aligned** — so each target chunk lies wholly within one partition and no
+/// two writers ever touch the same chunk (§5.4). That disjointness is what makes
+/// the concurrent writes correct: last-write-wins cannot arise when there is only
+/// ever one writer per chunk. Result is identical to [`write_batches`]; more
+/// partitions bound each writer's buffer to its slab rather than the whole array.
+pub fn write_batches_partitioned(
+    store_path: &str,
+    spec: &SkeletonSpec,
+    batches: impl IntoIterator<Item = RecordBatch>,
+    target_partitions: usize,
+) -> Result<u64, BoxError> {
+    reject_custom_fills(spec)?;
+    let shape: Vec<usize> = spec.coords.iter().map(|c| c.values.len()).collect();
+    let strides = row_major_strides(&shape);
+    let batches: Vec<RecordBatch> = batches.into_iter().collect();
+
+    let ranges: Vec<(usize, usize)> = plan_partitions(shape[0] as u64, spec.chunks[0], target_partitions)
+        .iter()
+        .filter_map(|p| p.as_range())
+        .collect();
+
+    // Each closure borrows shared, immutable state and writes a disjoint slab.
+    let results: Vec<Result<u64, String>> = std::thread::scope(|scope| {
+        let handles: Vec<_> = ranges
+            .iter()
+            .map(|&(a, b)| {
+                let (spec, shape, strides, batches) = (spec, &shape, &strides, &batches);
+                scope.spawn(move || {
+                    write_range(store_path, spec, shape, strides, batches, a, b)
+                        .map_err(|e| e.to_string())
+                })
+            })
+            .collect();
+        handles
+            .into_iter()
+            .map(|h| h.join().unwrap_or_else(|_| Err("writer thread panicked".into())))
+            .collect()
+    });
+
+    let mut total = 0u64;
+    for r in results {
+        total += r.map_err(BoxError::from)?;
+    }
+    info!(
+        store_path,
+        rows = total,
+        partitions = ranges.len(),
+        "sink wrote data variables (partitioned)"
+    );
+    Ok(total)
 }

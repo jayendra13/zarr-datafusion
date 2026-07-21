@@ -594,7 +594,7 @@ See §8 gaps 1-2.
 | 2 | Chunk-aligned sink, single partition, v3, plain columns | round trip + xarray | **high** — core design | **done** |
 | 3 | Admission rule wired to `optimizer::cardinality` | plans over the fixture | medium | **structural decision done**; value materialisation deferred |
 | 4 | Round trip green, v3 and v2 | round trip + compare_zarr | **high** — first misaligned source | **zarr->zarr done (v2+v3, external oracle); parquet/non-Zarr hop -> 4b** |
-| 5 | Repartition by target chunk (the shuffle) | round trip + xarray | **high** — correctness (§5.4) | not started |
+| 5 | Repartition by target chunk (the shuffle) | round trip + xarray | **high** — correctness (§5.4) | **chunk-aligned concurrent write done; streaming input-routing -> driver** |
 | 6 | Dict LUT fast path; shuffle elision via `touched_tiles` | slow path as oracle | low | not started |
 | 7 | Tier 1 array-native rechunk (`ZarrRechunkExec`) | round trip + xarray | medium; see §5.9, §9 | not started |
 
@@ -726,6 +726,35 @@ non-Zarr grid source.
 
 The parquet source is also the first input whose partitioning bears no relation to
 the target grid, so Phase 5's shuffle is a prerequisite for parallelising it.
+
+### Phase 5 — chunk-aligned concurrent writes
+
+**Done for the correctness core** (`writer::write_batches_partitioned`).
+
+The §5.4 hazard is that two writers touching one chunk race — a Zarr chunk is one
+object, written whole, so last-write-wins silently drops data. The fix is
+structural, not a lock: partition the **outer axis** with `plan_partitions` (reused
+from the read side), whose boundaries are **chunk-aligned**. Each target chunk then
+lies wholly within one partition, so no two writers ever address the same chunk, and
+concurrency is safe *by construction* rather than by coordination.
+
+`write_batches` was refactored into a per-outer-range core (`write_range`); the
+whole-array path is that core over `[0, outer_len)`. `write_batches_partitioned(...,
+n)` runs `n` chunk-aligned slabs concurrently (`std::thread::scope`), each writing a
+disjoint outer slab (full on inner axes) via one `store_array_subset` call — so
+zarrs still owns inner edge-chunk decomposition, and the slabs never overlap a chunk.
+
+Validated (`tests/integration_writer.rs`): the partitioned result is byte-identical
+to the single-writer path for partition counts 1, 2, 3, 7, and 16 (> the 7 outer
+chunks — excess partitions simply collapse), formula-faithful at the doubly-ragged
+corner, and fill-holes correct under a filtered write.
+
+**Deferred — the input side.** This bounds each *writer's* buffer to its slab, but a
+partition still scans the whole materialised input and keeps only its rows. A true
+streaming shuffle (route each row to its partition without N passes, bounding
+*accumulation* memory too — plan gap 3) belongs with the `DataSink` driver (§6),
+which does not exist yet. Also deferred: multi-axis (inner) partitioning, and the
+async/remote store path (this cut is `FilesystemStore` + threads).
 
 ---
 
