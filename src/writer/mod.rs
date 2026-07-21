@@ -7,12 +7,14 @@
 //!
 //! Writing is v3-only by design; reading v2 stays supported.
 
+pub mod copy_format;
 pub mod data_sink;
 pub mod materialize;
 pub mod plan;
 pub mod skeleton;
 pub mod sink;
 
+pub use copy_format::{register_zarr_write_format, ZarrFileFormat, ZarrFormatFactory};
 pub use data_sink::{zarr_write_exec, ZarrDataSink};
 pub use materialize::{derive_skeleton_spec, materialize_spec};
 pub use plan::{derive_write_shape, RejectReason, WriteShape, WriteVar};

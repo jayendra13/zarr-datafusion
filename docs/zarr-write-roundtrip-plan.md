@@ -532,10 +532,29 @@ only partition 0, so `zarr_write_exec` coalesces multi-partition input first; th
 write-side parallelism stays our own chunk-aligned `write_batches_partitioned`
 (Phase 5), run off the collected stream. Validated by
 `data_sink_writes_a_store_as_an_execution_plan` (execute the node, count == rows,
-store matches source). **Still deferred: the verb itself** (`COPY TO` /
-`insert_into`) that routes a SQL statement to this node, and the streaming input
-shuffle (the sink currently collects the whole coalesced stream, so accumulation
-memory is still unbounded — plan gap 3).
+store matches source).
+
+**`COPY TO ... STORED AS ZARR` — done** (`src/writer/copy_format.rs`). A write-only
+`FileFormat` + `FileFormatFactory` registered under the `zarr` extension
+(`register_zarr_write_format`, wired into the CLI). `create_writer_physical_plan`
+derives the spec from the query's *plan* (§3.1/Q1 — not the stream) and returns the
+`zarr_write_exec` node; the read methods are unreachable stubs (reads go through the
+separate `ZarrTableFactory`). `OPTIONS('chunks' ...)` sets the target chunk shape
+(defaults to the source's when the source is Zarr); `OPTIONS('partitions' ...)`
+selects concurrent writers (Phase 5).
+
+```sql
+COPY (SELECT time, lat, lon, temperature * 2 AS temp2 FROM src)
+  TO 'out.zarr' STORED AS ZARR OPTIONS ('chunks' '1,4,5', 'partitions' '3');
+```
+
+Verified end to end through the CLI (a transform written and read back) and by
+`copy_to_writes_a_zarr_store_from_sql` / `copy_to_defaults_chunks_from_source`. This
+is the justifying use case (§1): materialise a derived variable with pure SQL.
+
+**Still deferred:** the streaming input shuffle (the sink collects the whole
+coalesced stream, so accumulation memory is unbounded — plan gap 3); non-Zarr
+sources (Phase 4b); and `insert_into` (unneeded now that `COPY TO` works).
 
 **Lean: `COPY TO`** — three independent arguments, all found by writing the SQL out
 rather than by reasoning about traits:

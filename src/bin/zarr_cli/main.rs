@@ -228,6 +228,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         .build();
     let ctx = SessionContext::new_with_state(state);
 
+    // Register `COPY TO ... STORED AS ZARR` (the write verb).
+    if let Err(e) = zarr_datafusion::writer::register_zarr_write_format(&ctx) {
+        eprintln!("warning: could not register Zarr write format: {e}");
+    }
+
     // Register Zarr-specific table functions
     register_zarr_functions(&ctx);
 

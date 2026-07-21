@@ -345,3 +345,54 @@ async fn data_sink_writes_a_store_as_an_execution_plan() {
         scalar_i64(&tgt, &format!("{nan} FROM t")).await,
     );
 }
+
+// ---------------------------------------------------------------------------
+// COPY TO ... STORED AS ZARR — the SQL verb
+// ---------------------------------------------------------------------------
+
+use zarr_datafusion::writer::register_zarr_write_format;
+
+#[tokio::test]
+async fn copy_to_writes_a_zarr_store_from_sql() {
+    let ctx = create_baseline_context();
+    register_zarr_write_format(&ctx).expect("register format");
+    register_zarr_table(&ctx, "src", SRC);
+
+    let target = scratch("copyto.zarr");
+    let sql = format!(
+        "COPY (SELECT * FROM src) TO '{target}' \
+         STORED AS ZARR OPTIONS ('chunks' '1,4,5', 'partitions' '3')"
+    );
+    ctx.sql(&sql).await.expect("plan COPY").collect().await.expect("run COPY");
+
+    // The store the SQL produced must match the source.
+    let tgt = create_baseline_context();
+    register_zarr_table(&tgt, "t", &target);
+    assert_eq!(
+        scalar_i64(&ctx, "SELECT SUM(temperature) FROM src").await,
+        scalar_i64(&tgt, "SELECT SUM(temperature) FROM t").await,
+    );
+    let nan = "SELECT SUM(CASE WHEN isnan(reflectance) THEN 1 ELSE 0 END)";
+    let src_nan = scalar_i64(&ctx, &format!("{nan} FROM src")).await;
+    assert!(src_nan > 0);
+    assert_eq!(src_nan, scalar_i64(&tgt, &format!("{nan} FROM t")).await);
+}
+
+#[tokio::test]
+async fn copy_to_defaults_chunks_from_source() {
+    // Omitting the chunks option copies the source's chunking.
+    let ctx = create_baseline_context();
+    register_zarr_write_format(&ctx).expect("register format");
+    register_zarr_table(&ctx, "src", SRC);
+
+    let target = scratch("copyto_defaultchunks.zarr");
+    let sql = format!("COPY (SELECT * FROM src) TO '{target}' STORED AS ZARR");
+    ctx.sql(&sql).await.expect("plan").collect().await.expect("run");
+
+    let tgt = create_baseline_context();
+    register_zarr_table(&tgt, "t", &target);
+    assert_eq!(
+        scalar_i64(&ctx, "SELECT SUM(temperature) FROM src").await,
+        scalar_i64(&tgt, "SELECT SUM(temperature) FROM t").await,
+    );
+}
