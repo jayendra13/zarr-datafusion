@@ -71,6 +71,49 @@ impl WriteDataType {
             Self::Float64 => FillValue::from(f64::NAN),
         }
     }
+
+    /// Map a query's output Arrow type to a writable Zarr element type.
+    ///
+    /// Rule: **widen where necessary, never narrow.** `WriteDataType` cannot
+    /// represent every Arrow width, so anything narrower is promoted to the
+    /// nearest one that holds it losslessly — signed and unsigned integers up to
+    /// 32 bits into `Int64`, `Float16`/`Float32` into `Float32`. Narrowing is
+    /// refused rather than performed silently, because a truncated write is the
+    /// exact class of plausible-looking corruption this whole plan guards against.
+    ///
+    /// Two types are refused despite being numeric: `UInt64` has no lossless
+    /// signed-integer home (its top bit overflows `i64`), and `Float64` stays
+    /// `Float64` — it is *not* narrowed to `Float32`. Non-numeric types
+    /// (strings, booleans, temporal, dictionaries) have no Zarr element mapping
+    /// here yet.
+    ///
+    /// This function derives a target type *from a query output*, where narrowing
+    /// cannot arise. A separately *declared* target dtype that disagrees with the
+    /// query output (the future `COPY TO ... OPTIONS` surface) is a different
+    /// decision and is not made here.
+    pub fn from_arrow(dt: &arrow::datatypes::DataType) -> Result<Self, BoxError> {
+        use arrow::datatypes::DataType as A;
+        Ok(match dt {
+            A::Int8 | A::Int16 | A::Int32 | A::Int64 | A::UInt8 | A::UInt16 | A::UInt32 => {
+                Self::Int64
+            }
+            A::Float16 | A::Float32 => Self::Float32,
+            A::Float64 => Self::Float64,
+            A::UInt64 => {
+                return Err("cannot write UInt64: it has no lossless signed-integer \
+                            target; cast the column to Int64 or Float64 first"
+                    .into())
+            }
+            other => {
+                return Err(format!(
+                    "cannot write Arrow type {other:?} to Zarr yet (supported: \
+                     signed/unsigned ints -> Int64, Float16/Float32 -> Float32, \
+                     Float64 -> Float64)"
+                )
+                .into())
+            }
+        })
+    }
 }
 
 /// Values of one coordinate axis, dense and in index order.
@@ -81,11 +124,17 @@ pub enum CoordValues {
 }
 
 impl CoordValues {
-    fn len(&self) -> usize {
+    /// Number of points on this axis.
+    pub fn len(&self) -> usize {
         match self {
             Self::Int64(v) => v.len(),
             Self::Float64(v) => v.len(),
         }
+    }
+
+    /// Whether this axis has no points.
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
     }
 
     fn data_type(&self) -> WriteDataType {
@@ -132,6 +181,18 @@ impl DataVarSpec {
             fill_value: None,
             attributes: Map::new(),
         }
+    }
+
+    /// Derive a data-variable spec from a query's output field: its name and its
+    /// widened element type ([`WriteDataType::from_arrow`]), with the default
+    /// fill for that type. Override the fill afterward via [`Self::fill_value`] —
+    /// which matters for integers, whose default fill `0` cannot be told apart
+    /// from a written `0` in a filtered write.
+    pub fn from_arrow_field(field: &arrow::datatypes::Field) -> Result<Self, BoxError> {
+        Ok(Self::new(
+            field.name(),
+            WriteDataType::from_arrow(field.data_type())?,
+        ))
     }
 }
 
@@ -183,7 +244,7 @@ impl SkeletonSpec {
             return Err(format!("chunk size must be non-zero (dimension {bad})").into());
         }
         for coord in &self.coords {
-            if coord.values.len() == 0 {
+            if coord.values.is_empty() {
                 return Err(format!("coordinate '{}' is empty", coord.name).into());
             }
         }
@@ -292,4 +353,67 @@ pub fn create_skeleton(store_path: &str, spec: &SkeletonSpec) -> Result<(), BoxE
         "Skeleton created"
     );
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use arrow::datatypes::{DataType as A, Field};
+
+    #[test]
+    fn from_arrow_widens_integers_to_int64() {
+        for dt in [A::Int8, A::Int16, A::Int32, A::Int64, A::UInt8, A::UInt16, A::UInt32] {
+            assert_eq!(
+                WriteDataType::from_arrow(&dt).unwrap(),
+                WriteDataType::Int64,
+                "{dt:?} should widen to Int64"
+            );
+        }
+    }
+
+    #[test]
+    fn from_arrow_maps_floats_without_widening_f64() {
+        assert_eq!(
+            WriteDataType::from_arrow(&A::Float16).unwrap(),
+            WriteDataType::Float32
+        );
+        assert_eq!(
+            WriteDataType::from_arrow(&A::Float32).unwrap(),
+            WriteDataType::Float32
+        );
+        // Float64 stays Float64 — it is never narrowed to Float32.
+        assert_eq!(
+            WriteDataType::from_arrow(&A::Float64).unwrap(),
+            WriteDataType::Float64
+        );
+    }
+
+    #[test]
+    fn from_arrow_refuses_uint64_rather_than_truncating() {
+        let err = WriteDataType::from_arrow(&A::UInt64).unwrap_err().to_string();
+        assert!(err.contains("UInt64"), "{err}");
+        assert!(err.contains("lossless"), "{err}");
+    }
+
+    #[test]
+    fn from_arrow_refuses_unmapped_types() {
+        for dt in [A::Utf8, A::Boolean, A::Date32] {
+            assert!(
+                WriteDataType::from_arrow(&dt).is_err(),
+                "{dt:?} has no Zarr element mapping and must be refused"
+            );
+        }
+    }
+
+    #[test]
+    fn ndvi_expression_type_resolves_to_float32() {
+        // (b08 - b04) / (b08 + b04) over Float32 bands stays Float32 in DataFusion,
+        // so the derived NDVI variable is written Float32 with a NaN fill — no
+        // silent widening to Float64, no narrowing.
+        let field = Field::new("ndvi", A::Float32, true);
+        let spec = DataVarSpec::from_arrow_field(&field).unwrap();
+        assert_eq!(spec.name, "ndvi");
+        assert_eq!(spec.data_type, WriteDataType::Float32);
+        assert!(spec.fill_value.is_none(), "default NaN fill for a float var");
+    }
 }
