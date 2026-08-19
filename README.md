@@ -12,24 +12,36 @@ A Rust library that integrates [Zarr](https://zarr.dev/) (v2 and v3) array stora
 
 ## Quick Start
 
-```bash
-# Install the prebuilt CLI from a GitHub release (no Rust toolchain needed).
-# The Linux build is a static musl binary, so it runs on any x86_64 Linux
-# regardless of the system glibc version — ideal for deploying to a VM.
-# The current build is a preview prerelease, so pin the version explicitly:
-curl -fsSL https://raw.githubusercontent.com/jayendra13/zarr-datafusion/main/install.sh \
-  | VERSION=v0.1.0-test bash
-zarr-cli --version
+Install the prebuilt CLI — no Rust toolchain needed:
 
-# Or run from source (requires the Rust toolchain)
+```bash
+curl -fsSL https://raw.githubusercontent.com/jayendra13/zarr-datafusion/main/install.sh | bash
+```
+
+Check it landed:
+
+```bash
+zarr-cli --version
+```
+
+**Linux x86_64 only.** The binary is fully static (musl), so it runs on any
+x86_64 Linux regardless of the system glibc version — ideal for deploying to a
+VM. On macOS or other platforms the script stops with build-from-source
+instructions rather than downloading something that will not run; a macOS build
+is planned.
+
+To build from source instead (requires the Rust toolchain):
+
+```bash
+git clone https://github.com/jayendra13/zarr-datafusion.git
+cd zarr-datafusion
 cargo run --bin zarr-cli
 ```
 
-> Release: <https://github.com/jayendra13/zarr-datafusion/releases/tag/v0.1.0-test>
->
-> `install.sh` honours `VERSION=<tag>` to pin a release and `INSTALL_DIR=/usr/local/bin`
-> to change the install location (defaults to `~/.local/bin`). A `cargo install
-> zarr-datafusion` path will be available once the crate is published to crates.io.
+> `install.sh` installs a pinned release. Override with `VERSION=<tag>` (or
+> `VERSION=latest`) and change the location with `INSTALL_DIR=/usr/local/bin`
+> (defaults to `~/.local/bin`). A `cargo install zarr-datafusion` path will be
+> available once the crate is published to crates.io.
 
 ```sql
 -- Load a Zarr store (local or cloud)
