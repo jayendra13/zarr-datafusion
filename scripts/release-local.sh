@@ -7,7 +7,7 @@
 # TAG defaults to "v<version-in-Cargo.toml>". The release is created if missing;
 # existing assets are replaced (--clobber). After it runs, this works anywhere:
 #
-#   curl -fsSL https://raw.githubusercontent.com/jayendra13/zarr-datafusion/main/install.sh | bash
+#   curl -fsSL https://raw.githubusercontent.com/stratoscale-io/zarr-datafusion/main/install.sh | bash
 #
 # The x86_64 musl target is fully static, so it runs on any x86_64 Linux
 # regardless of the system glibc. For a full multi-platform release (macOS,
@@ -15,7 +15,7 @@
 # build everything.
 set -euo pipefail
 
-REPO="jayendra13/zarr-datafusion"
+REPO="stratoscale-io/zarr-datafusion"
 BIN="zarr-cli"
 TARGET="x86_64-unknown-linux-musl"
 

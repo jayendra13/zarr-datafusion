@@ -12,7 +12,7 @@ variable "region" {
 variable "github_owner" {
   description = "GitHub repository owner"
   type        = string
-  default     = "jayendra13"
+  default     = "stratoscale-io"
 }
 
 variable "github_repo" {

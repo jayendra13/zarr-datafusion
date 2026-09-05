@@ -30,7 +30,7 @@ WORKDIR /app
 
 # Links the published package to the source repo (e.g. on GHCR the package shows
 # up on the repo page and inherits its context).
-LABEL org.opencontainers.image.source="https://github.com/jayendra13/zarr-datafusion"
+LABEL org.opencontainers.image.source="https://github.com/stratoscale-io/zarr-datafusion"
 
 # Iris client (pulls marin-rigging/finelog from PyPI). marin-iris ships only
 # dev/prerelease wheels (no final release), so --pre is required and we pin an

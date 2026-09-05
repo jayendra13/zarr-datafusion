@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Install the zarr-cli binary from a GitHub release.
 #
-#   curl -fsSL https://raw.githubusercontent.com/jayendra13/zarr-datafusion/main/install.sh | bash
+#   curl -fsSL https://raw.githubusercontent.com/stratoscale-io/zarr-datafusion/main/install.sh | bash
 #
 # Options (env vars):
 #   VERSION       release tag to install (default: the pinned DEFAULT_VERSION below)
@@ -17,7 +17,7 @@
 # Bump DEFAULT_VERSION when a new release is verified to carry its assets.
 set -euo pipefail
 
-REPO="jayendra13/zarr-datafusion"
+REPO="stratoscale-io/zarr-datafusion"
 DEFAULT_VERSION="v0.1.1"
 VERSION="${VERSION:-$DEFAULT_VERSION}"
 INSTALL_DIR="${INSTALL_DIR:-$HOME/.local/bin}"

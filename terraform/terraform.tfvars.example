@@ -4,7 +4,7 @@
 project_id = "your-existing-gcp-project-id"
 region     = "us-central1"
 
-github_owner = "jayendra13"
+github_owner = "stratoscale-io"
 github_repo  = "zarr-datafusion"
 
 # Name of the GitHub connection you created in Cloud Build Console

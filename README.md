@@ -2,11 +2,11 @@
 
 [![Crates.io](https://img.shields.io/crates/v/zarr-datafusion.svg)](https://crates.io/crates/zarr-datafusion)
 [![docs.rs](https://docs.rs/zarr-datafusion/badge.svg)](https://docs.rs/zarr-datafusion)
-[![CI](https://github.com/jayendra13/zarr-datafusion/actions/workflows/test.yml/badge.svg)](https://github.com/jayendra13/zarr-datafusion/actions/workflows/test.yml)
-[![codecov](https://codecov.io/gh/jayendra13/zarr-datafusion/graph/badge.svg)](https://codecov.io/gh/jayendra13/zarr-datafusion)
+[![CI](https://github.com/stratoscale-io/zarr-datafusion/actions/workflows/test.yml/badge.svg)](https://github.com/stratoscale-io/zarr-datafusion/actions/workflows/test.yml)
+[![codecov](https://codecov.io/gh/stratoscale-io/zarr-datafusion/graph/badge.svg)](https://codecov.io/gh/stratoscale-io/zarr-datafusion)
 ![MSRV](https://img.shields.io/badge/rust-1.88+-orange.svg)
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
-[![GitHub commit activity](https://img.shields.io/github/commit-activity/m/jayendra13/zarr-datafusion)](https://github.com/jayendra13/zarr-datafusion/commits/main)
+[![GitHub commit activity](https://img.shields.io/github/commit-activity/m/stratoscale-io/zarr-datafusion)](https://github.com/stratoscale-io/zarr-datafusion/commits/main)
 
 A Rust library that integrates [Zarr](https://zarr.dev/) (v2 and v3) array storage with [Apache DataFusion](https://datafusion.apache.org/) for querying multidimensional scientific data using SQL.
 
@@ -15,7 +15,7 @@ A Rust library that integrates [Zarr](https://zarr.dev/) (v2 and v3) array stora
 Install the prebuilt CLI — no Rust toolchain needed:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/jayendra13/zarr-datafusion/main/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/stratoscale-io/zarr-datafusion/main/install.sh | bash
 ```
 
 Check it landed:
@@ -33,7 +33,7 @@ is planned.
 To build from source instead (requires the Rust toolchain):
 
 ```bash
-git clone https://github.com/jayendra13/zarr-datafusion.git
+git clone https://github.com/stratoscale-io/zarr-datafusion.git
 cd zarr-datafusion
 cargo run --bin zarr-cli
 ```
